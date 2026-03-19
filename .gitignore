@@ -47,3 +47,18 @@ reconstruct_video.sh
 # Test data and output
 01_test_data_generation/**/output/
 01_test_data_generation/**/temp/
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.flv
+*.wmv
+*.webm
+*.m4v
+*.3gp
+*.ts
+*.mts
+*.m2ts
+*.vob
