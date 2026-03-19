@@ -1,0 +1,15 @@
+target_video: /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/clip1.mp4
+source_videos:
+- /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/source_A.mp4
+- /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/source_B.mp4
+- /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/source_C.mp4
+output_video: /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/clip2_reconstructed.mp4
+fps: 5
+similarity_threshold: 0.9
+max_retries: 3
+use_target_audio: true
+min_segment_duration: 0.5
+match_threshold: 0.6
+scale: 480:270
+missing_segment_strategy: smart_fill
+smart_fill_threshold: 0.5

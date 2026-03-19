@@ -1,0 +1,50 @@
+{
+  "target_video": "/Users/zhangxu/.openclaw/workspace/test_videos/clip1.mp4",
+  "source_videos": [
+    "/Users/zhangxu/.openclaw/workspace/test_videos/source_A.mp4",
+    "/Users/zhangxu/.openclaw/workspace/test_videos/source_B.mp4",
+    "/Users/zhangxu/.openclaw/workspace/test_videos/source_C.mp4"
+  ],
+  "output_video": "/Users/zhangxu/.openclaw/workspace/test_videos/clip2_reconstructed.mp4",
+  "config": {
+    "fps": 5,
+    "similarity_threshold": 0.85,
+    "match_threshold": 0.5499999999999999,
+    "missing_strategy": "smart_fill"
+  },
+  "segments": [
+    {
+      "segment_idx": 1,
+      "status": "matched",
+      "target_time": "0.00s - 30.00s",
+      "source_video": "/Users/zhangxu/.openclaw/workspace/test_videos/source_A.mp4",
+      "source_time": "29.80s - 25.00s",
+      "similarity": "80.07%",
+      "duration": "30.00s"
+    },
+    {
+      "segment_idx": 1,
+      "status": "matched",
+      "target_time": "0.00s - 30.00s",
+      "source_video": "/Users/zhangxu/.openclaw/workspace/test_videos/source_A.mp4",
+      "source_time": "29.80s - 25.00s",
+      "similarity": "80.07%",
+      "duration": "30.00s"
+    },
+    {
+      "segment_idx": 1,
+      "status": "matched",
+      "target_time": "0.00s - 30.00s",
+      "source_video": "/Users/zhangxu/.openclaw/workspace/test_videos/source_A.mp4",
+      "source_time": "29.80s - 25.00s",
+      "similarity": "80.07%",
+      "duration": "30.00s"
+    }
+  ],
+  "summary": {
+    "total_segments": 3,
+    "matched": 3,
+    "filled": 0,
+    "missing": 0
+  }
+}

@@ -1,0 +1,40 @@
+# 视频重构配置 - 使用真实短剧视频
+
+# 目标视频（混剪视频1）- 需要重构的视频
+target_video: /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/source_videos/test_download.mp4
+
+# 源视频列表（素材库）
+source_videos:
+  - /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/source_videos/video1_天赋变异后我无敌了_ep1.mp4
+  - /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/source_videos/video2_开局饕餮血统我吞噬一切_ep1.mp4
+  - /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/source_videos/test_download.mp4
+
+# 输出视频路径（裁剪视频2）
+output_video: /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/clip2_reconstructed_real.mp4
+
+# 重构日志路径
+reconstruction_log: /Users/zhangxu/work/项目/cutvideo/06_configurations/real_videos_reconstruction_log.json
+
+# 帧率设置（降低以提高处理速度）
+fps: 2
+
+# 相似度阈值
+similarity_threshold: 0.85
+
+# 最大重试次数
+max_retries: 3
+
+# 是否使用目标视频的音频
+use_target_audio: true
+
+# 最小片段时长（秒）
+min_segment_duration: 1.0
+
+# 匹配阈值
+match_threshold: 0.5
+
+# 缺失片段处理策略
+missing_segment_strategy: smart_fill
+
+# 智能填充阈值
+smart_fill_threshold: 0.5

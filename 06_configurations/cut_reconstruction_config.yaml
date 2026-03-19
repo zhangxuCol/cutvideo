@@ -1,0 +1,79 @@
+# 视频重构配置 - 多源视频版本
+
+# 目标视频（裁剪视频 cut1）
+target_video: /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/cut/cut1.mp4
+
+# 源视频列表（素材库）- 所有原视频
+source_videos:
+  - /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/source_videos/1.mp4
+  - /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/source_videos/2.mp4
+  - /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/source_videos/363747886756540416_363977611190734848_363977611040526336.mp4
+  - /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/source_videos/363747886756540416_363977666966589440_363977611271213056.mp4
+  - /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/source_videos/363747886756540416_363977673945911296_363977667063844864.mp4
+
+# 输出视频路径（重构后的 cut2）
+output_video: /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/output/cut2_reconstructed.mp4
+
+# 重构日志路径
+reconstruction_log: /Users/zhangxu/work/项目/cutvideo/06_configurations/cut_reconstruction_log.json
+
+# 帧率设置: 1秒6帧
+fps: 6
+
+# 相似度阈值: 0.25 (进一步降低)
+similarity_threshold: 0.25
+
+# 匹配阈值: 0.25 (进一步降低)
+match_threshold: 0.25
+
+# 音频匹配阈值: 0.5 (降低以找到更多匹配点)
+audio_match_threshold: 0.5
+
+# 音频采样率: 16000Hz (提高采样率以提高匹配准确性)
+audio_sample_rate: 16000
+
+# 音频对齐点前N帧开始视频对比
+pre_search_frames: 15
+
+# 视频搜索窗口大小（帧）
+search_window: 10
+
+# 并行线程数（默认CPU核心数）
+max_workers: 8
+
+# 启用并行处理
+use_parallel: true
+
+# 最大重试次数
+max_retries: 3
+
+# 是否使用目标视频的音频
+use_target_audio: true
+
+# 最小片段时长（秒）- 降低以保留更多片段
+min_segment_duration: 0.05
+
+# 最大片段间隔（秒）- 允许8秒间隔
+max_gap: 8.0
+
+# 智能填充：是否自动填充未匹配的帧
+smart_fill: true
+
+# 最大连续未匹配帧数（智能填充阈值）
+max_none_gap: 2
+
+# 缺失片段处理策略
+missing_segment_strategy: smart_fill
+
+# 智能填充阈值
+smart_fill_threshold: 0.5
+
+# 是否记录每个片段的来源元数据
+enable_source_metadata: true
+
+# 片段去重配置
+enable_deduplication: true  # 启用片段去重
+max_overlap_ratio: 0.1  # 最大重叠比例（10%）
+
+# 覆盖率检查配置
+min_coverage: 0.5  # 最小覆盖率要求（50%）
