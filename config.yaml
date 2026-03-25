@@ -1,0 +1,52 @@
+# 统一配置文件
+# 南城以北项目路径配置
+
+# 原视频路径（参考视频）
+target_video_dir: "./01_test_data_generation/source_videos/南城以北/剧集"
+
+# 素材视频路径（源视频）
+source_video_dir: "./01_test_data_generation/source_videos/南城以北/adx原"
+
+# 输出路径
+output_dir: "./01_test_data_generation/source_videos/南城以北/output"
+
+# 处理参数
+processing:
+  # 提取帧率（1-10，建议8）
+  fps: 8
+
+  # 相似度阈值（0-1，建议0.85）
+  similarity_threshold: 0.85
+
+  # 最大重试次数
+  max_retries: 3
+
+  # 是否使用目标视频的音频
+  use_target_audio: true
+
+  # 最小片段时长（秒）
+  min_segment_duration: 0.3
+
+  # 单帧匹配阈值
+  match_threshold: 0.45
+
+  # 提取帧分辨率
+  scale: "480:270"
+
+  # 缺失片段处理策略
+  # strict: 严格模式，必须找到所有片段
+  # fill_black: 用黑屏填充缺失片段
+  # smart_fill: 智能填充，寻找最佳替代片段（推荐）
+  missing_segment_strategy: "smart_fill"
+
+  # 智能填充的最低相似度阈值
+  smart_fill_threshold: 0.4
+
+  # 是否启用后处理
+  enable_post_processing: true
+
+  # 后处理匹配阈值
+  post_process_threshold: 0.5
+
+  # 最大可填充的空白时长（秒）
+  max_gap_fill_duration: 2.0

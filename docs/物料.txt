@@ -1,0 +1,9 @@
+项目目录：/Users/zhangxu/work/项目/cutvideo
+原视频路径：/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/剧集
+素材视频路径：/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/adx原
+输出路径：/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/output
+需求文档路径：/Users/zhangxu/work/项目/cutvideo/docs/技术实现方案_完整版.md
+git 目录：git@github.com:zhangxuCol/cutvideo.git
+通过规则：二次裁剪的素材和素材视频时长和内容、音频保持一致
+运行文件：/Users/zhangxu/work/项目/cutvideo/batch_reconstructor_v2.py
+每次运行前清空一下输出路径中的文件：/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/output

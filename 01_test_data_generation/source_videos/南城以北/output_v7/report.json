@@ -1,0 +1,92 @@
+{
+  "version": "V7",
+  "config": {
+    "fps": 2,
+    "similarity_threshold": 0.85,
+    "match_threshold": 0.4,
+    "audio_weight": 0.4,
+    "video_weight": 0.6,
+    "max_workers": 8,
+    "audio_sample_rate": 16000,
+    "coarse_interval": 2.0,
+    "fine_interval": 1.0
+  },
+  "total": 10,
+  "success": 0,
+  "perfect": 0,
+  "success_rate": 0.0,
+  "perfect_rate": 0.0,
+  "total_processing_time": 3472.433315038681,
+  "avg_processing_time": 347.2433315038681,
+  "results": [
+    {
+      "cut_video": "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/adx原/115192-1-363935817413439491.mp4",
+      "cut_video_name": "115192-1-363935817413439491.mp4",
+      "success": false,
+      "error": "未生成输出",
+      "processing_time": 348.4958920478821
+    },
+    {
+      "cut_video": "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/adx原/115196-1-363935819124715523.mp4",
+      "cut_video_name": "115196-1-363935819124715523.mp4",
+      "success": false,
+      "error": "[Errno 2] No such file or directory: '/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/output_v7/115196-1-363935819124715523_cut.mp4.tmp' -> '/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/output_v7/115196-1-363935819124715523_cut.mp4'"
+    },
+    {
+      "cut_video": "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/adx原/115200-1-363935820852768771.mp4",
+      "cut_video_name": "115200-1-363935820852768771.mp4",
+      "success": false,
+      "error": "未生成输出",
+      "processing_time": 344.98505187034607
+    },
+    {
+      "cut_video": "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/adx原/115204-1-363935821733572611.mp4",
+      "cut_video_name": "115204-1-363935821733572611.mp4",
+      "success": false,
+      "error": "未生成输出",
+      "processing_time": 340.28344798088074
+    },
+    {
+      "cut_video": "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/adx原/115208-1-363935826842234883.mp4",
+      "cut_video_name": "115208-1-363935826842234883.mp4",
+      "success": false,
+      "error": "未生成输出",
+      "processing_time": 356.3873198032379
+    },
+    {
+      "cut_video": "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/adx原/115212-1-363935857343213571.mp4",
+      "cut_video_name": "115212-1-363935857343213571.mp4",
+      "success": false,
+      "error": "未生成输出",
+      "processing_time": 492.9027020931244
+    },
+    {
+      "cut_video": "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/adx原/115216-1-363935860858040323.mp4",
+      "cut_video_name": "115216-1-363935860858040323.mp4",
+      "success": false,
+      "error": "未生成输出",
+      "processing_time": 342.77260994911194
+    },
+    {
+      "cut_video": "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/adx原/115220-1-363935862351212547.mp4",
+      "cut_video_name": "115220-1-363935862351212547.mp4",
+      "success": false,
+      "error": "未生成输出",
+      "processing_time": 346.5299060344696
+    },
+    {
+      "cut_video": "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/adx原/115224-1-363935865966702595.mp4",
+      "cut_video_name": "115224-1-363935865966702595.mp4",
+      "success": false,
+      "error": "未生成输出",
+      "processing_time": 350.7316789627075
+    },
+    {
+      "cut_video": "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/adx原/115228-1-363935887248601091.mp4",
+      "cut_video_name": "115228-1-363935887248601091.mp4",
+      "success": false,
+      "error": "未生成输出",
+      "processing_time": 516.7860667705536
+    }
+  ]
+}

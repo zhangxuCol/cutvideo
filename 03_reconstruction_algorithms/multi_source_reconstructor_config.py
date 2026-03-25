@@ -54,15 +54,15 @@ class Config:
             'target_video': '',  # 裁剪视频1路径
             'source_videos': [],  # 原视频路径列表
             'output_video': 'reconstructed.mp4',  # 裁剪视频2输出路径
-            'fps': 5,  # 每秒提取帧数（1-10）
-            'similarity_threshold': 0.90,  # 相似度阈值（0-1）
+            'fps': 8,  # 每秒提取帧数（1-10，提高到8）
+            'similarity_threshold': 0.85,  # 相似度阈值（0-1，降低到0.85）
             'max_retries': 3,  # 最大重试次数
             'use_target_audio': True,  # 是否使用目标视频音频
-            'min_segment_duration': 0.5,  # 最小片段时长（秒）
-            'match_threshold': 0.6,  # 单帧匹配阈值
+            'min_segment_duration': 0.3,  # 最小片段时长（秒，降低到0.3）
+            'match_threshold': 0.45,  # 单帧匹配阈值（降低到0.45）
             'scale': '480:270',  # 提取帧分辨率
             'missing_segment_strategy': 'smart_fill',  # 缺失片段处理策略: strict/fill_black/smart_fill
-            'smart_fill_threshold': 0.5,  # 智能填充的最低相似度阈值
+            'smart_fill_threshold': 0.4,  # 智能填充的最低相似度阈值（降低到0.4）
         }
         
         if self.config_file.exists():

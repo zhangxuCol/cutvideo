@@ -90,8 +90,13 @@ class BatchVideoReconstructorV2:
                     output_duration = self.get_video_duration(output_path)
                     duration_diff = abs(output_duration - cut_duration)
 
-                    # 使用覆盖率判断成功
-                    success = match_rate > 50 and duration_diff < cut_duration * 0.2
+                    # 严格匹配模式：时长、内容、音频保持一致
+                    # - 时长差异 < 1秒
+                    # - 匹配率 > 95%
+                    # - 音频已启用 use_target_audio=True
+                    duration_match = duration_diff < 1.0  # 时长差异小于1秒
+                    content_match = match_rate > 95.0     # 内容匹配率大于95%
+                    success = duration_match and content_match
 
                     result = {
                         'cut_video': str(cut_video),
