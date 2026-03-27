@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-视频混剪重构工具 V6 Optimized - 基于V6的优化版本
-优化内容：
-1. 可配置的验证级别（严格/正常/宽松）
-2. 更灵活的阈值配置
-3. 改进的日志输出
-4. 保持V6的性能优势
+视频混剪重构工具 V6 - 智能多源拼接版
+核心逻辑：
+1. 首先尝试单源完整匹配（快速）
+2. 如果单源匹配度不足或时长不够，自动切换到多源片段拼接模式
 """
 
 import cv2
@@ -15,17 +13,9 @@ import subprocess
 import tempfile
 import shutil
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
-from enum import Enum
+from typing import List, Tuple, Optional
 import wave
 import struct
-
-class ValidationLevel(Enum):
-    """验证级别"""
-    STRICT = "strict"      # 严格: 匹配率>50%, 时长差异<20%
-    NORMAL = "normal"      # 正常: 匹配率>30%, 时长差异<30%
-    LOOSE = "loose"        # 宽松: 匹配率>10%, 时长差异<50%
-    BEST_EFFORT = "best_effort"  # 尽力: 只要有输出就算成功
 
 @dataclass
 class VideoSegment:
@@ -37,17 +27,8 @@ class VideoSegment:
     target_start: float = 0
     target_end: float = 0
 
-@dataclass
-class ValidationResult:
-    """验证结果"""
-    success: bool
-    match_rate: float
-    duration_diff: float
-    reasons: List[str]
-    suggestions: List[str]
-
-class VideoReconstructorHybridV6Optimized:
-    """V6 Optimized: 基于V6的优化版本，改进验证逻辑"""
+class VideoReconstructorHybridV6:
+    """V6: 智能多源重构器"""
     
     def __init__(self, target_video: str, source_videos: List[str], config: dict = None):
         self.target_video = Path(target_video)
@@ -55,116 +36,13 @@ class VideoReconstructorHybridV6Optimized:
         self.config = config or {}
         self.temp_dir = None
         
-        # 验证级别
-        validation_level = config.get('validation_level', 'normal')
-        self.validation_level = ValidationLevel(validation_level) if isinstance(validation_level, str) else ValidationLevel.NORMAL
-        
-        # 根据验证级别设置阈值
-        self.thresholds = self._get_thresholds_by_level(self.validation_level)
-        
-        # 覆盖配置中的阈值
-        self.thresholds.update({
-            'fps': config.get('fps', 5),
-            'similarity_threshold': config.get('similarity_threshold', 0.85),
-            'min_segment_duration': config.get('min_segment_duration', 0.5),
-            'match_threshold': config.get('match_threshold', 0.6),
-            'audio_weight': config.get('audio_weight', 0.4),
-            'video_weight': config.get('video_weight', 0.6),
-            'single_source_threshold': config.get('single_source_threshold', 0.85),
-        })
-        
-        self.fps = self.thresholds['fps']
-        self.similarity_threshold = self.thresholds['similarity_threshold']
-        self.min_segment_duration = self.thresholds['min_segment_duration']
-        self.match_threshold = self.thresholds['match_threshold']
-        self.audio_weight = self.thresholds['audio_weight']
-        self.video_weight = self.thresholds['video_weight']
-        self.single_source_threshold = self.thresholds['single_source_threshold']
-
-    def _get_thresholds_by_level(self, level: ValidationLevel) -> Dict:
-        """根据验证级别获取阈值"""
-        thresholds = {
-            ValidationLevel.STRICT: {
-                'min_match_rate': 0.50,
-                'max_duration_diff': 0.20,
-                'min_coverage': 0.80,
-            },
-            ValidationLevel.NORMAL: {
-                'min_match_rate': 0.30,
-                'max_duration_diff': 0.30,
-                'min_coverage': 0.60,
-            },
-            ValidationLevel.LOOSE: {
-                'min_match_rate': 0.10,
-                'max_duration_diff': 0.50,
-                'min_coverage': 0.40,
-            },
-            ValidationLevel.BEST_EFFORT: {
-                'min_match_rate': 0.0,
-                'max_duration_diff': 1.0,
-                'min_coverage': 0.0,
-            }
-        }
-        return thresholds.get(level, thresholds[ValidationLevel.NORMAL])
-
-    def validate_result(self, target_duration: float, segments: List[VideoSegment], output_path: str) -> ValidationResult:
-        """验证重构结果"""
-        reasons = []
-        suggestions = []
-        
-        # 检查输出文件
-        if not Path(output_path).exists():
-            return ValidationResult(
-                success=False,
-                match_rate=0.0,
-                duration_diff=1.0,
-                reasons=["输出文件不存在"],
-                suggestions=["检查磁盘空间", "检查FFmpeg命令"]
-            )
-        
-        # 获取输出时长
-        output_duration = self.get_video_duration(Path(output_path))
-        duration_diff = abs(output_duration - target_duration) / target_duration if target_duration > 0 else 1.0
-        
-        # 计算匹配率
-        if segments:
-            total_covered = sum(seg.target_end - seg.target_start for seg in segments)
-            match_rate = total_covered / target_duration if target_duration > 0 else 0.0
-            avg_score = np.mean([seg.similarity_score for seg in segments])
-        else:
-            match_rate = 0.0
-            avg_score = 0.0
-        
-        # 根据验证级别判断
-        min_match_rate = self.thresholds.get('min_match_rate', 0.3)
-        max_duration_diff = self.thresholds.get('max_duration_diff', 0.3)
-        min_coverage = self.thresholds.get('min_coverage', 0.6)
-        
-        success = True
-        
-        if match_rate < min_match_rate:
-            success = False
-            reasons.append(f"匹配率过低 ({match_rate:.1%} < {min_match_rate:.0%})")
-            suggestions.append("尝试放宽匹配阈值")
-            suggestions.append("检查源视频是否包含目标内容")
-        
-        if duration_diff > max_duration_diff:
-            success = False
-            reasons.append(f"时长差异过大 ({duration_diff:.1%} > {max_duration_diff:.0%})")
-            suggestions.append("检查片段拼接逻辑")
-            suggestions.append("尝试使用不同的源视频")
-        
-        if match_rate < min_coverage:
-            success = False
-            reasons.append(f"覆盖率不足 ({match_rate:.1%} < {min_coverage:.0%})")
-        
-        return ValidationResult(
-            success=success,
-            match_rate=match_rate,
-            duration_diff=duration_diff,
-            reasons=reasons,
-            suggestions=suggestions
-        )
+        # 配置参数
+        self.fps = config.get('fps', 5) if config else 5
+        self.similarity_threshold = config.get('similarity_threshold', 0.85) if config else 0.85
+        self.min_segment_duration = config.get('min_segment_duration', 0.5) if config else 0.5
+        self.match_threshold = config.get('match_threshold', 0.6) if config else 0.6
+        self.audio_weight = config.get('audio_weight', 0.4) if config else 0.4
+        self.video_weight = config.get('video_weight', 0.6) if config else 0.6
 
     def get_video_duration(self, video_path: Path) -> float:
         """获取视频时长"""
@@ -175,10 +53,7 @@ class VideoReconstructorHybridV6Optimized:
             str(video_path)
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
-        try:
-            return float(result.stdout.strip())
-        except:
-            return 0.0
+        return float(result.stdout.strip())
 
     def extract_frame_at(self, video_path: Path, time_sec: float, output_path: Path):
         """提取指定时间点的帧"""
@@ -197,10 +72,7 @@ class VideoReconstructorHybridV6Optimized:
             return 0.0
         
         gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
-        gray2 = cv2.imread(str(frame2_path), cv2.IMREAD_GRAYSCALE)
-        if gray2 is None:
-            return 0.0
-        
+        gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
         gray1 = cv2.resize(gray1, (320, 180))
         gray2 = cv2.resize(gray2, (320, 180))
         
@@ -216,7 +88,7 @@ class VideoReconstructorHybridV6Optimized:
         return 0.5 * max(0, hist_sim) + 0.5 * template_sim
 
     def _extract_audio_fingerprint(self, video_path: Path) -> np.ndarray:
-        """提取音频指纹 - 保持V6的8kHz采样率，保证速度"""
+        """提取音频指纹"""
         temp_wav = self.temp_dir / f"{video_path.stem}_audio.wav"
         
         cmd = [
@@ -233,8 +105,6 @@ class VideoReconstructorHybridV6Optimized:
         with wave.open(str(temp_wav), 'rb') as wf:
             n_frames = wf.getnframes()
             audio_data = wf.readframes(n_frames)
-            if n_frames == 0:
-                return np.array([])
             samples = struct.unpack(f'{n_frames}h', audio_data)
         
         samples_per_sec = 8000
@@ -252,7 +122,7 @@ class VideoReconstructorHybridV6Optimized:
         return np.array(features)
 
     def _find_audio_match(self, target_fp: np.ndarray, source_video: Path) -> Tuple[float, float]:
-        """音频指纹匹配 - 保持V6的简单滑动窗口"""
+        """音频指纹匹配"""
         source_fp = self._extract_audio_fingerprint(source_video)
         
         if len(target_fp) == 0 or len(source_fp) == 0 or len(target_fp) > len(source_fp):
@@ -261,9 +131,7 @@ class VideoReconstructorHybridV6Optimized:
         best_score = -1
         best_start = 0
         
-        # 使用步长2加速搜索
-        step = 2
-        for start in range(0, len(source_fp) - len(target_fp) + 1, step):
+        for start in range(0, len(source_fp) - len(target_fp) + 1, 1):
             end = start + len(target_fp)
             source_segment = source_fp[start:end]
             
@@ -296,38 +164,25 @@ class VideoReconstructorHybridV6Optimized:
             if source_duration < target_duration:
                 continue
             
-            audio_score, start_block = self._find_audio_match(target_audio, source)
-            start_time = start_block * 0.5  # 转换为秒
+            audio_score, start_time = self._find_audio_match(target_audio, source)
             
-            if audio_score > 0.3:  # 音频预筛选
-                # 视频帧验证 - 只检查片段开始位置（关键帧）
-                target_frame = self.temp_dir / f"target_start.jpg"
-                source_frame = self.temp_dir / f"source_{source.stem}_start.jpg"
-                self.extract_frame_at(self.target_video, 0, target_frame)
-                self.extract_frame_at(source, start_time, source_frame)
+            if audio_score > best_score:
+                # 视频帧验证
+                sample_times = [0, target_duration * 0.25, target_duration * 0.5]
+                video_scores = []
                 
-                video_score = 0
-                if target_frame.exists() and source_frame.exists():
-                    video_score = self.calculate_frame_similarity(target_frame, source_frame)
+                for t in sample_times:
+                    if t < target_duration:
+                        target_frame = self.temp_dir / f"target_{t:.0f}.jpg"
+                        source_frame = self.temp_dir / f"source_{source.stem}_{t:.0f}.jpg"
+                        self.extract_frame_at(self.target_video, t, target_frame)
+                        self.extract_frame_at(source, start_time + t, source_frame)
+                        
+                        if target_frame.exists() and source_frame.exists():
+                            sim = self.calculate_frame_similarity(target_frame, source_frame)
+                            video_scores.append(sim)
                 
-                # 如果开始位置匹配好，再检查中间和结尾
-                if video_score > 0.7:
-                    sample_times = [target_duration * 0.5, target_duration * 0.9]
-                    video_scores = [video_score]
-                    
-                    for t in sample_times:
-                        if t < target_duration:
-                            target_frame = self.temp_dir / f"target_{t:.0f}.jpg"
-                            source_frame = self.temp_dir / f"source_{source.stem}_{t:.0f}.jpg"
-                            self.extract_frame_at(self.target_video, t, target_frame)
-                            self.extract_frame_at(source, start_time + t, source_frame)
-                            
-                            if target_frame.exists() and source_frame.exists():
-                                sim = self.calculate_frame_similarity(target_frame, source_frame)
-                                video_scores.append(sim)
-                    
-                    video_score = np.mean(video_scores)
-                
+                video_score = np.mean(video_scores) if video_scores else 0
                 combined_score = self.audio_weight * audio_score + self.video_weight * video_score
                 
                 if combined_score > best_score:
@@ -345,11 +200,11 @@ class VideoReconstructorHybridV6Optimized:
         return best_result
 
     def find_multi_source_segments(self, target_duration: float) -> List[VideoSegment]:
-        """多源片段匹配 - 保持V6的实现"""
+        """多源片段匹配 - 从多个源视频中找最佳片段"""
         print(f"\n🔍 阶段2: 多源片段拼接...")
         
         # 提取目标视频的关键帧
-        target_times = np.arange(0, target_duration, 1.0)
+        target_times = np.arange(0, target_duration, 1.0)  # 每秒一帧
         target_frames = {}
         
         print(f"   提取目标视频 {len(target_times)} 帧...")
@@ -414,9 +269,11 @@ class VideoReconstructorHybridV6Optimized:
                 }
             elif (current_segment['source'] == match['source'] and 
                   abs(match['source_time'] - current_segment['end_time']) < 2):
+                # 连续
                 current_segment['end_time'] = match['source_time'] + 1
                 current_segment['scores'].append(match['score'])
             else:
+                # 保存当前片段
                 if len(current_segment['scores']) >= self.min_segment_duration:
                     segments.append(VideoSegment(
                         source_video=current_segment['source'],
@@ -435,6 +292,7 @@ class VideoReconstructorHybridV6Optimized:
                     'scores': [match['score']]
                 }
         
+        # 保存最后一个片段
         if current_segment and len(current_segment['scores']) >= self.min_segment_duration:
             segments.append(VideoSegment(
                 source_video=current_segment['source'],
@@ -447,7 +305,7 @@ class VideoReconstructorHybridV6Optimized:
         
         print(f"   生成 {len(segments)} 个连续片段")
         for i, seg in enumerate(segments[:5], 1):
-            print(f"      片段{i}: {seg.source_video.name} @{seg.start_time:.1f}s~{seg.end_time:.1f}s")
+            print(f"      片段{i}: {seg.source_video.name} @{seg.start_time:.1f}s~{seg.end_time:.1f}s (目标{seg.target_start:.1f}s~{seg.target_end:.1f}s)")
         
         if len(segments) > 5:
             print(f"      ... 还有 {len(segments)-5} 个片段")
@@ -462,8 +320,10 @@ class VideoReconstructorHybridV6Optimized:
             print(f"   ❌ 没有可用片段")
             return False
         
+        # 按目标时间排序
         segments = sorted(segments, key=lambda x: x.target_start)
         
+        # 生成 concat 列表
         concat_lines = []
         for seg in segments:
             concat_lines.append(f"file '{seg.source_video}'")
@@ -474,6 +334,7 @@ class VideoReconstructorHybridV6Optimized:
         with open(concat_file, 'w') as f:
             f.write('\n'.join(concat_lines))
         
+        # 第一步：拼接
         temp_concat = self.temp_dir / "temp_concat.mp4"
         cmd1 = [
             'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
@@ -486,6 +347,7 @@ class VideoReconstructorHybridV6Optimized:
             print(f"   ❌ 拼接失败")
             return False
         
+        # 第二步：添加音频
         if use_target_audio:
             target_audio = self.temp_dir / "target_audio.aac"
             cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
@@ -510,21 +372,20 @@ class VideoReconstructorHybridV6Optimized:
         subprocess.run(cmd2, capture_output=True)
         
         if Path(output_path).exists():
-            output_duration = self.get_video_duration(Path(output_path))
+            output_duration = self.get_video_duration(output_path)
             print(f"   ✅ 生成成功: {output_duration:.1f}s")
             return True
         else:
             print(f"   ❌ 生成失败")
             return False
 
-    def reconstruct(self, output_path: str, use_target_audio: bool = True) -> Tuple[List[VideoSegment], ValidationResult]:
-        """智能重构 - 自动选择单源或多源模式，带验证"""
+    def reconstruct(self, output_path: str, use_target_audio: bool = True) -> List[VideoSegment]:
+        """智能重构 - 自动选择单源或多源模式"""
         print(f"\n{'='*60}")
-        print(f"🎬 V6 Optimized 智能重构 [验证级别: {self.validation_level.value}]")
+        print(f"🎬 V6 智能多源重构")
         print(f"{'='*60}")
         
         self.temp_dir = Path(tempfile.mkdtemp())
-        segments = []
         
         try:
             target_duration = self.get_video_duration(self.target_video)
@@ -534,7 +395,7 @@ class VideoReconstructorHybridV6Optimized:
             # 阶段1: 尝试单源完整匹配
             single_match = self.find_best_single_source_match(target_duration)
             
-            if single_match and single_match['combined_score'] > self.single_source_threshold:
+            if single_match and single_match['combined_score'] > 0.85:
                 print(f"\n✅ 单源匹配成功!")
                 print(f"   来源: {single_match['source'].name}")
                 print(f"   位置: @{single_match['start_time']:.1f}s")
@@ -544,18 +405,17 @@ class VideoReconstructorHybridV6Optimized:
                     source_video=single_match['source'],
                     start_time=single_match['start_time'],
                     end_time=single_match['start_time'] + target_duration,
-                    similarity_score=single_match['combined_score'],
-                    target_start=0,
-                    target_end=target_duration
+                    similarity_score=single_match['combined_score']
                 )
-                segments = [segment]
                 
                 self._generate_single_output(segment, output_path, use_target_audio)
+                return [segment]
             else:
                 print(f"\n⚠️ 单源匹配不足，切换到多源拼接模式")
                 if single_match:
-                    print(f"   最佳单源得分: {single_match['combined_score']:.1%} (需要>{self.single_source_threshold:.0%})")
+                    print(f"   最佳单源得分: {single_match['combined_score']:.1%} (需要>85%)")
                 
+                # 阶段2: 多源片段拼接
                 segments = self.find_multi_source_segments(target_duration)
                 
                 if segments:
@@ -564,32 +424,15 @@ class VideoReconstructorHybridV6Optimized:
                     
                     print(f"\n   覆盖时长: {total_covered:.1f}s / {target_duration:.1f}s ({coverage:.1%})")
                     
-                    min_coverage = self.thresholds.get('min_coverage', 0.6)
-                    if coverage >= min_coverage or self.validation_level == ValidationLevel.BEST_EFFORT:
+                    if coverage > 0.5:  # 至少覆盖50%
                         self.generate_multi_source_output(segments, output_path, use_target_audio)
+                        return segments
                     else:
-                        print(f"   ❌ 覆盖不足 ({coverage:.1%} < {min_coverage:.0%})，跳过生成")
-                        segments = []
+                        print(f"   ❌ 覆盖不足，无法生成")
+                        return []
                 else:
                     print(f"   ❌ 未找到可用片段")
-            
-            # 验证结果
-            validation = self.validate_result(target_duration, segments, output_path)
-            
-            print(f"\n📊 验证结果:")
-            print(f"   匹配率: {validation.match_rate:.1%}")
-            print(f"   时长差异: {validation.duration_diff:.1%}")
-            print(f"   状态: {'✅ 通过' if validation.success else '❌ 失败'}")
-            
-            if not validation.success:
-                print(f"\n   失败原因:")
-                for reason in validation.reasons:
-                    print(f"      - {reason}")
-                print(f"\n   建议:")
-                for suggestion in validation.suggestions:
-                    print(f"      - {suggestion}")
-            
-            return segments, validation
+                    return []
         
         finally:
             if self.temp_dir and self.temp_dir.exists():

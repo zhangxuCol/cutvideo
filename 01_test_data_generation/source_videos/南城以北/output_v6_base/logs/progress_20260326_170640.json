@@ -1,0 +1,15 @@
+{
+  "timestamp": "2026-03-26T17:06:40.683713",
+  "current": 1,
+  "total": 10,
+  "results": [
+    {
+      "success": true,
+      "target": "115192-1-363935817413439491.mp4",
+      "segments": 18,
+      "time": 1064.0442340373993,
+      "output_path": "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/output_v6_base/115192-1-363935817413439491_reconstructed.mp4",
+      "status": "success"
+    }
+  ]
+}

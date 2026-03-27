@@ -138,66 +138,175 @@ class VideoReconstructorHybridV7:
         return np.array(fingerprints)
 
     def _find_audio_matches_v7(self, target_fp: np.ndarray, source_video: Path) -> List[Tuple[float, float, float]]:
-        """V7: 多尺度音频匹配，返回 (source_time, score, confidence)"""
+        """V7: 分块整段音频匹配，每3秒一段，只保留最佳匹配
+        
+        修改：用整段音频比对（3秒一段），而不是逐点滑动
+        这样可以减少候选点，提高效率
+        """
         source_fp = self._extract_audio_fingerprint_v7(source_video)
         
-        if len(target_fp) == 0 or len(source_fp) == 0 or len(target_fp) > len(source_fp):
+        if len(target_fp) == 0 or len(source_fp) == 0:
             return []
         
+        # 如果源视频时长不足，使用可用的最大长度进行匹配
+        effective_target_len = min(len(target_fp), len(source_fp))
+        
         matches = []
-        window_sizes = [5, 10, 15]  # 多尺度窗口
+        block_size = 10  # 5秒 = 10块 (每块0.5s)
         audio_threshold = self.config.get('audio_match_threshold', 0.7)  # 提高阈值到0.7
         
-        for target_idx in range(len(target_fp)):
+        # 分块处理：每3秒为一个块
+        for block_start in range(0, effective_target_len, block_size):
+            block_end = min(block_start + block_size, effective_target_len)
+            actual_block_size = block_end - block_start
+            
+            if actual_block_size < 5:  # 跳过小于2.5秒的末尾块
+                continue
+            
+            # 提取目标视频的当前块
+            target_block = target_fp[block_start:block_end]
+            
+            # 在源视频中搜索最佳匹配位置
             best_match = None
             best_score = 0.0
             
-            for window_size in window_sizes:
-                if target_idx + window_size > len(target_fp):
+            max_source_idx = len(source_fp) - actual_block_size
+            for source_idx in range(0, max_source_idx + 1, 3):  # 步长3块(1.5s)
+                source_block = source_fp[source_idx:source_idx + actual_block_size]
+                
+                # 计算整段相似度
+                cosine_sims = []
+                euclidean_dists = []
+                
+                for t, s in zip(target_block, source_block):
+                    t_norm = np.linalg.norm(t)
+                    s_norm = np.linalg.norm(s)
+                    
+                    if t_norm > 0 and s_norm > 0:
+                        cosine_sims.append(np.dot(t, s) / (t_norm * s_norm))
+                        euclidean_dists.append(np.linalg.norm(t - s))
+                
+                if not cosine_sims:
                     continue
                 
-                target_window = target_fp[target_idx:target_idx + window_size]
+                cosine_sim = np.mean(cosine_sims)
+                euclidean_dist = np.mean(euclidean_dists)
+                euclidean_sim = 1 / (1 + euclidean_dist)
                 
-                for source_idx in range(0, len(source_fp) - window_size, 2):  # 步长2提高效率
-                    source_window = source_fp[source_idx:source_idx + window_size]
-                    
-                    # 余弦相似度
-                    cosine_sim = np.mean([
-                        np.dot(t, s) / (np.linalg.norm(t) * np.linalg.norm(s) + 1e-10)
-                        for t, s in zip(target_window, source_window)
-                    ])
-                    
-                    # 欧氏距离转相似度
-                    euclidean_dist = np.mean([
-                        np.linalg.norm(t - s) for t, s in zip(target_window, source_window)
-                    ])
-                    euclidean_sim = 1 / (1 + euclidean_dist)
-                    
-                    similarity = 0.7 * cosine_sim + 0.3 * euclidean_sim
-                    
-                    if similarity > best_score and similarity > audio_threshold:
-                        best_score = similarity
-                        best_match = (source_idx * 0.5, best_score)  # 0.5因为50%重叠
+                similarity = 0.7 * cosine_sim + 0.3 * euclidean_sim
+                
+                if similarity > best_score:
+                    best_score = similarity
+                    best_match = source_idx
             
-            if best_match:
-                matches.append((target_idx * 0.5, best_match[0], best_match[1]))
-        
-        # 去重
-        if matches:
-            matches.sort(key=lambda x: x[0])
-            deduplicated = [matches[0]]
-            for match in matches[1:]:
-                if match[0] - deduplicated[-1][0] > 1.0:
-                    deduplicated.append(match)
-                elif match[2] > deduplicated[-1][2]:
-                    deduplicated[-1] = match
-            matches = deduplicated
+            # 只保留超过阈值的最佳匹配
+            if best_match is not None and best_score > audio_threshold:
+                block_time = block_start * 0.5  # 转换为秒
+                source_time = best_match * 0.5
+                matches.append((block_time, source_time, best_score))
         
         return matches
+    
+    def _find_best_single_source_match_v7(self, target_fp: np.ndarray, source_video: Path, target_duration: float) -> Tuple[float, float, float]:
+        """V7改进: 滑动窗口搜索最佳单源匹配位置，返回 (source_time, audio_score, video_score)"""
+        source_fp = self._extract_audio_fingerprint_v7(source_video)
+        
+        if len(target_fp) == 0 or len(source_fp) == 0 or len(target_fp) > len(source_fp):
+            return None, 0.0, 0.0
+        
+        best_match = None
+        best_combined = 0.0
+        best_audio = 0.0
+        best_video = 0.0
+        
+        # 滑动窗口搜索，步长5秒提高效率
+        search_step = 5
+        audio_threshold = self.config.get('audio_match_threshold', 0.6)  # 降低阈值让更多候选进入视频验证
+        
+        source_duration = self.get_video_duration(source_video)
+        max_start = int(source_duration - target_duration)
+        
+        print(f"   滑动窗口搜索 (步长{search_step}s，范围 0-{max_start}s)...")
+        
+        for start_sec in range(0, max_start, search_step):
+            # 将秒数转换为指纹索引 (0.5s per fingerprint)
+            source_idx = int(start_sec * 2)
+            
+            if source_idx + len(target_fp) > len(source_fp):
+                break
+            
+            # 计算音频相似度
+            source_window = source_fp[source_idx:source_idx + len(target_fp)]
+            
+            cosine_sims = []
+            for t, s in zip(target_fp, source_window):
+                if np.linalg.norm(t) > 0 and np.linalg.norm(s) > 0:
+                    sim = np.dot(t, s) / (np.linalg.norm(t) * np.linalg.norm(s))
+                    cosine_sims.append(sim)
+            
+            if not cosine_sims:
+                continue
+                
+            audio_score = np.mean(cosine_sims)
+            
+            if audio_score < audio_threshold:
+                continue
+            
+            # 视频验证 - 采样3个时间点
+            video_score = self.verify_with_video(source_video, start_sec, target_duration)
+            combined = self.audio_weight * audio_score + self.video_weight * video_score
+            
+            if combined > best_combined:
+                best_combined = combined
+                best_match = start_sec
+                best_audio = audio_score
+                best_video = video_score
+                print(f"      ✓ @{start_sec}s: 音频{audio_score:.1%} 视频{video_score:.1%} 综合{combined:.1%}")
+            
+            if combined > 0.9:
+                break
+        
+        # 在最佳位置附近精修 (±5s，步长1s)
+        if best_match is not None:
+            print(f"   精修搜索 (@{best_match}s 附近)...")
+            for start_sec in range(max(0, best_match - 5), min(max_start, best_match + 6)):
+                if start_sec % search_step == 0:  # 跳过已搜索的点
+                    continue
+                    
+                source_idx = int(start_sec * 2)
+                if source_idx + len(target_fp) > len(source_fp):
+                    break
+                
+                source_window = source_fp[source_idx:source_idx + len(target_fp)]
+                
+                cosine_sims = []
+                for t, s in zip(target_fp, source_window):
+                    if np.linalg.norm(t) > 0 and np.linalg.norm(s) > 0:
+                        sim = np.dot(t, s) / (np.linalg.norm(t) * np.linalg.norm(s))
+                        cosine_sims.append(sim)
+                
+                if not cosine_sims:
+                    continue
+                    
+                audio_score = np.mean(cosine_sims)
+                video_score = self.verify_with_video(source_video, start_sec, target_duration)
+                combined = self.audio_weight * audio_score + self.video_weight * video_score
+                
+                if combined > best_combined:
+                    best_combined = combined
+                    best_match = start_sec
+                    best_audio = audio_score
+                    best_video = video_score
+                    print(f"      ✓ @{start_sec}s: 音频{audio_score:.1%} 视频{video_score:.1%} 综合{combined:.1%} ⭐")
+        
+        return best_match, best_audio, best_video
 
     def verify_with_video(self, source: Path, start_time: float, target_duration: float) -> float:
-        """视频帧验证"""
-        sample_times = [0, target_duration * 0.5, target_duration * 0.9]
+        """视频帧验证 - 使用 SSIM 提高内容一致性检测"""
+        from skimage.metrics import structural_similarity as ssim
+        
+        # 使用5个采样点
+        sample_times = [0, target_duration * 0.25, target_duration * 0.5, target_duration * 0.75, target_duration * 0.9]
         video_scores = []
         
         for t in sample_times:
@@ -208,10 +317,35 @@ class VideoReconstructorHybridV7:
                 self.extract_frame_at(source, start_time + t, source_frame)
                 
                 if target_frame.exists() and source_frame.exists():
-                    sim = self.calculate_frame_similarity(target_frame, source_frame)
+                    # 使用 SSIM 计算相似度
+                    sim = self._calculate_ssim(target_frame, source_frame)
                     video_scores.append(sim)
         
         return np.mean(video_scores) if video_scores else 0
+    
+    def _calculate_ssim(self, frame1_path: Path, frame2_path: Path) -> float:
+        """使用 SSIM 计算两帧的相似度"""
+        import cv2
+        from skimage.metrics import structural_similarity as ssim
+        
+        img1 = cv2.imread(str(frame1_path))
+        img2 = cv2.imread(str(frame2_path))
+        
+        if img1 is None or img2 is None:
+            return 0.0
+        
+        # 转换为灰度图
+        gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+        gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+        
+        # 统一尺寸
+        gray1 = cv2.resize(gray1, (320, 180))
+        gray2 = cv2.resize(gray2, (320, 180))
+        
+        # 计算 SSIM
+        score, _ = ssim(gray1, gray2, full=True)
+        
+        return score
 
     def find_multi_source_segments_v7(self, target_duration: float) -> List[VideoSegment]:
         """V7: 音频预筛选 + 动态帧间隔 + 并行处理"""
@@ -223,7 +357,9 @@ class VideoReconstructorHybridV7:
         
         all_audio_matches = []
         for source in self.source_videos:
+            print(f"     检查 {source.name}...")
             matches = self._find_audio_matches_v7(target_audio, source)
+            print(f"       找到 {len(matches)} 个匹配")
             for target_time, source_time, score in matches:
                 all_audio_matches.append({
                     'target_time': target_time,
@@ -233,19 +369,20 @@ class VideoReconstructorHybridV7:
                 })
         
         all_audio_matches.sort(key=lambda x: x['target_time'])
-        print(f"   音频预筛选: {len(all_audio_matches)} 个候选点")
+        print(f"   音频预筛选总计: {len(all_audio_matches)} 个候选点 (来自 {len(self.source_videos)} 个源视频)")
         
         if not all_audio_matches:
             print(f"   ⚠️ 音频预筛选无结果，降级到纯视频匹配")
             return self._fallback_video_only_match(target_duration)
         
-        # 阶段2: 粗筛 (2秒间隔) - 快速筛选高置信度区域
-        print(f"   阶段2: 粗筛 (2秒间隔)...")
+        # 阶段2: 粗筛 (5秒间隔) - 快速筛选高置信度区域
+        print(f"   阶段2: 粗筛 (5秒间隔)...")
         coarse_matches = self._coarse_video_match(all_audio_matches, target_duration)
         print(f"   粗筛结果: {len(coarse_matches)} 个匹配点")
         
         # 阶段3: 精修 (1秒间隔) - 在粗筛结果附近精细匹配
-        print(f"   阶段3: 精修 (1秒间隔)...")
+        print(f"   阶段3: 精修 (3秒间隔)...")
+        # 优化：使用3秒间隔代替1秒，提速3倍
         fine_matches = self._fine_video_match(coarse_matches, target_duration)
         print(f"   精修结果: {len(fine_matches)} 个匹配点")
         
@@ -279,7 +416,8 @@ class VideoReconstructorHybridV7:
             if not target_frame.exists() or not source_frame.exists():
                 continue
             
-            video_score = self.calculate_frame_similarity(target_frame, source_frame)
+            # 使用 SSIM 进行视频验证
+            video_score = self._calculate_ssim(target_frame, source_frame)
             combined_score = self.audio_weight * audio_score + self.video_weight * video_score
             
             # 强制视频验证: 视频分数必须超过阈值
@@ -305,10 +443,10 @@ class VideoReconstructorHybridV7:
         
         print(f"   通过视频验证: {len(verified_matches)} 个")
         
-        # 基于验证通过的匹配点，2秒间隔提取更多帧进行匹配
+        # 基于验证通过的匹配点，3秒间隔提取更多帧进行匹配
         target_times = set()
         for match in verified_matches:
-            for offset in [-2, 0, 2]:
+            for offset in [-3, 0, 3]:
                 t = match['target_time'] + offset
                 if 0 <= t < target_duration:
                     target_times.add(round(t, 1))
@@ -334,7 +472,7 @@ class VideoReconstructorHybridV7:
             source = match['source']
             if source not in source_candidates:
                 source_candidates[source] = set()
-            for offset in range(-4, 5, 2):
+            for offset in range(-6, 7, 3):
                 t = match['source_time'] + offset
                 if t >= 0:
                     source_candidates[source].add(round(t, 1))
@@ -364,7 +502,7 @@ class VideoReconstructorHybridV7:
             
             for source, frames in source_frames.items():
                 for source_time, source_frame in frames.items():
-                    sim = self.calculate_frame_similarity(target_frame, source_frame)
+                    sim = self._calculate_ssim(target_frame, source_frame)
                     if sim > best_score:
                         best_score = sim
                         best_source = source
@@ -444,7 +582,7 @@ class VideoReconstructorHybridV7:
             
             for source, frames in source_frames.items():
                 for source_time, source_frame in frames.items():
-                    sim = self.calculate_frame_similarity(target_frame, source_frame)
+                    sim = self._calculate_ssim(target_frame, source_frame)
                     if sim > best_score:
                         best_score = sim
                         best_source = source
@@ -558,7 +696,7 @@ class VideoReconstructorHybridV7:
             
             for source, frames in source_frames.items():
                 for source_time, source_frame in frames.items():
-                    sim = self.calculate_frame_similarity(target_frame, source_frame)
+                    sim = self._calculate_ssim(target_frame, source_frame)
                     if sim > best_score:
                         best_score = sim
                         best_source = source
@@ -585,7 +723,24 @@ class VideoReconstructorHybridV7:
         try:
             target_duration = self.get_video_duration(self.target_video)
             print(f"   目标: {self.target_video.name} ({target_duration:.1f}s)")
+            
+            # 自动扫描源视频目录
+            if len(self.source_videos) == 1:
+                # 如果只传了一个源视频，检查是否是目录
+                source_path = self.source_videos[0]
+                if Path(source_path).is_dir():
+                    # 扫描目录中的所有视频文件
+                    video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv'}
+                    self.source_videos = [
+                        f for f in Path(source_path).iterdir()
+                        if f.is_file() and f.suffix.lower() in video_extensions
+                    ]
+                    self.source_videos.sort()
+                    print(f"   扫描目录: {source_path}")
+            
             print(f"   源视频: {len(self.source_videos)} 个")
+            for sv in self.source_videos:
+                print(f"     - {sv.name}")
             print(f"   并行workers: {self.max_workers}")
             
             # 阶段1: 尝试单源完整匹配
@@ -601,29 +756,29 @@ class VideoReconstructorHybridV7:
                 if source_duration < target_duration:
                     continue
                 
-                # 音频匹配找候选
-                audio_matches = self._find_audio_matches_v7(target_audio, source)
+                # V7改进: 使用滑动窗口搜索最佳匹配位置
+                source_time, audio_score, video_score = self._find_best_single_source_match_v7(
+                    target_audio, source, target_duration
+                )
                 
-                for target_time, source_time, audio_score in audio_matches[:5]:  # 只验证前5个
-                    # 视频验证
-                    video_score = self.verify_with_video(source, source_time, target_duration)
-                    combined = self.audio_weight * audio_score + self.video_weight * video_score
+                if source_time is None:
+                    continue
                     
-                    print(f"   {source.name} @{source_time:.0f}s: 音频{audio_score:.1%} 视频{video_score:.1%} 综合{combined:.1%}")
-                    
-                    if combined > best_score:
-                        best_score = combined
-                        best_result = {
-                            'source': source,
-                            'start_time': source_time,
-                            'audio_score': audio_score,
-                            'video_score': video_score,
-                            'combined': combined
-                        }
-                    
-                    if combined > 0.9:
-                        break
-                if best_result and best_result['combined'] > 0.9:
+                combined = self.audio_weight * audio_score + self.video_weight * video_score
+                
+                print(f"   {source.name} 最佳匹配: @{source_time:.0f}s 音频{audio_score:.1%} 视频{video_score:.1%} 综合{combined:.1%}")
+                
+                if combined > best_score:
+                    best_score = combined
+                    best_result = {
+                        'source': source,
+                        'start_time': source_time,
+                        'audio_score': audio_score,
+                        'video_score': video_score,
+                        'combined': combined
+                    }
+                
+                if combined > 0.9:
                     break
             
             # 检查单源是否足够

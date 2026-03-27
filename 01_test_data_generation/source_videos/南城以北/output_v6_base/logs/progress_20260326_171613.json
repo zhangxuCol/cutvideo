@@ -1,0 +1,23 @@
+{
+  "timestamp": "2026-03-26T17:16:13.789421",
+  "current": 2,
+  "total": 10,
+  "results": [
+    {
+      "success": true,
+      "target": "115192-1-363935817413439491.mp4",
+      "segments": 18,
+      "time": 1064.0442340373993,
+      "output_path": "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/output_v6_base/115192-1-363935817413439491_reconstructed.mp4",
+      "status": "success"
+    },
+    {
+      "success": true,
+      "target": "115196-1-363935819124715523.mp4",
+      "segments": 10,
+      "time": 573.1051099300385,
+      "output_path": "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/output_v6_base/115196-1-363935819124715523_reconstructed.mp4",
+      "status": "success"
+    }
+  ]
+}

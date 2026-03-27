@@ -1,138 +1,75 @@
 #!/usr/bin/env python3
 """
-在所有源视频中搜索 115196 的最佳匹配
+在所有源视频中搜索 115196
 """
 
-import cv2
-import numpy as np
+import sys
+sys.path.insert(0, '/Users/zhangxu/work/项目/cutvideo/03_reconstruction_algorithms')
+
 from pathlib import Path
-import subprocess
+from video_reconstructor_hybrid_v6 import VideoReconstructorHybridV6
+
+# 目标视频
+target = "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/adx原/115196-1-363935819124715523.mp4"
+
+# 所有源视频
+source_videos = [
+    "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/剧集/1.mp4",
+    "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/剧集/2.mp4",
+]
+
+print("=" * 60)
+print("在所有源视频中搜索 115196")
+print("=" * 60)
+
+# 创建重构器
+reconstructor = VideoReconstructorHybridV6(
+    target_video=target,
+    source_videos=source_videos,
+    config={}
+)
+
 import tempfile
-import shutil
+reconstructor.temp_dir = Path(tempfile.mkdtemp())
 
-def get_video_duration(video_path):
-    cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
-           '-of', 'default=noprint_wrappers=1:nokey=1', str(video_path)]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    return float(result.stdout.strip())
-
-def extract_frame(video_path, time_sec, output_path):
-    cmd = [
-        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-        '-ss', str(time_sec), '-i', str(video_path),
-        '-vframes', '1', str(output_path)
-    ]
-    subprocess.run(cmd, capture_output=True)
-    return output_path.exists()
-
-def compare_frames(frame1_path, frame2_path):
-    img1 = cv2.imread(str(frame1_path))
-    img2 = cv2.imread(str(frame2_path))
-    if img1 is None or img2 is None:
-        return 0.0
+try:
+    # 提取目标音频
+    print("\n提取目标音频指纹...")
+    target_audio = reconstructor._extract_audio_fingerprint(Path(target))
+    print(f"  目标指纹: {len(target_audio)} 帧")
     
-    gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
-    gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
-    gray1 = cv2.resize(gray1, (320, 180))
-    gray2 = cv2.resize(gray2, (320, 180))
+    # 在每个源视频中搜索
+    print("\n搜索所有源视频...")
+    results = []
     
-    hist1 = cv2.calcHist([gray1], [0], None, [64], [0, 256])
-    hist2 = cv2.calcHist([gray2], [0], None, [64], [0, 256])
-    hist_sim = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
-    
-    result = cv2.matchTemplate(gray1, gray2, cv2.TM_CCOEFF_NORMED)
-    template_sim = np.max(result)
-    
-    return 0.5 * max(0, hist_sim) + 0.5 * template_sim
-
-def search_in_video(target, source, temp_dir):
-    """在单个源视频中搜索"""
-    target_duration = get_video_duration(target)
-    source_duration = get_video_duration(source)
-    
-    if source_duration < target_duration:
-        return None
-    
-    # 提取目标视频的关键帧
-    target_times = [0, target_duration * 0.25, target_duration * 0.5, target_duration * 0.75]
-    target_frames = {}
-    for t in target_times:
-        if t < target_duration:
-            frame_path = temp_dir / f"target_{t:.0f}.jpg"
-            if extract_frame(target, t, frame_path):
-                target_frames[t] = frame_path
-    
-    best_score = 0
-    best_start = 0
-    
-    # 每10秒搜索一次
-    for start in range(0, int(source_duration - target_duration), 10):
-        scores = []
-        for offset, target_frame in target_frames.items():
-            source_time = start + offset
-            if source_time < source_duration:
-                source_frame = temp_dir / f"source_{source.stem}_{start}_{offset:.0f}.jpg"
-                if extract_frame(source, source_time, source_frame):
-                    sim = compare_frames(target_frame, source_frame)
-                    scores.append(sim)
+    for source_path in source_videos:
+        source = Path(source_path)
+        print(f"\n搜索 {source.name}...")
         
-        if scores:
-            avg_score = np.mean(scores)
-            if avg_score > best_score:
-                best_score = avg_score
-                best_start = start
-    
-    return {'source': source.name, 'start': best_start, 'score': best_score}
-
-def main():
-    target = Path("/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/adx原/115196-1-363935819124715523.mp4")
-    sources_dir = Path("/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/剧集")
-    
-    target_duration = get_video_duration(target)
-    
-    print(f"🎬 在所有源视频中搜索 115196")
-    print(f"   目标时长: {target_duration:.1f}s")
-    print(f"   源视频目录: {sources_dir}\n")
-    
-    temp_dir = Path(tempfile.mkdtemp())
-    
-    try:
-        results = []
+        audio_score, start_time = reconstructor._find_audio_match(target_audio, source)
         
-        for source in sorted(sources_dir.glob("*.mp4")):
-            source_duration = get_video_duration(source)
-            print(f"📹 检查 {source.name} ({source_duration:.1f}s)...")
-            
-            result = search_in_video(target, source, temp_dir)
-            if result:
-                results.append(result)
-                print(f"   最佳匹配: @{result['start']}s, 相似度 {result['score']:.1%}")
-            else:
-                print(f"   时长不足，跳过")
+        print(f"  最佳匹配: @{start_time}s")
+        print(f"  音频评分: {audio_score:.1%}")
         
-        # 排序结果
-        results.sort(key=lambda x: x['score'], reverse=True)
-        
-        print(f"\n{'='*60}")
-        print(f"📊 搜索结果汇总")
-        print(f"{'='*60}")
-        
-        for i, r in enumerate(results, 1):
-            marker = "⭐" if r['score'] > 0.85 else "⚠️" if r['score'] > 0.7 else "❌"
-            print(f"   {i}. {r['source']}: @{r['start']}s, {r['score']:.1%} {marker}")
-        
-        if results and results[0]['score'] > 0.85:
-            print(f"\n✅ 找到高度匹配！")
-            print(f"   推荐: {results[0]['source']} @{results[0]['start']}s")
-        elif results and results[0]['score'] > 0.7:
-            print(f"\n⚠️ 找到可能匹配")
-            print(f"   推荐: {results[0]['source']} @{results[0]['start']}s")
-        else:
-            print(f"\n❌ 未找到良好匹配")
+        results.append({
+            'source': source.name,
+            'start_time': start_time,
+            'audio_score': audio_score
+        })
     
-    finally:
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
-
-if __name__ == '__main__':
-    main()
+    # 找出最佳结果
+    best = max(results, key=lambda x: x['audio_score'])
+    
+    print(f"\n{'='*60}")
+    print("搜索结果")
+    print("=" * 60)
+    for r in results:
+        marker = "⭐" if r['source'] == best['source'] else "  "
+        print(f"{marker} {r['source']}: @{r['start_time']}s ({r['audio_score']:.1%})")
+    
+    print(f"\n最佳匹配: {best['source']} @ {best['start_time']}s")
+    
+finally:
+    import shutil
+    if reconstructor.temp_dir and reconstructor.temp_dir.exists():
+        shutil.rmtree(reconstructor.temp_dir)
