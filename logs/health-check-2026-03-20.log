@@ -1,0 +1,31 @@
+# OpenClaw Health Check Log
+
+**Timestamp:** 2026-03-20 23:52:00 (Asia/Shanghai)
+**Status:** ✅ 正常运行
+
+## 检查结果
+
+### 服务状态
+- **Gateway Service:** 运行中 (pid 63055, state active)
+- **Node Service:** 未安装 LaunchAgent
+- **Sessions:** 297 active
+- **Feishu Channel:** ON / OK (2/2 账户已配置)
+
+### 系统信息
+- **OS:** macOS 26.3 (arm64)
+- **Node:** 23.11.0
+- **Dashboard:** http://127.0.0.1:18789/
+- **Tailscale:** off
+
+### 安全审计
+- **Critical:** 0
+- **Warning:** 2
+  - Reverse proxy headers are not trusted
+  - Feishu doc create can grant requester permissions
+- **Info:** 1
+
+### 备注
+服务运行正常，无需重启。检测到 2 个警告级别的安全问题，建议查看详细报告。
+
+---
+*自动生成的健康检查报告*

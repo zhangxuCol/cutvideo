@@ -1,0 +1,23 @@
+2026-03-21 06:52:00 CST - OpenClaw Health Check
+
+✅ 状态: 运行正常
+
+服务状态:
+- Gateway: 运行中 (pid 63055, state active)
+- LaunchAgent: 已安装并已加载
+- 会话数: 665 活跃会话
+- 模型: kimi-k2.5
+
+安全审计:
+- 0 严重 · 2 警告 · 1 信息
+- 警告1: 反向代理头未信任 (loopback 配置，可忽略)
+- 警告2: Feishu doc create 可授予请求者权限
+
+通道状态:
+- Feishu: 正常 (2/2 账户已配置)
+
+内存系统:
+- 0 文件 · 0 chunks · 脏状态
+- FTS 不可用 (缺少 fts5 模块)
+
+无需重启操作。

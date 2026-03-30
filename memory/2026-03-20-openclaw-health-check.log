@@ -1,0 +1,18 @@
+[2026-03-20 23:43 CST] OpenClaw 健康检查
+
+✅ 服务状态: 正常运行
+- Gateway 服务: 运行中 (pid 63055)
+- Feishu 频道: 已启用，状态正常 (2/2 账户)
+- 活跃会话: 288
+- 默认模型: kimi-k2.5
+
+⚠️ 安全警告 (2个):
+1. Reverse proxy headers 未信任 - 如通过反向代理暴露 Control UI，需配置 trustedProxies
+2. Feishu doc create 权限 - 创建文档时会授予请求者权限
+
+📊 资源使用:
+- 内存: 0 文件索引
+- 缓存: 开启
+- Heartbeat: 30m
+
+无需重启操作。

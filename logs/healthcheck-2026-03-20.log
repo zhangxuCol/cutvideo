@@ -1,0 +1,16 @@
+[2026-03-20 20:05 CST] OpenClaw 健康检查
+
+状态: ✅ 正常运行
+
+关键指标:
+- Gateway 服务: 运行中 (pid 44044)
+- 默认 Agent: 活跃 (main, kimi-k2.5)
+- 活跃会话: 85
+- Feishu 频道: 正常 (2/2 账户已配置)
+- 安全审计: 0 严重 · 2 警告 · 1 信息
+
+注意:
+- Memory 模块状态异常 (fts unavailable: no such module: fts5)
+- 安全警告: Reverse proxy headers 未配置信任
+
+无需重启操作。

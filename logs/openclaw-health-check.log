@@ -1,0 +1,28 @@
+# OpenClaw 健康检查日志
+
+## 2026-03-21 07:13 CST
+
+### 检查结果
+- **状态**: ✅ 正常运行
+- **Gateway**: 运行中 (pid 63055, state active)
+- **Feishu 频道**: 已配置，2个账户正常
+- **Sessions**: 684 活跃会话
+
+### 安全审计
+- 严重问题: 0
+- 警告: 2
+  - 反向代理头未配置信任（本地使用可忽略）
+  - Feishu 文档创建权限提示
+- 信息: 1
+
+### 备注
+服务运行正常，无需重启。
+[2026-03-21 07:49:14] OpenClaw Health Check - Status: RUNNING
+- Gateway service: Running (pid 63055, state active)
+- Feishu channel: OK (2 accounts)
+- Sessions: 712 active
+- Model: kimi-k2.5
+- Security: 0 critical, 2 warn, 1 info
+- Memory: 0 files, dirty state
+- Check completed successfully
+[2026-03-21 11:14:01] OpenClaw health check - Status: RUNNING | Gateway: running (pid 7209) | Feishu: OK | Sessions: 765 active
