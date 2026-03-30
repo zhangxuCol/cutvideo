@@ -62,3 +62,13 @@ reconstruct_video.sh
 *.mts
 *.m2ts
 *.vob
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.zip
+*.tar.gz
+01_test_data_generation/source_videos/
+cache/
+*.pkl
+ai_check/
