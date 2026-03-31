@@ -21,6 +21,60 @@ import wave
 import struct
 import json
 import pickle
+import re
+
+def extract_chromaprint(video_path: Path, start: float = 0, duration: float = None) -> list:
+    """使用 Chromaprint (fpcalc) 提取音频指纹"""
+    try:
+        cmd = ['fpcalc', '-raw']
+        if start > 0:
+            cmd.extend(['-start', str(int(start))])
+        if duration is not None:
+            cmd.extend(['-length', str(int(duration))])
+        cmd.append(str(video_path))
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            return []
+        
+        # 解析 fpcalc 输出
+        # 格式: DURATION=xxx\nFINGERPRINT=xxx
+        output = result.stdout
+        fingerprint_match = re.search(r'FINGERPRINT=(.+)', output)
+        
+        if fingerprint_match:
+            # 指纹是以逗号分隔的整数列表
+            fingerprint_str = fingerprint_match.group(1)
+            fingerprint = [int(x) for x in fingerprint_str.split(',')]
+            return fingerprint
+        return []
+    except Exception as e:
+        print(f"   Chromaprint 提取失败: {e}")
+        return []
+
+def compare_chromaprint(fp1: list, fp2: list) -> float:
+    """比较两个 Chromaprint 指纹的相似度"""
+    if not fp1 or not fp2:
+        return 0.0
+    
+    # 使用汉明距离计算相似度
+    # Chromaprint 指纹是 32-bit 整数列表
+    min_len = min(len(fp1), len(fp2))
+    if min_len == 0:
+        return 0.0
+    
+    matches = 0
+    for i in range(min_len):
+        # 计算汉明距离
+        xor = fp1[i] ^ fp2[i]
+        # 统计不同的 bit 数
+        diff_bits = bin(xor).count('1')
+        # 相似度 = 1 - (不同bit数 / 32)
+        sim = 1.0 - (diff_bits / 32.0)
+        matches += sim
+    
+    return matches / min_len
 
 @dataclass
 class SegmentTask:
@@ -63,45 +117,26 @@ class FastHighPrecisionReconstructor:
         result = subprocess.run(cmd, capture_output=True, text=True)
         return float(result.stdout.strip())
     
-    def extract_audio_fingerprint(self, video_path: Path, start: float = 0, duration: float = None) -> np.ndarray:
-        """提取音频指纹 - 带缓存"""
+    def extract_audio_fingerprint(self, video_path: Path, start: float = 0, duration: float = None) -> list:
+        """提取音频指纹 - 使用 Chromaprint"""
         duration_str = f"{duration:.0f}" if duration is not None else "full"
         cache_key = f"{video_path.stem}_{start:.0f}_{duration_str}"
-        cache_file = self.cache_dir / f"{cache_key}.pkl"
+        cache_file = self.cache_dir / f"{cache_key}_chromaprint.pkl"
         
         # 检查缓存
         if cache_file.exists():
             with open(cache_file, 'rb') as f:
                 return pickle.load(f)
         
-        # 提取
-        if duration is None:
-            duration = self.get_video_duration(video_path) - start
+        # 使用 Chromaprint 提取
+        fingerprint = extract_chromaprint(video_path, start, duration)
         
-        temp_wav = self.temp_dir / f"fp_{video_path.stem}_{start:.0f}.wav"
+        # 保存缓存
+        if fingerprint:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(fingerprint, f)
         
-        cmd = [
-            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-            '-ss', str(start), '-t', str(duration),
-            '-i', str(video_path), '-vn',
-            '-acodec', 'pcm_s16le', '-ar', '8000', '-ac', '1',  # 提高采样率
-            str(temp_wav)
-        ]
-        subprocess.run(cmd, capture_output=True)
-        
-        if not temp_wav.exists():
-            return np.array([])
-        
-        with wave.open(str(temp_wav), 'rb') as wf:
-            n_frames = wf.getnframes()
-            audio_data = wf.readframes(n_frames)
-            samples = struct.unpack(f'{n_frames}h', audio_data)
-        
-        samples_per_sec = 4000
-        n_blocks = len(samples) // samples_per_sec
-        features = []
-        
-        # 降低精度：每秒一个特征，步长2秒
+        return fingerprint
         for i in range(0, min(n_blocks, 200), 2):
             block = samples[i * samples_per_sec:(i + 1) * samples_per_sec]
             fft = np.fft.rfft(block)
@@ -135,55 +170,230 @@ class FastHighPrecisionReconstructor:
         
         print("   ✅ 预计算完成")
     
-    def find_match_fast(self, target_start: float, duration: float) -> Tuple[Path, float, float]:
-        """快速匹配 - 使用预计算指纹"""
-        
-        # 获取目标指纹片段
-        target_idx_start = int(target_start / 2)  # 步长2秒
-        target_idx_end = int((target_start + duration) / 2)
-        
-        if target_idx_start >= len(self.target_fingerprint):
-            return None, 0, 0
-        
-        target_segment = self.target_fingerprint[target_idx_start:target_idx_end]
-        
-        if len(target_segment) == 0:
-            return None, 0, 0
-        
+    def find_match_combined(self, target_start: float, duration: float, seg_index: int = 0) -> Tuple[Path, float, float]:
+        """音频+画面结合匹配 - 音频找区域，画面精确定位"""
         best_source = None
         best_start = 0
-        best_score = 0
+        best_score = 0.0
         
-        # 搜索所有源视频
-        for source, source_fp in self.source_fingerprints.items():
-            if len(source_fp) < len(target_segment):
-                continue
+        # 第一步：音频匹配找到候选区域（全视频搜索，不限于目标时间附近）
+        target_fp = extract_chromaprint(self.target_video, target_start, duration)
+        if not target_fp or len(target_fp) < 10:
+            # 音频指纹提取失败， fallback 到纯画面搜索
+            return self.find_best_match_by_visual(target_start, duration, seg_index)
+        
+        audio_candidates = []  # (source, start_sec, audio_score)
+        
+        for source in self.source_videos:
+            source_duration = self.get_video_duration(source)
             
-            # 扩大搜索范围：大步长搜索（步长2）+ 精细搜索
-            for start in range(0, len(source_fp) - len(target_segment), 2):
-                end = start + len(target_segment)
-                source_segment = source_fp[start:end]
+            # 全视频搜索（步长1秒，更精细）
+            for start_sec in range(0, int(source_duration - duration), 1):
+                source_fp = extract_chromaprint(source, start_sec, duration)
+                if not source_fp or len(source_fp) < 10:
+                    continue
                 
-                correlations = []
-                for t, s in zip(target_segment, source_segment):
-                    if len(t) == len(s) and np.std(t) > 0 and np.std(s) > 0:
-                        corr = np.corrcoef(t, s)[0, 1]
-                        correlations.append(corr)
-                    else:
-                        correlations.append(0)
-                
-                score = np.mean(correlations) if correlations else 0
-                if score > best_score:
-                    best_score = score
-                    best_start = start * 2  # 转换回秒
-                    best_source = source
-                
-                # 不提前退出，确保找到全局最优
-                if best_score > 0.99:
-                    break
+                score = compare_chromaprint(target_fp, source_fp)
+                if score > 0.40:  # 降低阈值，让更多候选通过
+                    audio_candidates.append((source, start_sec, score))
         
-        return best_source, best_start, best_score
+        if not audio_candidates:
+            # 没有找到音频匹配，fallback 到纯画面搜索
+            return self.find_best_match_by_visual(target_start, duration, seg_index)
+        
+        # 按音频分数排序，取前20个（增加候选数量）
+        audio_candidates.sort(key=lambda x: x[2], reverse=True)
+        top_audio = audio_candidates[:20]
+        
+        # 第二步：画面精细比对（在音频候选区域前后±3秒）
+        # 提取目标段的多个关键帧
+        target_frames = []
+        check_offsets = [0, duration * 0.3, duration * 0.7]  # 3个时间点
+        
+        for i, offset in enumerate(check_offsets):
+            target_frame = self.temp_dir / f"target_seg{seg_index}_fine_{i}.jpg"
+            self.extract_frame(self.target_video, target_start + offset, target_frame)
+            if target_frame.exists():
+                target_frames.append((offset, target_frame))
+        
+        if not target_frames:
+            # 画面提取失败，使用最佳音频匹配
+            best = top_audio[0]
+            return best[0], best[1], best[2]
+        
+        # 在音频候选区域附近精细搜索
+        for source, audio_start, audio_score in top_audio:
+            # 在音频匹配点前后 ±3 秒精细搜索
+            search_start = max(0, audio_start - 3)
+            search_end = min(int(self.get_video_duration(source) - duration), audio_start + 3)
+            
+            for start_sec in range(search_start, search_end, 1):  # 步长1秒
+                total_sim = 0
+                valid_frames = 0
+                
+                for offset, target_frame in target_frames:
+                    source_frame = self.temp_dir / f"fine_{seg_index}_{source.stem}_{start_sec}_{int(offset)}.jpg"
+                    self.extract_frame(source, start_sec + offset, source_frame)
+                    
+                    if source_frame.exists():
+                        sim = self.calculate_frame_similarity(target_frame, source_frame)
+                        total_sim += sim
+                        valid_frames += 1
+                        source_frame.unlink()
+                
+                if valid_frames > 0:
+                    avg_sim = total_sim / valid_frames
+                    # 综合评分：音频50% + 画面50%
+                    combined_score = 0.5 * audio_score + 0.5 * avg_sim
+                    if combined_score > best_score:
+                        best_score = combined_score
+                        best_start = start_sec
+                        best_source = source
+                
+                if best_score > 0.90:
+                    break
+            
+            if best_score > 0.90:
+                break
+        
+        # 清理目标帧
+        for _, target_frame in target_frames:
+            if target_frame.exists():
+                target_frame.unlink()
+        
+        if best_score >= 0.70:
+            return best_source, best_start, best_score
+        
+        # 都失败了，使用最佳音频匹配
+        best = top_audio[0]
+        return best[0], best[1], best[2] * 0.8  # 降低分数表示不确定
     
+    def find_best_match_by_visual(self, target_start: float, duration: float, seg_index: int = 0) -> Tuple[Path, float, float]:
+        """当音频匹配失败时，遍历所有源视频进行画面匹配（更精细的搜索）"""
+        best_source = None
+        best_start = 0
+        best_score = 0.0
+        
+        # 提取目标帧（多个时间点）
+        target_frames = []
+        check_offsets = [0, duration * 0.3, duration * 0.7]  # 3个时间点
+        
+        for i, offset in enumerate(check_offsets):
+            target_frame = self.temp_dir / f"visual_match_target_{seg_index}_{i}.jpg"
+            self.extract_frame(self.target_video, target_start + offset, target_frame)
+            if target_frame.exists():
+                target_frames.append((offset, target_frame))
+        
+        if not target_frames:
+            return None, 0, 0
+        
+        # 遍历所有源视频
+        for source in self.source_videos:
+            source_duration = self.get_video_duration(source)
+            
+            # 扩大搜索范围：在目标时间点附近搜索（±60秒）
+            search_start = max(0, int(target_start - 60))
+            search_end = min(int(source_duration - duration), int(target_start + 60))
+            
+            # 滑动搜索（步长2秒，更精细）
+            for start_sec in range(search_start, search_end, 2):
+                total_sim = 0
+                valid_frames = 0
+                
+                # 对比多个时间点
+                for offset, target_frame in target_frames:
+                    source_frame = self.temp_dir / f"visual_match_source_{seg_index}_{source.stem}_{start_sec}_{int(offset)}.jpg"
+                    self.extract_frame(source, start_sec + offset, source_frame)
+                    
+                    if source_frame.exists():
+                        sim = self.calculate_frame_similarity(target_frame, source_frame)
+                        total_sim += sim
+                        valid_frames += 1
+                        # 清理临时帧
+                        source_frame.unlink()
+                
+                if valid_frames > 0:
+                    avg_sim = total_sim / valid_frames
+                    if avg_sim > best_score:
+                        best_score = avg_sim
+                        best_start = start_sec
+                        best_source = source
+                
+                # 提前退出条件
+                if best_score > 0.90:
+                    break
+            
+            if best_score > 0.90:
+                break
+        
+        # 清理目标帧
+        for _, target_frame in target_frames:
+            if target_frame.exists():
+                target_frame.unlink()
+        
+        # 只有相似度足够高才返回
+        if best_score >= 0.75:
+            return best_source, best_start, best_score
+        return None, 0, 0
+    
+    def _find_alternative_match(self, target_start: float, duration: float, 
+                                 source: Path, min_start: float, seg_index: int) -> float:
+        """
+        在同一源视频中向后搜索，找一个不重叠的替代匹配点
+        返回: 新的开始时间，或 None（如果没找到）
+        """
+        # 提取目标帧（只取2个关键点，减少计算）
+        target_frames = []
+        check_offsets = [0, duration * 0.5]  # 减少到2个时间点
+        
+        for i, offset in enumerate(check_offsets):
+            target_frame = self.temp_dir / f"alt_target_{seg_index}_{i}.jpg"
+            self.extract_frame(self.target_video, target_start + offset, target_frame)
+            if target_frame.exists():
+                target_frames.append((offset, target_frame))
+        
+        if not target_frames:
+            return None
+        
+        source_duration = self.get_video_duration(source)
+        best_start = None
+        best_score = 0.0
+        
+        # 限制搜索范围：最多向后搜索30秒，步长1秒（减少计算量）
+        search_end = min(int(source_duration - duration), int(min_start + 30))
+        
+        for start_sec in range(int(min_start), search_end, 1):
+            total_sim = 0
+            valid_frames = 0
+            
+            for offset, target_frame in target_frames:
+                source_frame = self.temp_dir / f"alt_source_{seg_index}_{start_sec}_{int(offset)}.jpg"
+                self.extract_frame(source, start_sec + offset, source_frame)
+                
+                if source_frame.exists():
+                    sim = self.calculate_frame_similarity(target_frame, source_frame)
+                    total_sim += sim
+                    valid_frames += 1
+                    source_frame.unlink()
+            
+            if valid_frames > 0:
+                avg_sim = total_sim / valid_frames
+                # 降低相似度阈值，提高找到替代点的概率
+                if avg_sim > best_score and avg_sim >= 0.70:
+                    best_score = avg_sim
+                    best_start = start_sec
+                    
+                    # 如果找到足够好的匹配，提前退出
+                    if avg_sim >= 0.85:
+                        break
+        
+        # 清理目标帧
+        for _, target_frame in target_frames:
+            if target_frame.exists():
+                target_frame.unlink()
+        
+        return best_start
+
     def quick_verify(self, source: Path, source_start: float, target_start: float, duration: float) -> Tuple[bool, float]:
         """快速画面验证 - 3个时间点"""
         
@@ -244,56 +454,29 @@ class FastHighPrecisionReconstructor:
         return 0.5 * max(0, hist_sim) + 0.5 * template_sim
     
     def process_segment(self, task: SegmentTask) -> SegmentResult:
-        """处理单个段"""
+        """处理单个段 - 音频+画面结合匹配"""
         
-        # ========== 特殊匹配（最高优先级）==========
-        # 针对已知的失败点使用精确匹配
-        # 95s->第19段(95-100s), 165s->第33段(165-170s), 185s->第37段(185-190s)
-        # 注意：段索引是0-based，段号 = 时间 / 5
-        special_segments = {
-            19: ('/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/剧集/363747886756540416_363977611190734848_363977611040526336.mp4', 94),  # 95s对应94s，相似度0.995
-            33: ('/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/剧集/1.mp4', 100),  # 165s对应100s，相似度0.915
-            37: ('/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/剧集/363747886756540416_363977673945911296_363977667063844864.mp4', 18),  # 185s对应18s，相似度0.959
-        }
-        
-        if task.index in special_segments:
-            source_path, source_start = special_segments[task.index]
-            source = Path(source_path)
-            print(f"   段 {task.index}/44 ✅ [特殊匹配] {source.name} @ {source_start}s")
-            # 强制使用特殊匹配，不进行验证，直接返回成功
-            result = SegmentResult(
-                index=task.index,
-                success=True,
-                source=source,
-                source_start=source_start,
-                quality={'audio': 0.95, 'frame': 0.90, 'special': True}
-            )
-            return result  # 立即返回，不执行任何其他逻辑
-        
-        # ========== 普通匹配流程 ==========
-        source, source_start, audio_score = self.find_match_fast(
-            task.target_start, task.duration
+        # 音频+画面结合匹配
+        source, source_start, combined_score = self.find_match_combined(
+            task.target_start, task.duration, task.index
         )
         
-        if not source or audio_score < 0.70:
+        if not source:
             return SegmentResult(index=task.index, success=False)
         
-        # 快速画面验证
-        passed, frame_score = self.quick_verify(
-            source, source_start, task.target_start, task.duration
-        )
-        
-        # 综合评分 - 更严格的音视频匹配
-        combined_score = 0.5 * frame_score + 0.5 * audio_score
+        # 综合评分阈值
         if combined_score < 0.70:
+            print(f"   段 {task.index}/44 ⚠️ 匹配分数不足 ({combined_score:.2f})")
             return SegmentResult(index=task.index, success=False)
+        
+        print(f"   段 {task.index}/44 ✅ {source.name} @ {source_start}s (综合: {combined_score:.2f})")
         
         return SegmentResult(
             index=task.index,
             success=True,
             source=source,
             source_start=source_start,
-            quality={'audio': audio_score, 'frame': frame_score}
+            quality={'combined': combined_score}
         )
     
     def reconstruct_fast(self, output_path: str) -> bool:
@@ -309,9 +492,6 @@ class FastHighPrecisionReconstructor:
         
         target_duration = self.get_video_duration(self.target_video)
         print(f"\n📹 目标视频: {target_duration:.1f}s")
-        
-        # 预计算指纹
-        self.precompute_fingerprints()
         
         # 创建任务列表
         tasks = []
@@ -365,17 +545,86 @@ class FastHighPrecisionReconstructor:
             if seg['index'] in [18, 19, 20, 21, 32, 33, 34, 35, 36, 37, 38]:
                 print(f"   [调试] 段 {seg['index']}: target_start={seg['target_start']}s, source={seg['source'].name}, start={seg['start']}s")
         
-        # 去重：只跳过真正重复的片段（同一源+同一时间+同一段）
+        # 去重：只跳过真正完全相同的片段（同一源+同一时间+同一段）
+        # 注意：不同段使用同一源的不同时间是正常的（连续片段）
         seen_segments = set()
         unique_segments = []
+        
         for seg in confirmed_segments:
             # 使用源路径、开始时间、段索引作为唯一标识
             unique_key = f"{seg['source']}_{seg['start']:.1f}_{seg['index']}"
             if unique_key not in seen_segments:
                 seen_segments.add(unique_key)
                 unique_segments.append(seg)
+            else:
+                print(f"   [去重] 跳过完全重复的段 {seg['index']}: {seg['source'].name} @ {seg['start']}s")
         
         confirmed_segments = unique_segments
+        
+        # 检查并修复相邻段的时间重叠（同一源视频）
+        print(f"\n   检查相邻段重叠...")
+        overlap_fixed = 0
+        for i in range(1, len(confirmed_segments)):
+            prev = confirmed_segments[i-1]
+            curr = confirmed_segments[i]
+            
+            if prev['source'] == curr['source']:
+                prev_end = prev['start'] + prev['duration']
+                overlap = prev_end - curr['start']
+                
+                if overlap > 0.5:  # 重叠超过0.5秒才处理
+                    print(f"   ⚠️ 段 {curr['index']} 与段 {prev['index']} 重叠 {overlap:.1f}s")
+                    
+                    # 策略1：尝试在同一源视频中向后搜索，找一个不重叠的替代匹配点
+                    alternative_start = self._find_alternative_match(
+                        curr['target_start'], curr['duration'], 
+                        curr['source'], prev_end, curr['index']
+                    )
+                    
+                    if alternative_start is not None:
+                        # 找到了替代匹配点
+                        print(f"   ✅ 段 {curr['index']} 找到替代匹配点: {curr['start']}s -> {alternative_start}s")
+                        curr['start'] = alternative_start
+                        overlap_fixed += 1
+                        continue
+                    
+                    # 策略2：尝试在其他源视频中搜索
+                    alt_source, alt_start, alt_score = self.find_best_match_by_visual(
+                        curr['target_start'], curr['duration'], curr['index']
+                    )
+                    
+                    if alt_source and alt_score >= 0.70 and alt_source != curr['source']:
+                        print(f"   ✅ 段 {curr['index']} 切换到新源: {alt_source.name} @ {alt_start}s (相似度: {alt_score:.2f})")
+                        curr['source'] = alt_source
+                        curr['start'] = alt_start
+                        overlap_fixed += 1
+                        continue
+                    
+                    # 策略3：如果当前段开始时间早于前一段，直接调整开始时间
+                    if curr['start'] < prev['start']:
+                        print(f"   ⚠️ 段 {curr['index']} 时间顺序错乱，强制调整: {curr['start']}s -> {prev_end}s")
+                        curr['start'] = prev_end
+                        overlap_fixed += 1
+                        continue
+                    
+                    # 策略4：重叠较小，尝试微调当前段
+                    if overlap <= 2.0:
+                        new_start = curr['start'] + overlap + 0.1
+                        print(f"   ⚠️ 段 {curr['index']} 微调: {curr['start']}s -> {new_start}s")
+                        curr['start'] = new_start
+                        overlap_fixed += 1
+                        continue
+                    
+                    # 策略5：重叠太大，直接调整（会丢失内容）
+                    print(f"   ⚠️ 段 {curr['index']} 重叠过大，强制调整: {curr['start']}s -> {prev_end}s")
+                    curr['start'] = prev_end
+                    overlap_fixed += 1
+        
+        if overlap_fixed > 0:
+            print(f"   ✅ 修复了 {overlap_fixed} 处重叠")
+        
+        if overlap_fixed > 0:
+            print(f"   ✅ 修复了 {overlap_fixed} 处重叠")
         
         print(f"\n✅ 成功匹配: {len(confirmed_segments)}/{len(tasks)} 段")
         
@@ -398,32 +647,18 @@ class FastHighPrecisionReconstructor:
     def _generate_output(self, segments: List[dict], output_path: str, target_duration: float) -> bool:
         """生成输出 - 同步音视频"""
         
-        # 特殊段定义（确保音视频完全同步）
-        special_segments_output = {
-            19: ('/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/剧集/363747886756540416_363977611190734848_363977611040526336.mp4', 94),  # 95s对应94s
-            33: ('/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/剧集/1.mp4', 100),  # 165s对应100s
-            37: ('/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/剧集/363747886756540416_363977673945911296_363977667063844864.mp4', 18),  # 185s对应18s
-        }
-        
         video_clips = []
         audio_clips = []
         
         for seg in segments:
-            # 检查是否是特殊段（强制使用指定源）- 输出阶段再次确认
-            if seg['index'] in special_segments_output:
-                special_source, special_start = special_segments_output[seg['index']]
-                seg_source = Path(special_source)
-                seg_start = special_start
-                print(f"   [输出阶段特殊处理] 段 {seg['index']}: {seg_source.name} @ {seg_start}s")
-            else:
-                seg_source = seg['source']
-                seg_start = seg['start']
+            seg_source = seg['source']
+            seg_start = seg['start']
             
-            # 提取视频片段 - 使用重新编码确保精确裁剪
+            # 提取视频片段 - 使用精确提取（-ss在-i之前）
             video_clip = self.temp_dir / f"seg_{seg['index']:03d}_v.mp4"
             cmd = [
                 'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                '-ss', str(seg_start),
+                '-ss', str(seg_start),  # 放在-i之前，逐帧精确seek
                 '-t', str(seg['duration']),
                 '-i', str(seg_source),
                 '-an', '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
@@ -431,11 +666,11 @@ class FastHighPrecisionReconstructor:
             ]
             subprocess.run(cmd, capture_output=True)
             
-            # 提取音频片段（从同一源）
+            # 提取音频片段（从同一源，同样精确提取）
             audio_clip = self.temp_dir / f"seg_{seg['index']:03d}_a.aac"
             cmd = [
                 'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                '-ss', str(seg_start),
+                '-ss', str(seg_start),  # 放在-i之前，逐帧精确seek
                 '-t', str(seg['duration']),
                 '-i', str(seg_source),
                 '-vn', '-c:a', 'aac', '-b:a', '128k',
@@ -523,9 +758,86 @@ class FastHighPrecisionReconstructor:
         if Path(output_path).exists():
             final_duration = self.get_video_duration(Path(output_path))
             print(f"   最终视频时长: {final_duration:.2f}s")
+            
+            # AI亲自查看视频内容
+            self.ai_verify_video(output_path)
             return True
         
         return False
+    
+    def ai_verify_video(self, output_path: str) -> bool:
+        """
+        【强制】AI亲自查看视频关键时间点
+        必须实际查看每一帧，不能依赖自动工具的百分比
+        """
+        import os
+        
+        print("\n" + "="*70)
+        print("🤖 【强制】AI亲自查看视频内容")
+        print("="*70)
+        print("⚠️  警告：必须实际查看每一帧，不能只看百分比！")
+        
+        # 创建检查目录
+        check_dir = Path("ai_check_round" + str(getattr(self, 'round_num', 'X')))
+        check_dir.mkdir(exist_ok=True)
+        
+        # 关键时间点检查
+        check_points = [0, 75, 100, 165, 200]
+        
+        frame_pairs = []  # 存储帧路径用于后续查看
+        
+        for time_sec in check_points:
+            print(f"\n🔍 提取时间点 {time_sec}s 的帧...")
+            
+            # 提取原视频帧
+            original_frame = check_dir / f"orig_{time_sec:03d}s.jpg"
+            cmd = [
+                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                '-ss', str(time_sec), '-i', str(self.target_video),
+                '-vframes', '1', '-q:v', '2', str(original_frame)
+            ]
+            subprocess.run(cmd, capture_output=True)
+            
+            # 提取生成视频帧
+            generated_frame = check_dir / f"gen_{time_sec:03d}s.jpg"
+            cmd = [
+                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                '-ss', str(time_sec), '-i', str(output_path),
+                '-vframes', '1', '-q:v', '2', str(generated_frame)
+            ]
+            subprocess.run(cmd, capture_output=True)
+            
+            if original_frame.exists() and generated_frame.exists():
+                frame_pairs.append({
+                    'time': time_sec,
+                    'original': original_frame,
+                    'generated': generated_frame
+                })
+                print(f"   ✅ 原视频帧: {original_frame}")
+                print(f"   ✅ 生成帧: {generated_frame}")
+            else:
+                print(f"   ❌ 帧提取失败")
+        
+        # 保存检查目录路径供外部查看
+        self.last_check_dir = check_dir
+        
+        print("\n" + "="*70)
+        print("📋 【下一步】请使用 read 工具查看以下帧对：")
+        print("="*70)
+        for pair in frame_pairs:
+            print(f"\n时间点 {pair['time']}s:")
+            print(f"  read {pair['original']}")
+            print(f"  read {pair['generated']}")
+        
+        print("\n" + "="*70)
+        print("⚠️  必须完成以下步骤：")
+        print("1. 使用 read 工具查看每一对帧")
+        print("2. 对比画面内容是否一致")
+        print("3. 输出查看报告")
+        print("4. 等待用户确认")
+        print("="*70)
+        
+        return True
         
         if abs(current_duration - target_duration) > 0.5:
             # 调整速度
