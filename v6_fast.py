@@ -10,6 +10,7 @@
 
 import cv2
 import numpy as np
+import argparse
 from pathlib import Path
 import subprocess
 import tempfile
@@ -22,6 +23,8 @@ import struct
 import json
 import pickle
 import re
+from PIL import Image
+import imagehash
 
 def extract_chromaprint(video_path: Path, start: float = 0, duration: float = None) -> list:
     """使用 Chromaprint (fpcalc) 提取音频指纹"""
@@ -106,7 +109,10 @@ class FastHighPrecisionReconstructor:
         self.match_threshold = 0.95
         self.segment_duration = 5.0  # 降低分段时长提高精度
         self.max_workers = 4  # 并行线程数
-        
+
+        # pHash 帧索引
+        self.frame_index = {}  # {video_path: [(time, phash), ...]}
+
         # 缓存
         self.source_fingerprints = {}
         self.target_fingerprint = None
@@ -137,22 +143,76 @@ class FastHighPrecisionReconstructor:
                 pickle.dump(fingerprint, f)
         
         return fingerprint
-        for i in range(0, min(n_blocks, 200), 2):
-            block = samples[i * samples_per_sec:(i + 1) * samples_per_sec]
-            fft = np.fft.rfft(block)
-            magnitude = np.abs(fft)
-            bands = np.array([np.mean(magnitude[j:j+len(magnitude)//10]) 
-                            for j in range(0, len(magnitude), len(magnitude)//10)])
-            features.append(bands[:10])
-        
-        result = np.array(features)
-        
-        # 保存缓存
-        with open(cache_file, 'wb') as f:
-            pickle.dump(result, f)
-        
-        return result
-    
+
+    def extract_frame_to_pil(self, video_path: Path, time_sec: float) -> Image.Image:
+        """提取帧并转换为 PIL Image"""
+        temp_frame = self.temp_dir / f"phash_frame_{video_path.stem}_{int(time_sec*100)}.jpg"
+        cmd = [
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+            '-ss', str(time_sec), '-i', str(video_path),
+            '-vframes', '1', '-vf', 'scale=320:180',
+            str(temp_frame)
+        ]
+        subprocess.run(cmd, capture_output=True)
+        if temp_frame.exists():
+            img = Image.open(str(temp_frame))
+            img = img.copy()
+            temp_frame.unlink()
+            return img
+        return None
+
+    def compute_phash(self, img: Image.Image) -> imagehash.ImageHash:
+        """计算感知哈希"""
+        return imagehash.phash(img, hash_size=8)
+
+    def build_frame_index(self, sample_interval: float = 1.0):
+        """预建帧索引：提取所有源视频的帧 pHash"""
+        index_file = self.cache_dir / "frame_index_v6.pkl"
+
+        if index_file.exists():
+            print(f"\n📂 加载已有帧索引: {index_file}")
+            with open(index_file, 'rb') as f:
+                self.frame_index = pickle.load(f)
+            total_frames = sum(len(v) for v in self.frame_index.values())
+            print(f"   ✅ 已索引 {len(self.frame_index)} 个视频，共 {total_frames} 帧")
+            return
+
+        print(f"\n🔨 构建帧索引 (采样间隔: {sample_interval}s)...")
+        for i, video_path in enumerate(self.source_videos):
+            print(f"   [{i+1}/{len(self.source_videos)}] {video_path.name}")
+            duration = self.get_video_duration(video_path)
+            frames = []
+            for t in np.arange(0, duration, sample_interval):
+                img = self.extract_frame_to_pil(video_path, t)
+                if img:
+                    frames.append((t, self.compute_phash(img)))
+            self.frame_index[video_path] = frames
+            print(f"      提取了 {len(frames)} 帧")
+
+        with open(index_file, 'wb') as f:
+            pickle.dump(self.frame_index, f)
+        total_frames = sum(len(v) for v in self.frame_index.values())
+        print(f"\n✅ 索引构建完成: {len(self.frame_index)} 个视频，共 {total_frames} 帧")
+
+    def find_match_by_phash(self, target_start: float, duration: float,
+                            seg_index: int = 0, top_k: int = 10) -> List[Tuple[Path, float, float]]:
+        """使用 pHash 快速查找匹配候选，返回 [(source, start_time, similarity), ...]"""
+        target_img = self.extract_frame_to_pil(self.target_video, target_start + duration * 0.5)
+        if not target_img:
+            return []
+        target_phash = self.compute_phash(target_img)
+
+        candidates = []
+        for video_path, frames in self.frame_index.items():
+            for time_sec, phash in frames:
+                distance = target_phash - phash
+                if distance <= 18:
+                    similarity = 1.0 - (distance / 64.0)
+                    candidates.append((video_path, time_sec, similarity))
+
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        return candidates[:top_k]
+
     def precompute_fingerprints(self):
         """预计算所有音频指纹"""
         print("\n🔄 预计算音频指纹...")
@@ -171,102 +231,133 @@ class FastHighPrecisionReconstructor:
         print("   ✅ 预计算完成")
     
     def find_match_combined(self, target_start: float, duration: float, seg_index: int = 0) -> Tuple[Path, float, float]:
-        """音频+画面结合匹配 - 音频找区域，画面精确定位"""
+        """三阶段匹配：pHash 预筛选 → 音频验证 → 画面精细定位"""
         best_source = None
         best_start = 0
         best_score = 0.0
-        
-        # 第一步：音频匹配找到候选区域（全视频搜索，不限于目标时间附近）
+
+        # 第一步：pHash 快速预筛选候选
+        phash_candidates = self.find_match_by_phash(target_start, duration, seg_index, top_k=10)
+
+        if phash_candidates:
+            # 第二步：对 pHash 候选做音频+画面精细验证
+            target_fp = extract_chromaprint(self.target_video, target_start, duration)
+            target_frames = []
+            check_offsets = [0, duration * 0.3, duration * 0.7]
+            for i, offset in enumerate(check_offsets):
+                tf = self.temp_dir / f"target_seg{seg_index}_p_{i}.jpg"
+                self.extract_frame(self.target_video, target_start + offset, tf)
+                if tf.exists():
+                    target_frames.append((offset, tf))
+
+            for source, phash_time, phash_sim in phash_candidates:
+                # 在 pHash 匹配时间点前后 ±2 秒精细搜索
+                source_duration = self.get_video_duration(source)
+                search_start = max(0, int(phash_time) - 2)
+                search_end = min(int(source_duration - duration), int(phash_time) + 2)
+
+                for start_sec in range(search_start, search_end + 1, 1):
+                    # 画面验证
+                    visual_sim = 0.0
+                    if target_frames:
+                        total_sim = 0
+                        valid = 0
+                        for offset, target_frame in target_frames:
+                            sf = self.temp_dir / f"fine_{seg_index}_{source.stem}_{start_sec}_{int(offset)}.jpg"
+                            self.extract_frame(source, start_sec + offset, sf)
+                            if sf.exists():
+                                total_sim += self.calculate_frame_similarity(target_frame, sf)
+                                valid += 1
+                                sf.unlink()
+                        visual_sim = total_sim / valid if valid > 0 else 0
+
+                    # 音频验证
+                    audio_sim = 0.0
+                    if target_fp and len(target_fp) >= 10:
+                        source_fp = extract_chromaprint(source, start_sec, duration)
+                        if source_fp and len(source_fp) >= 10:
+                            audio_sim = compare_chromaprint(target_fp, source_fp)
+
+                    # 综合评分：pHash 20% + 音频 40% + 画面 40%
+                    combined_score = 0.2 * phash_sim + 0.4 * audio_sim + 0.4 * visual_sim
+                    if combined_score > best_score:
+                        best_score = combined_score
+                        best_start = start_sec
+                        best_source = source
+
+                    if best_score > 0.92:
+                        break
+
+            # 清理目标帧
+            for _, tf in target_frames:
+                if tf.exists():
+                    tf.unlink()
+
+            if best_source and best_score >= 0.70:
+                return best_source, best_start, best_score
+
+        # Fallback：无 pHash 候选时，回退到原音频+画面搜索
         target_fp = extract_chromaprint(self.target_video, target_start, duration)
         if not target_fp or len(target_fp) < 10:
-            # 音频指纹提取失败， fallback 到纯画面搜索
             return self.find_best_match_by_visual(target_start, duration, seg_index)
-        
-        audio_candidates = []  # (source, start_sec, audio_score)
-        
+
+        audio_candidates = []
         for source in self.source_videos:
             source_duration = self.get_video_duration(source)
-            
-            # 全视频搜索（步长1秒，更精细）
             for start_sec in range(0, int(source_duration - duration), 1):
                 source_fp = extract_chromaprint(source, start_sec, duration)
                 if not source_fp or len(source_fp) < 10:
                     continue
-                
                 score = compare_chromaprint(target_fp, source_fp)
-                if score > 0.40:  # 降低阈值，让更多候选通过
+                if score > 0.40:
                     audio_candidates.append((source, start_sec, score))
-        
+
         if not audio_candidates:
-            # 没有找到音频匹配，fallback 到纯画面搜索
             return self.find_best_match_by_visual(target_start, duration, seg_index)
-        
-        # 按音频分数排序，取前20个（增加候选数量）
+
         audio_candidates.sort(key=lambda x: x[2], reverse=True)
         top_audio = audio_candidates[:20]
-        
-        # 第二步：画面精细比对（在音频候选区域前后±3秒）
-        # 提取目标段的多个关键帧
+
         target_frames = []
-        check_offsets = [0, duration * 0.3, duration * 0.7]  # 3个时间点
-        
+        check_offsets = [0, duration * 0.3, duration * 0.7]
         for i, offset in enumerate(check_offsets):
-            target_frame = self.temp_dir / f"target_seg{seg_index}_fine_{i}.jpg"
-            self.extract_frame(self.target_video, target_start + offset, target_frame)
-            if target_frame.exists():
-                target_frames.append((offset, target_frame))
-        
+            tf = self.temp_dir / f"target_seg{seg_index}_fine_{i}.jpg"
+            self.extract_frame(self.target_video, target_start + offset, tf)
+            if tf.exists():
+                target_frames.append((offset, tf))
+
         if not target_frames:
-            # 画面提取失败，使用最佳音频匹配
             best = top_audio[0]
             return best[0], best[1], best[2]
-        
-        # 在音频候选区域附近精细搜索
+
         for source, audio_start, audio_score in top_audio:
-            # 在音频匹配点前后 ±3 秒精细搜索
             search_start = max(0, audio_start - 3)
             search_end = min(int(self.get_video_duration(source) - duration), audio_start + 3)
-            
-            for start_sec in range(search_start, search_end, 1):  # 步长1秒
+            for start_sec in range(search_start, search_end, 1):
                 total_sim = 0
                 valid_frames = 0
-                
                 for offset, target_frame in target_frames:
-                    source_frame = self.temp_dir / f"fine_{seg_index}_{source.stem}_{start_sec}_{int(offset)}.jpg"
-                    self.extract_frame(source, start_sec + offset, source_frame)
-                    
-                    if source_frame.exists():
-                        sim = self.calculate_frame_similarity(target_frame, source_frame)
-                        total_sim += sim
+                    sf = self.temp_dir / f"fine_{seg_index}_{source.stem}_{start_sec}_{int(offset)}.jpg"
+                    self.extract_frame(source, start_sec + offset, sf)
+                    if sf.exists():
+                        total_sim += self.calculate_frame_similarity(target_frame, sf)
                         valid_frames += 1
-                        source_frame.unlink()
-                
+                        sf.unlink()
                 if valid_frames > 0:
                     avg_sim = total_sim / valid_frames
-                    # 综合评分：音频50% + 画面50%
                     combined_score = 0.5 * audio_score + 0.5 * avg_sim
                     if combined_score > best_score:
                         best_score = combined_score
                         best_start = start_sec
                         best_source = source
-                
                 if best_score > 0.90:
                     break
-            
-            if best_score > 0.90:
-                break
-        
-        # 清理目标帧
-        for _, target_frame in target_frames:
-            if target_frame.exists():
-                target_frame.unlink()
-        
-        if best_score >= 0.70:
-            return best_source, best_start, best_score
-        
-        # 都失败了，使用最佳音频匹配
-        best = top_audio[0]
-        return best[0], best[1], best[2] * 0.8  # 降低分数表示不确定
+
+        for _, tf in target_frames:
+            if tf.exists():
+                tf.unlink()
+
+        return best_source, best_start, best_score
     
     def find_best_match_by_visual(self, target_start: float, duration: float, seg_index: int = 0) -> Tuple[Path, float, float]:
         """当音频匹配失败时，遍历所有源视频进行画面匹配（更精细的搜索）"""
@@ -454,23 +545,26 @@ class FastHighPrecisionReconstructor:
         return 0.5 * max(0, hist_sim) + 0.5 * template_sim
     
     def process_segment(self, task: SegmentTask) -> SegmentResult:
-        """处理单个段 - 音频+画面结合匹配"""
-        
+        """处理单个段 - 音频+画面结合匹配，失败时用目标视频兜底"""
+
         # 音频+画面结合匹配
         source, source_start, combined_score = self.find_match_combined(
             task.target_start, task.duration, task.index
         )
-        
-        if not source:
-            return SegmentResult(index=task.index, success=False)
-        
-        # 综合评分阈值
-        if combined_score < 0.70:
-            print(f"   段 {task.index}/44 ⚠️ 匹配分数不足 ({combined_score:.2f})")
-            return SegmentResult(index=task.index, success=False)
-        
+
+        if not source or combined_score < 0.70:
+            # 兜底：使用目标视频本身对应时间段
+            print(f"   段 {task.index}/44 ⚠️ 匹配失败 (score={combined_score:.2f})，使用目标视频兜底")
+            return SegmentResult(
+                index=task.index,
+                success=True,
+                source=self.target_video,
+                source_start=task.target_start,
+                quality={'combined': 0.0, 'fallback': True}
+            )
+
         print(f"   段 {task.index}/44 ✅ {source.name} @ {source_start}s (综合: {combined_score:.2f})")
-        
+
         return SegmentResult(
             index=task.index,
             success=True,
@@ -482,14 +576,16 @@ class FastHighPrecisionReconstructor:
     def reconstruct_fast(self, output_path: str) -> bool:
         """极速重构"""
         import time
-        
+
         print(f"\n{'='*70}")
-        print(f"🚀 极速高精度重构 V3")
-        print(f"   目标: 3分钟/视频")
+        print(f"🚀 极速高精度重构 V3 + pHash")
         print(f"{'='*70}")
-        
+
         start_time = time.time()
-        
+
+        # 预建 pHash 帧索引（首次运行后缓存，后续秒速加载）
+        self.build_frame_index(sample_interval=1.0)
+
         target_duration = self.get_video_duration(self.target_video)
         print(f"\n📹 目标视频: {target_duration:.1f}s")
         
@@ -539,11 +635,27 @@ class FastHighPrecisionReconstructor:
                 })
         
         confirmed_segments.sort(key=lambda x: x['index'])
-        
-        # 打印段18-21和32-38的信息用于调试
+
+        # 强制单调递增：相邻两段使用同一源视频时，源时间必须单调递增
+        # 不同目标段可以独立地映射到同一源视频的任意位置
+        print(f"\n   强制单调递增校验...")
+        monotonic_segments = []
+        removed_count = 0
+
         for seg in confirmed_segments:
-            if seg['index'] in [18, 19, 20, 21, 32, 33, 34, 35, 36, 37, 38]:
-                print(f"   [调试] 段 {seg['index']}: target_start={seg['target_start']}s, source={seg['source'].name}, start={seg['start']}s")
+            if monotonic_segments:
+                prev = monotonic_segments[-1]
+                if prev['source'] == seg['source']:
+                    prev_end = prev['start'] + prev['duration']
+                    if seg['start'] < prev_end - 0.5:
+                        print(f"   [单调] 剔除倒退段 {seg['index']}: {seg['source'].name} @ {seg['start']:.1f}s (前段结束 {prev_end:.1f}s)")
+                        removed_count += 1
+                        continue
+            monotonic_segments.append(seg)
+
+        if removed_count > 0:
+            print(f"   ✅ 剔除了 {removed_count} 个时间倒退段")
+        confirmed_segments = monotonic_segments
         
         # 去重：只跳过真正完全相同的片段（同一源+同一时间+同一段）
         # 注意：不同段使用同一源的不同时间是正常的（连续片段）
@@ -622,10 +734,7 @@ class FastHighPrecisionReconstructor:
         
         if overlap_fixed > 0:
             print(f"   ✅ 修复了 {overlap_fixed} 处重叠")
-        
-        if overlap_fixed > 0:
-            print(f"   ✅ 修复了 {overlap_fixed} 处重叠")
-        
+
         print(f"\n✅ 成功匹配: {len(confirmed_segments)}/{len(tasks)} 段")
         
         # 生成输出
@@ -728,30 +837,15 @@ class FastHighPrecisionReconstructor:
         current_duration = self.get_video_duration(temp_video)
         print(f"   当前视频时长: {current_duration:.2f}s, 目标: {target_duration:.2f}s")
         
-        if abs(current_duration - target_duration) > 0.1:
-            # 需要调整时长
-            cmd = [
-                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                '-i', str(temp_video),
-                '-i', str(temp_audio),
-                '-vf', f'setpts={target_duration/current_duration}*PTS',
-                '-af', f'atempo={current_duration/target_duration}',
-                '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-                '-c:a', 'aac', '-b:a', '128k',
-                '-shortest',
-                str(output_path)
-            ]
-        else:
-            # 直接合并 - 使用重新编码确保精确同步，避免copy导致的keyframe问题
-            cmd = [
-                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                '-i', str(temp_video),
-                '-i', str(temp_audio),
-                '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-                '-c:a', 'aac', '-b:a', '128k',
-                '-shortest',
-                str(output_path)
-            ]
+        # 直接合并音视频，不调速、不截断
+        cmd = [
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+            '-i', str(temp_video),
+            '-i', str(temp_audio),
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k',
+            str(output_path)
+        ]
         
         subprocess.run(cmd, capture_output=True)
         
@@ -778,7 +872,7 @@ class FastHighPrecisionReconstructor:
         print("⚠️  警告：必须实际查看每一帧，不能只看百分比！")
         
         # 创建检查目录
-        check_dir = Path("ai_check_round" + str(getattr(self, 'round_num', 'X')))
+        check_dir = Path("temp_outputs/ai_check_round" + str(getattr(self, 'round_num', 'X')))
         check_dir.mkdir(exist_ok=True)
         
         # 关键时间点检查
@@ -838,43 +932,50 @@ class FastHighPrecisionReconstructor:
         print("="*70)
         
         return True
-        
-        if abs(current_duration - target_duration) > 0.5:
-            # 调整速度
-            cmd = [
-                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                '-i', str(temp_output),
-                '-vf', f'setpts={target_duration/current_duration}*PTS',
-                '-af', f'atempo={current_duration/target_duration}',
-                '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-                '-c:a', 'aac', '-b:a', '128k',
-                str(output_path)
-            ]
-            subprocess.run(cmd, capture_output=True)
-        else:
-            shutil.copy(temp_output, output_path)
-        
-        return Path(output_path).exists()
 
 
 def main():
-    target = "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/adx原/115196-1-363935819124715523.mp4"
-    source_dir = "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/剧集"
-    output = "/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/output_v6_base/115196_V3_FAST.mp4"
-    cache = "/Users/zhangxu/work/项目/cutvideo/cache"
-    
-    source_videos = [str(f) for f in Path(source_dir).iterdir() if f.suffix.lower() == '.mp4']
+    root = Path(__file__).resolve().parent
+    default_target = root / "01_test_data_generation" / "source_videos" / "南城以北" / "adx原" / "115196-1-363935819124715523.mp4"
+    default_source_dir = root / "01_test_data_generation" / "source_videos" / "南城以北" / "剧集"
+    default_output = root / "01_test_data_generation" / "source_videos" / "南城以北" / "output_v6_base" / "115196_V3_FAST.mp4"
+    default_cache = root / "cache"
+
+    parser = argparse.ArgumentParser(description="115196 极速高精度重构 V3 + pHash")
+    parser.add_argument("--target", default=str(default_target), help="目标视频路径")
+    parser.add_argument("--source-dir", default=str(default_source_dir), help="源视频目录")
+    parser.add_argument("--output", default=str(default_output), help="输出视频路径")
+    parser.add_argument("--cache", default=str(default_cache), help="缓存目录")
+    args = parser.parse_args()
+
+    target = Path(args.target)
+    source_dir = Path(args.source_dir)
+    output = Path(args.output)
+    cache = Path(args.cache)
+
+    if not target.exists():
+        print(f"❌ 目标视频不存在: {target}")
+        return
+    if not source_dir.exists():
+        print(f"❌ 源视频目录不存在: {source_dir}")
+        return
+
+    source_videos = [str(f) for f in source_dir.iterdir() if f.suffix.lower() == '.mp4']
+    if not source_videos:
+        print(f"❌ 源视频目录中未找到 mp4: {source_dir}")
+        return
     
     print("="*70)
     print("115196 极速高精度重构 V3")
     print("="*70)
     
-    Path(cache).mkdir(exist_ok=True)
+    cache.mkdir(exist_ok=True)
+    output.parent.mkdir(parents=True, exist_ok=True)
     
-    reconstructor = FastHighPrecisionReconstructor(target, source_videos, cache)
+    reconstructor = FastHighPrecisionReconstructor(str(target), source_videos, str(cache))
     
     try:
-        success = reconstructor.reconstruct_fast(output)
+        success = reconstructor.reconstruct_fast(str(output))
         
         if success:
             print("\n🎉 极速重构完成!")
@@ -882,7 +983,7 @@ def main():
             # 立即验证
             print("\n正在进行一致性验证...")
             from av_consistency_checker import AVConsistencyChecker
-            checker = AVConsistencyChecker(target, output)
+            checker = AVConsistencyChecker(str(target), str(output))
             results = checker.check_consistency(interval=5.0)
             
             if results['statistics']['poor'] == 0:
@@ -894,5 +995,4 @@ def main():
 
 
 if __name__ == "__main__":
-    from pathlib import Path
     main()

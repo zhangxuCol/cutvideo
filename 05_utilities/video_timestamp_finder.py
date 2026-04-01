@@ -143,7 +143,12 @@ class VideoTimestampFinder:
         if output_path is None:
             output_path = f"新裁剪_{timestamp_info['start_formatted']}_{timestamp_info['end_formatted']}.mp4"
         
-        cmd = f"""ffmpeg -y -hide_banner -i "{self.original_video}" -ss {timestamp_info['start_formatted']} -to {timestamp_info['end_formatted']} -c copy "{output_path}""""
+        cmd = (
+            f'ffmpeg -y -hide_banner -i "{self.original_video}" '
+            f'-ss {timestamp_info["start_formatted"]} '
+            f'-to {timestamp_info["end_formatted"]} '
+            f'-c copy "{output_path}"'
+        )
         
         return cmd
 

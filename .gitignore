@@ -28,6 +28,8 @@ ENV/
 # IDE
 .vscode/
 .idea/
+.openclaw/
+.claude/
 *.swp
 *.swo
 *~
@@ -40,12 +42,29 @@ Thumbs.db
 temp/
 *.temp
 temp_*
+*.bak
+*.bak.*
 concat_list.txt
 reconstruct_video.sh
+
+# Temporary files organized into directories
+temp_frames/
+temp_logs/
+temp_outputs/
+ai_check*
+comparison_frames/
+debug_sync/
+verify_output/
+v6_validation/
+
+# Log files (kept for history in temp_logs/)
 *.log
+logs/
 
 # Test data and output
 01_test_data_generation/**/output/
+01_test_data_generation/**/output_v*/
+01_test_data_generation/**/logs/
 01_test_data_generation/**/temp/
 
 # Video files
@@ -70,5 +89,6 @@ reconstruct_video.sh
 *.tar.gz
 01_test_data_generation/source_videos/
 cache/
+cache_v*/
 *.pkl
 ai_check/

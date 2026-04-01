@@ -4,24 +4,41 @@
 遍历所有裁剪视频，在剧集目录中匹配原视频，生成二次裁剪视频
 """
 
+import argparse
 import sys
-sys.path.insert(0, '/Users/zhangxu/work/项目/cutvideo/03_reconstruction_algorithms')
-
-from video_reconstructor_hybrid_v2 import VideoReconstructorHybridV2, load_config
 from pathlib import Path
 import json
 from typing import List, Tuple
 import subprocess
 
+ROOT_DIR = Path(__file__).resolve().parent
+ALGORITHMS_DIR = ROOT_DIR / "03_reconstruction_algorithms"
+DEFAULT_CONFIG_PATH = ROOT_DIR / "06_configurations" / "cut_reconstruction_config.yaml"
+DEFAULT_CUT_VIDEOS_DIR = ROOT_DIR / "01_test_data_generation" / "source_videos" / "南城以北" / "adx原"
+DEFAULT_SOURCE_VIDEOS_DIR = ROOT_DIR / "01_test_data_generation" / "source_videos" / "南城以北" / "剧集"
+DEFAULT_OUTPUT_DIR = ROOT_DIR / "01_test_data_generation" / "source_videos" / "南城以北" / "output"
+
+sys.path.insert(0, str(ALGORITHMS_DIR))
+
+from video_reconstructor_hybrid_v2 import VideoReconstructorHybridV2, load_config
+
+
 class BatchVideoReconstructor:
-    def __init__(self, cut_videos_dir: str, source_videos_dir: str, output_dir: str):
+    def __init__(
+        self,
+        cut_videos_dir: str,
+        source_videos_dir: str,
+        output_dir: str,
+        config_path: str,
+    ):
         self.cut_videos_dir = Path(cut_videos_dir)
         self.source_videos_dir = Path(source_videos_dir)
         self.output_dir = Path(output_dir)
+        self.config_path = Path(config_path)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # 加载默认配置
-        self.config = load_config('/Users/zhangxu/work/项目/cutvideo/06_configurations/cut_reconstruction_config.yaml')
+        self.config = load_config(str(self.config_path))
         
         # 获取源视频列表
         self.source_videos = self._get_source_videos()
@@ -186,20 +203,58 @@ class BatchVideoReconstructor:
 
 
 def main():
-    # 配置路径
-    CUT_VIDEOS_DIR = '/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/adx原'
-    SOURCE_VIDEOS_DIR = '/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/剧集'
-    OUTPUT_DIR = '/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/output'
+    parser = argparse.ArgumentParser(description="批量视频重构工具")
+    parser.add_argument(
+        "--cut-dir",
+        default=str(DEFAULT_CUT_VIDEOS_DIR),
+        help="裁剪视频目录，默认使用仓库内示例数据",
+    )
+    parser.add_argument(
+        "--source-dir",
+        default=str(DEFAULT_SOURCE_VIDEOS_DIR),
+        help="源视频目录，默认使用仓库内示例数据",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="输出目录，默认写入仓库内 output 目录",
+    )
+    parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help="配置文件路径",
+    )
+    args = parser.parse_args()
+
+    cut_videos_dir = Path(args.cut_dir)
+    source_videos_dir = Path(args.source_dir)
+    output_dir = Path(args.output_dir)
+    config_path = Path(args.config)
+
+    missing_paths = [
+        path for path in [cut_videos_dir, source_videos_dir, config_path] if not path.exists()
+    ]
+    if missing_paths:
+        print("❌ 以下路径不存在:")
+        for path in missing_paths:
+            print(f"   - {path}")
+        return
     
     print("="*60)
     print("🎬 批量视频重构工具")
     print("="*60)
-    print(f"裁剪视频目录: {CUT_VIDEOS_DIR}")
-    print(f"源视频目录: {SOURCE_VIDEOS_DIR}")
-    print(f"输出目录: {OUTPUT_DIR}")
+    print(f"裁剪视频目录: {cut_videos_dir}")
+    print(f"源视频目录: {source_videos_dir}")
+    print(f"输出目录: {output_dir}")
+    print(f"配置文件: {config_path}")
     print("="*60)
     
-    batch = BatchVideoReconstructor(CUT_VIDEOS_DIR, SOURCE_VIDEOS_DIR, OUTPUT_DIR)
+    batch = BatchVideoReconstructor(
+        str(cut_videos_dir),
+        str(source_videos_dir),
+        str(output_dir),
+        str(config_path),
+    )
     batch.process_all()
 
 
