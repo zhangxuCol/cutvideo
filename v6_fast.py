@@ -1755,16 +1755,22 @@ class FastHighPrecisionReconstructor:
         if ret != 0 or not repaired_video_only.exists():
             return input_video, 0
 
+        # 若后续会强制覆盖目标音轨，这里不再回灌输入音轨，
+        # 避免输入音轨时长异常时把视频错误截短。
+        if self.force_target_audio:
+            return repaired_video_only, len(replace_indices)
+
+        input_duration = self.get_video_duration(input_video)
         repaired_output = self.temp_dir / "temp_output_boundary_repaired.mp4"
         mux_cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-i", str(repaired_video_only),
             "-i", str(input_video),
             "-map", "0:v:0",
-            "-map", "1:a:0",
+            "-map", "1:a:0?",
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "128k",
-            "-shortest",
+            "-t", f"{input_duration:.3f}",
             str(repaired_output),
         ]
         mux = subprocess.run(mux_cmd, capture_output=True, text=True)
