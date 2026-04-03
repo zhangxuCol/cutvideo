@@ -647,6 +647,8 @@ def generate_html_report(
   <div class="meta">
     <div><b>原素材:</b> {html.escape(str(target_video))}</div>
     <div><b>二次裁剪:</b> {html.escape(str(candidate_video))}</div>
+    <div><b>候选来源:</b> {html.escape(str(summary.get('candidate_mode', 'unknown')))}</div>
+    <div><b>二次裁剪耗时:</b> {summary.get('clip_elapsed_sec', 0.0)} 秒</div>
     <div><b>时间间隔:</b> {summary.get('interval')} 秒</div>
     <div><b>检查点:</b> {summary.get('total_points')}</div>
   </div>
@@ -755,6 +757,8 @@ def main() -> int:
     parser.add_argument("--asr", choices=["auto", "none", "faster_whisper", "whisper"], default=asr_default)
     parser.add_argument("--asr-cmd", default=asr_cmd_default, help="指定 whisper 命令路径或命令串（跨环境）")
     parser.add_argument("--asr-python", default=asr_python_default, help="指定装有 whisper 的 python 解释器路径")
+    parser.add_argument("--clip-elapsed-sec", type=float, default=0.0, help="二次裁剪耗时（秒，可由批处理注入）")
+    parser.add_argument("--candidate-mode", default="existing", help="候选来源模式（existing/reconstructed）")
 
     parser.add_argument("--output-dir", default=output_dir_default, help="输出目录，默认 runtime/temp_outputs/ai_video_audit/<timestamp>")
     args = parser.parse_args()
@@ -937,6 +941,8 @@ def main() -> int:
         "high_match_points": high_match_points,
         "mismatch_points": mismatch_points,
         "lowest_points": lowest_points,
+        "clip_elapsed_sec": round(float(args.clip_elapsed_sec), 3),
+        "candidate_mode": str(args.candidate_mode),
     }
 
     html_report_path = generate_html_report(out_dir, target, candidate, report_points, summary)
@@ -951,6 +957,8 @@ def main() -> int:
         "asr_error": asr_error or asr_init_error,
         "asr_cmd_used": " ".join(asr_cmd_base) if asr_cmd_base else None,
         "asr_model": args.asr_model,
+        "candidate_mode": str(args.candidate_mode),
+        "clip_elapsed_sec": round(float(args.clip_elapsed_sec), 3),
         "summary": summary,
         "comparison_report_html": str(html_report_path),
         "subtitle_inputs": {

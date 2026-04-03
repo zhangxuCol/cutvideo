@@ -116,6 +116,8 @@ def run_single_audit(
     language: str,
     target_sub: str,
     candidate_sub: str,
+    clip_elapsed_sec: float = 0.0,
+    candidate_mode: str = "existing",
     config_path: str = "",
 ) -> Tuple[bool, str]:
     ensure_dir(output_dir)
@@ -130,6 +132,8 @@ def run_single_audit(
         "--asr", asr_mode,
         "--asr-model", asr_model,
         "--language", language,
+        "--clip-elapsed-sec", str(float(clip_elapsed_sec)),
+        "--candidate-mode", str(candidate_mode),
         "--output-dir", str(output_dir),
     ]
     if asr_cmd:
@@ -153,7 +157,16 @@ def run_single_audit(
     return True, ""
 
 
-def build_total_report(output_root: Path, rows: List[Dict], started_at: str, finished_at: str, interval: float) -> Tuple[Path, Path]:
+def build_total_report(
+    output_root: Path,
+    rows: List[Dict],
+    started_at: str,
+    finished_at: str,
+    interval: float,
+    material_dir: Path,
+    candidate_dir: Path,
+    source_dir: Optional[Path],
+) -> Tuple[Path, Path]:
     summary_json = output_root / "audit_total_summary.json"
     summary_html = output_root / "audit_total_summary.html"
 
@@ -165,6 +178,10 @@ def build_total_report(output_root: Path, rows: List[Dict], started_at: str, fin
         "started_at": started_at,
         "finished_at": finished_at,
         "interval": interval,
+        "material_dir": str(material_dir),
+        "candidate_dir": str(candidate_dir),
+        "source_dir": str(source_dir) if source_dir else None,
+        "report_root": str(output_root),
         "total": total,
         "success": success,
         "failed": failed,
@@ -233,6 +250,10 @@ def build_total_report(output_root: Path, rows: List[Dict], started_at: str, fin
 <body>
   <h1>3秒间隔 AI 审片总报告</h1>
   <div class="meta">
+    <div>原素材目录: {html.escape(str(material_dir))}</div>
+    <div>二剪目录: {html.escape(str(candidate_dir))}</div>
+    <div>源剧集目录: {html.escape(str(source_dir)) if source_dir else "-"}</div>
+    <div>测试报告目录: {html.escape(str(output_root))}</div>
     <div>开始时间: {html.escape(started_at)}</div>
     <div>结束时间: {html.escape(finished_at)}</div>
     <div>检查间隔: {interval} 秒</div>
@@ -424,6 +445,8 @@ def main() -> int:
             language=args.language,
             target_sub=args.target_sub,
             candidate_sub=args.candidate_sub,
+            clip_elapsed_sec=clip_elapsed_sec,
+            candidate_mode=candidate_mode,
             config_path=args.config,
         )
         audit_elapsed_sec = round(time.perf_counter() - audit_start, 3)
@@ -463,7 +486,16 @@ def main() -> int:
         print(f"  - 完成: {report_html}")
 
     finished_at = datetime.now().isoformat()
-    summary_json, summary_html = build_total_report(output_root, rows, started_at, finished_at, args.interval)
+    summary_json, summary_html = build_total_report(
+        output_root=output_root,
+        rows=rows,
+        started_at=started_at,
+        finished_at=finished_at,
+        interval=args.interval,
+        material_dir=material_dir,
+        candidate_dir=candidate_dir,
+        source_dir=source_dir,
+    )
 
     print("\n" + "=" * 72)
     print("批量审片完成")

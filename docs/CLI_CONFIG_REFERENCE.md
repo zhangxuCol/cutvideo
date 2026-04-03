@@ -111,6 +111,11 @@ export CUTVIDEO_CONFIG=/abs/path/ai_pipeline.local.json
 | `--adjacent-overlap-trigger` | float | `adjacent_overlap_trigger` | 相邻段重叠触发阈值（秒） |
 | `--adjacent-lag-trigger` | float | `adjacent_lag_trigger` | 相邻段慢进触发阈值（秒） |
 | `--isolated-drift-trigger` | float | `isolated_drift_trigger` | 孤立段漂移触发阈值（秒） |
+| `--cross-source-mapping-jump-trigger` | float | `cross_source_mapping_jump_trigger` | 跨源切换映射跳变阈值（秒） |
+| `--boundary-glitch-fix` / `--no-boundary-glitch-fix` | bool | `boundary_glitch_fix` | 启用/关闭段边界单帧突刺修复 |
+| `--boundary-glitch-hi-threshold` | float | `boundary_glitch_hi_threshold` | 段边界突刺修复：prev/next 高相似阈值 |
+| `--boundary-glitch-lo-threshold` | float | `boundary_glitch_lo_threshold` | 段边界突刺修复：current 低相似阈值 |
+| `--boundary-glitch-gap-threshold` | float | `boundary_glitch_gap_threshold` | 段边界突刺修复：current 相对掉分阈值 |
 | `--use-audio-matching` / `--no-use-audio-matching` | bool | `use_audio_matching` | 匹配阶段是否使用音频指纹 |
 | `--force-target-audio` / `--no-force-target-audio` | bool | `force_target_audio` | 封装阶段是否强制目标音轨 |
 | `--verify-interval` | float | `verify_interval` | 证据验证抽检间隔（秒） |
@@ -123,6 +128,7 @@ export CUTVIDEO_CONFIG=/abs/path/ai_pipeline.local.json
 | `--verify-asr-python` | string | `verify_asr_python` | Whisper Python 路径（可选） |
 | `--verify-asr-model` | string | `verify_asr_model` | ASR 模型 |
 | `--verify-language` | string | `verify_language` | ASR 语种 |
+| `--verify-output-root` | string | `verify_output_root` | 证据验证报告输出根目录（默认输出视频同目录） |
 | `--verify-whisper-candidates` | string(csv) | `verify_whisper_python_candidates` | Whisper Python 候选列表 |
 | `--allow-numeric-fallback` / `--no-allow-numeric-fallback` | bool | `allow_numeric_fallback` | 证据验证失败后是否回退数值校验 |
 
@@ -156,6 +162,8 @@ python v6_fast.py \
 | `--asr` | enum | `asr` | `auto/none/faster_whisper/whisper` |
 | `--asr-cmd` | string | `asr_cmd` | Whisper 命令路径 |
 | `--asr-python` | string | `asr_python` | Whisper Python 路径 |
+| `--clip-elapsed-sec` | float | - | 二次裁剪耗时（秒，通常由批处理注入） |
+| `--candidate-mode` | string | - | 候选来源（`existing` / `reconstructed`） |
 | `--output-dir` | string | `output_dir` | 输出目录 |
 
 示例：
@@ -217,6 +225,7 @@ python skills/ai-video-audit/scripts/run_batch_ai_audit_3s.py \
 6. 若 ASR 未成功初始化（模型不可用或命令不可用），音频对比会降级，报告会在 `asr_error` 给出原因。
 7. `v6_fast` 的 `--verify-whisper-candidates` 为逗号分隔路径列表；仅在未显式提供 `--verify-asr-cmd/--verify-asr-python` 时用于自动探测。
 8. 推荐保留一份 `ai_pipeline.local.json`（不入库）用于机器本地路径与模型偏好。
+9. `v6_fast` 的 `*.quality_report.json` 已包含 `timing`、`render_metrics` 与逐段 `render_extract_elapsed_sec`，可直接查看“二次裁剪耗时/渲染耗时”。
 
 ## 推荐落地方式
 

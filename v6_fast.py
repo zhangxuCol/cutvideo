@@ -18,7 +18,7 @@ import subprocess
 import tempfile
 import shutil
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import wave
 import struct
@@ -152,6 +152,20 @@ class FastHighPrecisionReconstructor:
         self.adjacent_lag_trigger = 0.8
         # 孤立段（无同源邻段）允许的最大时间漂移；超出则回退目标段
         self.isolated_drift_trigger = 0.8
+        # 跨源切换时允许的映射偏移突变；超出则判定为边界时间回跳风险
+        self.cross_source_mapping_jump_trigger = 0.75
+        # 段边界单帧突刺修复（A-B-A 单帧跳帧）
+        self.boundary_glitch_fix = True
+        self.boundary_glitch_hi_threshold = 0.965
+        self.boundary_glitch_lo_threshold = 0.94
+        self.boundary_glitch_gap_threshold = 0.03
+
+        # 运行期统计（用于质量报告）
+        self.match_elapsed_sec = 0.0
+        self.timeline_guard_elapsed_sec = 0.0
+        self.total_elapsed_sec = 0.0
+        self.guard_stats: Dict[str, int] = {}
+        self.last_render_metrics: Dict[str, object] = {}
 
         # pHash 帧索引
         self.frame_index = {}  # {video_path: [(time, phash), ...]}
@@ -975,7 +989,8 @@ class FastHighPrecisionReconstructor:
         print(f"🚀 极速高精度重构 V3 + pHash")
         print(f"{'='*70}")
 
-        start_time = time.time()
+        start_wall = time.time()
+        overall_perf = time.perf_counter()
 
         # 预建 pHash 帧索引（首次运行后缓存，后续秒速加载）
         self.build_frame_index(sample_interval=1.0)
@@ -999,7 +1014,8 @@ class FastHighPrecisionReconstructor:
         self.total_segments = len(tasks)
         
         print(f"\n🔄 并行处理 {len(tasks)} 个段 (线程数: {self.max_workers})...")
-        
+        match_perf = time.perf_counter()
+
         # 并行处理
         results = [None] * len(tasks)
         
@@ -1052,6 +1068,9 @@ class FastHighPrecisionReconstructor:
         if missing_count > 0:
             print(f"   ⚠️ 自动补齐缺失段: {missing_count} 段")
 
+        self.match_elapsed_sec = time.perf_counter() - match_perf
+
+        guard_perf = time.perf_counter()
         overlap_adjusted, overlap_fallback = self.smooth_adjacent_overlaps(confirmed_segments)
         if overlap_adjusted > 0:
             print(f"   🔧 去重叠平滑: 修正 {overlap_adjusted} 个相邻段")
@@ -1067,32 +1086,59 @@ class FastHighPrecisionReconstructor:
         if alignment_bias_fallback > 0:
             print(f"   🎯 对齐偏置守卫: 切换 {alignment_bias_fallback} 个段到目标素材")
 
+        self.timeline_guard_elapsed_sec = time.perf_counter() - guard_perf
+        self.guard_stats = {
+            "missing_filled": int(missing_count),
+            "overlap_adjusted": int(overlap_adjusted),
+            "overlap_fallback": int(overlap_fallback),
+            "global_repeat_fallback": int(global_repeat_fallback),
+            "step_guard_fallback": int(step_guard_fallback),
+            "alignment_bias_fallback": int(alignment_bias_fallback),
+        }
+
         print(f"\n✅ 可用段: {len(confirmed_segments)}/{len(tasks)} 段 (完整保留)")
-        self.save_quality_report(confirmed_segments, output_path)
         
         # 生成输出
+        success = False
         if confirmed_segments:
             print(f"\n🎬 生成视频...")
             success = self._generate_output(confirmed_segments, output_path, target_duration)
-            
-            elapsed = time.time() - start_time
-            print(f"\n{'='*70}")
-            print(f"✅ 完成!")
-            print(f"   耗时: {elapsed:.1f}s ({elapsed/60:.1f}分钟)")
-            print(f"   输出: {output_path}")
-            print(f"{'='*70}")
-            
-            return success
-        
-        return False
+
+        self.total_elapsed_sec = time.perf_counter() - overall_perf
+        self.save_quality_report(confirmed_segments, output_path)
+
+        elapsed = time.time() - start_wall
+        print(f"\n{'='*70}")
+        print(f"✅ 完成!")
+        print(f"   耗时: {elapsed:.1f}s ({elapsed/60:.1f}分钟)")
+        print(f"   输出: {output_path}")
+        print(f"{'='*70}")
+
+        return success
 
     def save_quality_report(self, segments: List[dict], output_path: str):
         """输出段级质量统计，便于排查局部错位。"""
+        def to_jsonable(value):
+            if isinstance(value, Path):
+                return str(value)
+            if isinstance(value, np.bool_):
+                return bool(value)
+            if isinstance(value, (np.floating, np.integer)):
+                return value.item()
+            if isinstance(value, dict):
+                return {str(k): to_jsonable(v) for k, v in value.items()}
+            if isinstance(value, tuple):
+                return [to_jsonable(v) for v in value]
+            if isinstance(value, list):
+                return [to_jsonable(v) for v in value]
+            return value
+
         low_segments = []
         rematch_triggered = 0
         rematch_improved = 0
         fallback_count = 0
         combined_scores = []
+        segment_details = []
 
         for seg in segments:
             quality = seg.get("quality", {}) or {}
@@ -1114,8 +1160,36 @@ class FastHighPrecisionReconstructor:
                     "fallback": bool(quality.get("fallback", False)),
                 })
 
+            segment_details.append({
+                "index": int(seg["index"]),
+                "target_start": float(seg["target_start"]),
+                "duration": float(seg["duration"]),
+                "source": str(seg["source"]),
+                "source_start": float(seg["start"]),
+                "mapping_offset": float(seg["start"] - seg["target_start"]),
+                "combined": combined,
+                "fallback": bool(quality.get("fallback", False)),
+                "fallback_reason": quality.get("fallback_reason", quality.get("reason", "")),
+                "render_extract_elapsed_sec": float(seg.get("render_extract_elapsed_sec", 0.0)),
+                "quality": to_jsonable(quality),
+            })
+
         avg_score = float(np.mean(combined_scores)) if combined_scores else 0.0
+        output_path_obj = Path(output_path)
+        output_duration = None
+        if output_path_obj.exists():
+            try:
+                output_duration = float(self.get_video_duration(output_path_obj))
+            except Exception:
+                output_duration = None
+
+        render_metrics = self.last_render_metrics if isinstance(self.last_render_metrics, dict) else {}
+
         report = {
+            "target_video": str(self.target_video),
+            "output_video": str(output_path_obj),
+            "target_duration": float(self.target_duration),
+            "output_duration": output_duration,
             "total_segments": len(segments),
             "avg_combined_score": avg_score,
             "low_score_threshold": self.low_score_threshold,
@@ -1123,7 +1197,16 @@ class FastHighPrecisionReconstructor:
             "rematch_triggered": rematch_triggered,
             "rematch_improved": rematch_improved,
             "fallback_segments": fallback_count,
+            "timing": {
+                "match_elapsed_sec": round(float(self.match_elapsed_sec), 3),
+                "timeline_guard_elapsed_sec": round(float(self.timeline_guard_elapsed_sec), 3),
+                "render_elapsed_sec": round(float(render_metrics.get("render_total_sec", 0.0)), 3),
+                "total_elapsed_sec": round(float(self.total_elapsed_sec), 3),
+            },
+            "guard_stats": to_jsonable(self.guard_stats),
+            "render_metrics": to_jsonable(render_metrics),
             "low_segments": low_segments,
+            "segments": segment_details,
         }
 
         report_path = Path(output_path).with_suffix(".quality_report.json")
@@ -1169,8 +1252,16 @@ class FastHighPrecisionReconstructor:
                 if prev["source"] == self.target_video and cross_drift > self.isolated_drift_trigger:
                     fallback_segment(curr, "timeline_cross_source_after_target", cross_drift)
                     continue
+                # 跨源切换守卫：若映射偏移突变，极易出现 1 秒级“回放/倒放样式”错觉。
+                if prev["source"] != self.target_video:
+                    prev_mapping = float(prev["start"]) - float(prev["target_start"])
+                    curr_mapping = curr_start - curr_target
+                    mapping_jump = abs(curr_mapping - prev_mapping)
+                    if mapping_jump > self.cross_source_mapping_jump_trigger:
+                        fallback_segment(curr, "timeline_cross_source_mapping_jump", mapping_jump)
+                continue
 
-            if prev["source"] != curr["source"] or curr["source"] == self.target_video:
+            if curr["source"] == self.target_video:
                 continue
 
             prev_end = float(prev["start"]) + float(prev["duration"])
@@ -1443,13 +1534,13 @@ class FastHighPrecisionReconstructor:
             hard_tolerance = max(2.0, step_tolerance * 2.2)
             step_deviations: List[float] = []
             mapping_jumps: List[float] = []
-            has_same_source_neighbor = False
+            same_source_neighbor_count = 0
 
             def collect_with_neighbor(nei: dict):
-                nonlocal has_same_source_neighbor
+                nonlocal same_source_neighbor_count
                 if nei["source"] != curr["source"]:
                     return
-                has_same_source_neighbor = True
+                same_source_neighbor_count += 1
                 nei_start = float(nei["start"])
                 nei_target = float(nei["target_start"])
                 target_delta = abs(curr_target - nei_target)
@@ -1466,12 +1557,19 @@ class FastHighPrecisionReconstructor:
             if i + 1 < len(segments):
                 collect_with_neighbor(segments[i + 1])
 
+            isolated_drift = abs(curr_start - curr_target)
+            isolated_limit = max(self.isolated_drift_trigger, float(curr["duration"]) * 0.16)
+
             # 孤立段守卫：前后都非同源时，限制 target/source 的绝对偏移，避免“单段跳错后又恢复”。
-            if not has_same_source_neighbor:
-                isolated_drift = abs(curr_start - curr_target)
-                isolated_limit = max(self.isolated_drift_trigger, float(curr["duration"]) * 0.16)
-                if isolated_drift > isolated_limit:
-                    fallback_segment(curr, "timeline_isolated_drift", isolated_drift)
+            if same_source_neighbor_count == 0 and isolated_drift > isolated_limit:
+                fallback_segment(curr, "timeline_isolated_drift", isolated_drift)
+                continue
+
+            # 单侧同源守卫：仅一侧同源时也限制漂移，拦截“边界 1 秒回跳后下一段恢复”的问题。
+            if same_source_neighbor_count == 1:
+                one_side_limit = max(isolated_limit, float(curr["duration"]) * 0.18)
+                if isolated_drift > one_side_limit:
+                    fallback_segment(curr, "timeline_single_neighbor_drift", isolated_drift)
                     continue
 
             if not step_deviations and not mapping_jumps:
@@ -1499,20 +1597,31 @@ class FastHighPrecisionReconstructor:
 
         return switched
 
-    def _extract_av_clip(self, source: Path, start: float, duration: float, output_clip: Path, fps_expr: str) -> Tuple[bool, str]:
+    def _extract_av_clip(
+        self,
+        source: Path,
+        start: float,
+        duration: float,
+        output_clip: Path,
+        fps_expr: str,
+        expected_frames: int = 0,
+    ) -> Tuple[bool, str]:
         """提取单段 AV 片段，返回 (是否成功, 错误信息)。"""
+        frame_count = max(1, int(expected_frames)) if expected_frames else 0
         cmd = [
             'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
             '-i', str(source),
             '-ss', str(start),
             '-t', str(duration),
             '-vf', fps_expr,
-            '-af', 'aresample=async=1:first_pts=0',
+            '-af', f'aresample=async=1:first_pts=0,atrim=0:{duration:.6f},asetpts=PTS-STARTPTS',
             '-reset_timestamps', '1',
             '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
             '-c:a', 'aac', '-b:a', '128k',
-            str(output_clip)
         ]
+        if frame_count > 0:
+            cmd.extend(['-frames:v', str(frame_count)])
+        cmd.append(str(output_clip))
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             return False, (result.stderr or "").strip()
@@ -1520,22 +1629,193 @@ class FastHighPrecisionReconstructor:
             return False, "empty_output"
         return True, ""
 
+    def _quick_frame_similarity(self, frame_a: np.ndarray, frame_b: np.ndarray) -> float:
+        """轻量帧相似度（1-归一化绝对差），用于单帧突刺检测。"""
+        if frame_a is None or frame_b is None:
+            return 0.0
+        mad = np.mean(np.abs(frame_a.astype(np.int16) - frame_b.astype(np.int16))) / 255.0
+        return float(1.0 - mad)
+
+    def _repair_boundary_single_frame_glitches(
+        self,
+        input_video: Path,
+        segments: List[dict],
+        fps: float,
+    ) -> Tuple[Path, int]:
+        """
+        修复段边界附近的单帧突刺（A-B-A）：
+        - 仅在段边界前后 1 帧检测
+        - 仅当 prev/next 高相似且 current 同时与两侧低相似时替换
+        """
+        if not self.boundary_glitch_fix or len(segments) < 2:
+            return input_video, 0
+        if not input_video.exists():
+            return input_video, 0
+
+        boundary_indices: Set[int] = set()
+        fps_safe = max(1.0, float(fps))
+        for seg in segments[:-1]:
+            boundary_t = float(seg["target_start"]) + float(seg["duration"])
+            center = int(round(boundary_t * fps_safe))
+            for delta in (-1, 0, 1):
+                idx = center + delta
+                if idx > 0:
+                    boundary_indices.add(idx)
+        if not boundary_indices:
+            return input_video, 0
+
+        cap = cv2.VideoCapture(str(input_video))
+        if not cap.isOpened():
+            return input_video, 0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        source_fps = float(cap.get(cv2.CAP_PROP_FPS) or fps_safe)
+        if width <= 0 or height <= 0:
+            cap.release()
+            return input_video, 0
+
+        features: List[np.ndarray] = []
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            small = cv2.resize(gray, (96, 54), interpolation=cv2.INTER_AREA)
+            features.append(small)
+        cap.release()
+
+        frame_count = len(features)
+        if frame_count < 3:
+            return input_video, 0
+
+        replace_indices: Set[int] = set()
+        hi = float(self.boundary_glitch_hi_threshold)
+        lo = float(self.boundary_glitch_lo_threshold)
+        gap_threshold = float(self.boundary_glitch_gap_threshold)
+        for idx in sorted(boundary_indices):
+            if idx <= 0 or idx >= frame_count - 1:
+                continue
+            prev_frame = features[idx - 1]
+            curr_frame = features[idx]
+            next_frame = features[idx + 1]
+            sim_prev_next = self._quick_frame_similarity(prev_frame, next_frame)
+            sim_prev_curr = self._quick_frame_similarity(prev_frame, curr_frame)
+            sim_curr_next = self._quick_frame_similarity(curr_frame, next_frame)
+            drop_gap = sim_prev_next - max(sim_prev_curr, sim_curr_next)
+            if (
+                sim_prev_next >= hi
+                and (
+                    (sim_prev_curr <= lo and sim_curr_next <= lo)
+                    or (drop_gap >= gap_threshold)
+                )
+            ):
+                replace_indices.add(idx)
+
+        if not replace_indices:
+            return input_video, 0
+
+        repaired_video_only = self.temp_dir / "temp_output_boundary_repaired_video.mp4"
+        encode_cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{width}x{height}",
+            "-r", f"{source_fps:.6f}",
+            "-i", "-",
+            "-an",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            str(repaired_video_only),
+        ]
+
+        proc = subprocess.Popen(encode_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        cap = cv2.VideoCapture(str(input_video))
+        prev_full_frame = None
+        frame_idx = 0
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+                out_frame = frame
+                if frame_idx in replace_indices and prev_full_frame is not None:
+                    out_frame = prev_full_frame
+                if proc.stdin is None:
+                    break
+                proc.stdin.write(out_frame.tobytes())
+                prev_full_frame = frame
+                frame_idx += 1
+            if proc.stdin is not None:
+                proc.stdin.close()
+            ret = proc.wait()
+        finally:
+            cap.release()
+            if proc.poll() is None:
+                proc.kill()
+
+        if ret != 0 or not repaired_video_only.exists():
+            return input_video, 0
+
+        repaired_output = self.temp_dir / "temp_output_boundary_repaired.mp4"
+        mux_cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(repaired_video_only),
+            "-i", str(input_video),
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "128k",
+            "-shortest",
+            str(repaired_output),
+        ]
+        mux = subprocess.run(mux_cmd, capture_output=True, text=True)
+        if mux.returncode != 0 or not repaired_output.exists():
+            return input_video, 0
+
+        return repaired_output, len(replace_indices)
+
     def _generate_output(self, segments: List[dict], output_path: str, target_duration: float) -> bool:
         """生成输出 - 同步音视频"""
-        
+        import time
+
         av_clips = []
         output_fps = max(12.0, float(self.output_fps))
         fps_expr = f"fps={output_fps:.6f},format=yuv420p"
         fps_out = f"{output_fps:.6f}"
         render_fallbacks = 0
+        render_perf = time.perf_counter()
+        clip_extract_total = 0.0
+        concat_elapsed = 0.0
+        trim_elapsed = 0.0
+        mux_elapsed = 0.0
+        boundary_glitch_fixed_frames = 0
+        self.last_render_metrics = {
+            "status": "running",
+            "segments_total": len(segments),
+            "render_fallback_segments": 0,
+            "clip_extract_total_sec": 0.0,
+            "concat_elapsed_sec": 0.0,
+            "trim_elapsed_sec": 0.0,
+            "mux_elapsed_sec": 0.0,
+            "boundary_glitch_fixed_frames": 0,
+            "render_total_sec": 0.0,
+        }
         
         for seg in segments:
             seg_source = seg['source']
             seg_start = seg['start']
+            seg_expected_frames = max(1, int(round(float(seg['duration']) * output_fps)))
             
             # 一次性提取 AV 片段，避免音视频分离切片造成边界漂移
             av_clip = self.temp_dir / f"seg_{seg['index']:03d}_av.mp4"
-            ok, err = self._extract_av_clip(seg_source, seg_start, seg['duration'], av_clip, fps_expr)
+            seg_extract_perf = time.perf_counter()
+            ok, err = self._extract_av_clip(
+                seg_source,
+                seg_start,
+                seg['duration'],
+                av_clip,
+                fps_expr,
+                expected_frames=seg_expected_frames,
+            )
             if not ok and seg_source != self.target_video:
                 render_fallbacks += 1
                 q = seg.get("quality", {}) or {}
@@ -1545,9 +1825,33 @@ class FastHighPrecisionReconstructor:
                 seg["quality"] = q
                 seg["source"] = self.target_video
                 seg["start"] = seg["target_start"]
-                ok, err = self._extract_av_clip(seg["source"], seg["start"], seg["duration"], av_clip, fps_expr)
+                ok, err = self._extract_av_clip(
+                    seg["source"],
+                    seg["start"],
+                    seg["duration"],
+                    av_clip,
+                    fps_expr,
+                    expected_frames=seg_expected_frames,
+                )
+
+            seg_elapsed = time.perf_counter() - seg_extract_perf
+            clip_extract_total += seg_elapsed
+            seg["render_extract_elapsed_sec"] = round(float(seg_elapsed), 3)
 
             if not ok:
+                self.last_render_metrics = {
+                    "status": "failed",
+                    "error": f"segment_extract_failed:{seg['index']}",
+                    "error_detail": err[:240],
+                    "segments_total": len(segments),
+                    "render_fallback_segments": render_fallbacks,
+                    "clip_extract_total_sec": round(float(clip_extract_total), 3),
+                    "concat_elapsed_sec": round(float(concat_elapsed), 3),
+                    "trim_elapsed_sec": round(float(trim_elapsed), 3),
+                    "mux_elapsed_sec": round(float(mux_elapsed), 3),
+                    "boundary_glitch_fixed_frames": int(boundary_glitch_fixed_frames),
+                    "render_total_sec": round(float(time.perf_counter() - render_perf), 3),
+                }
                 print(f"❌ 段 {seg['index']+1} 提取失败，无法生成完整时间轴: {err}")
                 return False
 
@@ -1572,15 +1876,27 @@ class FastHighPrecisionReconstructor:
             'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
             '-f', 'concat', '-safe', '0',
             '-i', str(av_concat),
-            '-vsync', 'cfr',
-            '-r', fps_out,
             '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
             '-c:a', 'aac', '-b:a', '128k',
             str(temp_output)
         ]
+        concat_perf = time.perf_counter()
         subprocess.run(cmd, capture_output=True)
+        concat_elapsed = time.perf_counter() - concat_perf
 
         if not temp_output.exists():
+            self.last_render_metrics = {
+                "status": "failed",
+                "error": "concat_failed",
+                "segments_total": len(segments),
+                "render_fallback_segments": render_fallbacks,
+                "clip_extract_total_sec": round(float(clip_extract_total), 3),
+                "concat_elapsed_sec": round(float(concat_elapsed), 3),
+                "trim_elapsed_sec": round(float(trim_elapsed), 3),
+                "mux_elapsed_sec": round(float(mux_elapsed), 3),
+                "boundary_glitch_fixed_frames": int(boundary_glitch_fixed_frames),
+                "render_total_sec": round(float(time.perf_counter() - render_perf), 3),
+            }
             print("❌ AV 拼接失败")
             return False
 
@@ -1597,9 +1913,20 @@ class FastHighPrecisionReconstructor:
             '-c:a', 'aac', '-b:a', '128k',
             str(trimmed_output)
         ]
+        trim_perf = time.perf_counter()
         subprocess.run(cmd, capture_output=True)
+        trim_elapsed = time.perf_counter() - trim_perf
         if trimmed_output.exists():
             temp_output = trimmed_output
+
+        repaired_output, boundary_glitch_fixed_frames = self._repair_boundary_single_frame_glitches(
+            temp_output,
+            segments,
+            output_fps,
+        )
+        if boundary_glitch_fixed_frames > 0:
+            temp_output = repaired_output
+            print(f"   🩹 边界单帧突刺修复: {boundary_glitch_fixed_frames} 帧")
 
         if self.force_target_audio:
             # 可选：使用目标音轨进行最终封装
@@ -1616,7 +1943,9 @@ class FastHighPrecisionReconstructor:
                 '-shortest',
                 str(muxed_output)
             ]
+            mux_perf = time.perf_counter()
             subprocess.run(cmd, capture_output=True)
+            mux_elapsed = time.perf_counter() - mux_perf
 
             if muxed_output.exists():
                 shutil.copy(muxed_output, output_path)
@@ -1631,11 +1960,34 @@ class FastHighPrecisionReconstructor:
         if Path(output_path).exists():
             final_duration = self.get_video_duration(Path(output_path))
             print(f"   最终视频时长: {final_duration:.2f}s")
+            self.last_render_metrics = {
+                "status": "ok",
+                "segments_total": len(segments),
+                "render_fallback_segments": render_fallbacks,
+                "clip_extract_total_sec": round(float(clip_extract_total), 3),
+                "concat_elapsed_sec": round(float(concat_elapsed), 3),
+                "trim_elapsed_sec": round(float(trim_elapsed), 3),
+                "mux_elapsed_sec": round(float(mux_elapsed), 3),
+                "boundary_glitch_fixed_frames": int(boundary_glitch_fixed_frames),
+                "render_total_sec": round(float(time.perf_counter() - render_perf), 3),
+                "final_duration": round(float(final_duration), 3),
+            }
             
             # AI亲自查看视频内容
             self.ai_verify_video(output_path)
             return True
-        
+        self.last_render_metrics = {
+            "status": "failed",
+            "error": "output_not_found",
+            "segments_total": len(segments),
+            "render_fallback_segments": render_fallbacks,
+            "clip_extract_total_sec": round(float(clip_extract_total), 3),
+            "concat_elapsed_sec": round(float(concat_elapsed), 3),
+            "trim_elapsed_sec": round(float(trim_elapsed), 3),
+            "mux_elapsed_sec": round(float(mux_elapsed), 3),
+            "boundary_glitch_fixed_frames": int(boundary_glitch_fixed_frames),
+            "render_total_sec": round(float(time.perf_counter() - render_perf), 3),
+        }
         return False
     
     def ai_verify_video(self, output_path: str) -> bool:
@@ -1734,6 +2086,9 @@ def run_evidence_validation(
     asr_model: str = "base",
     language: str = "zh",
     whisper_python_candidates: Optional[List[str]] = None,
+    clip_elapsed_sec: Optional[float] = None,
+    candidate_mode: str = "reconstructed",
+    report_output_root: Optional[str] = None,
 ) -> Optional[Dict]:
     """
     证据级一致性验证：
@@ -1783,7 +2138,12 @@ def run_evidence_validation(
             print(f"   🔎 自动探测到 Whisper Python: {asr_python}")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = root / "runtime" / "temp_outputs" / "ai_evidence_check" / f"{target_video.stem}_{ts}"
+    if report_output_root and str(report_output_root).strip():
+        base_report_root = Path(str(report_output_root).strip()).expanduser()
+    else:
+        # 默认与输出视频同目录，避免报告散落在 runtime 临时目录
+        base_report_root = candidate_video.parent / "ai_evidence_check"
+    out_dir = base_report_root / f"{target_video.stem}_{ts}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [
@@ -1807,6 +2167,10 @@ def run_evidence_validation(
         cmd.extend(["--asr-cmd", asr_cmd])
     if asr_python:
         cmd.extend(["--asr-python", asr_python])
+    if clip_elapsed_sec is not None:
+        cmd.extend(["--clip-elapsed-sec", f"{max(0.0, float(clip_elapsed_sec)):.3f}"])
+    if candidate_mode:
+        cmd.extend(["--candidate-mode", str(candidate_mode)])
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         err = (result.stderr or result.stdout or "evidence_validation_failed").strip()
@@ -1862,6 +2226,7 @@ def main():
         adjacent_overlap_trigger_default = cfg_float(cfg, "adjacent_overlap_trigger", 0.6)
         adjacent_lag_trigger_default = cfg_float(cfg, "adjacent_lag_trigger", 0.8)
         isolated_drift_trigger_default = cfg_float(cfg, "isolated_drift_trigger", 0.8)
+        cross_source_mapping_jump_trigger_default = cfg_float(cfg, "cross_source_mapping_jump_trigger", 0.75)
         use_audio_matching_default = cfg_bool(cfg, "use_audio_matching", False)
         force_target_audio_default = cfg_bool(cfg, "force_target_audio", False)
         verify_interval_default = cfg_float(cfg, "verify_interval", 3.0)
@@ -1875,6 +2240,11 @@ def main():
         verify_asr_model_default = cfg_str(cfg, "verify_asr_model", "base")
         verify_language_default = cfg_str(cfg, "verify_language", "zh")
         verify_whisper_candidates_default = cfg_str_list(cfg, "verify_whisper_python_candidates", [])
+        verify_output_root_default = cfg_str(cfg, "verify_output_root", "")
+        boundary_glitch_fix_default = cfg_bool(cfg, "boundary_glitch_fix", True)
+        boundary_glitch_hi_threshold_default = cfg_float(cfg, "boundary_glitch_hi_threshold", 0.965)
+        boundary_glitch_lo_threshold_default = cfg_float(cfg, "boundary_glitch_lo_threshold", 0.94)
+        boundary_glitch_gap_threshold_default = cfg_float(cfg, "boundary_glitch_gap_threshold", 0.03)
         allow_numeric_fallback_default = cfg_bool(cfg, "allow_numeric_fallback", False)
     except RuntimeError as exc:
         print(f"❌ {exc}")
@@ -1900,6 +2270,7 @@ def main():
     parser.add_argument("--adjacent-overlap-trigger", type=float, default=adjacent_overlap_trigger_default, help="相邻段重叠触发阈值（秒）")
     parser.add_argument("--adjacent-lag-trigger", type=float, default=adjacent_lag_trigger_default, help="相邻段慢进触发阈值（秒）")
     parser.add_argument("--isolated-drift-trigger", type=float, default=isolated_drift_trigger_default, help="孤立段时间漂移触发阈值（秒）")
+    parser.add_argument("--cross-source-mapping-jump-trigger", type=float, default=cross_source_mapping_jump_trigger_default, help="跨源切换映射跳变触发阈值（秒）")
     add_bool_arg(parser, "--use-audio-matching", use_audio_matching_default, "启用音频指纹参与匹配")
     add_bool_arg(parser, "--force-target-audio", force_target_audio_default, "最终封装强制使用目标音轨")
     parser.add_argument("--verify-interval", type=float, default=verify_interval_default, help="证据级验证间隔（秒）")
@@ -1917,6 +2288,11 @@ def main():
     parser.add_argument("--verify-asr-python", default=verify_asr_python_default, help="证据级验证：whisper 所在 python（可选）")
     parser.add_argument("--verify-asr-model", default=verify_asr_model_default, help="证据级验证：ASR 模型")
     parser.add_argument("--verify-language", default=verify_language_default, help="证据级验证：ASR 语种")
+    parser.add_argument("--verify-output-root", default=verify_output_root_default, help="证据级验证：报告输出根目录（默认输出视频同目录）")
+    add_bool_arg(parser, "--boundary-glitch-fix", boundary_glitch_fix_default, "启用段边界单帧突刺修复")
+    parser.add_argument("--boundary-glitch-hi-threshold", type=float, default=boundary_glitch_hi_threshold_default, help="边界突刺修复：prev/next 高相似阈值")
+    parser.add_argument("--boundary-glitch-lo-threshold", type=float, default=boundary_glitch_lo_threshold_default, help="边界突刺修复：current 低相似阈值")
+    parser.add_argument("--boundary-glitch-gap-threshold", type=float, default=boundary_glitch_gap_threshold_default, help="边界突刺修复：当前帧相对掉分阈值")
     parser.add_argument(
         "--verify-whisper-candidates",
         default=",".join(verify_whisper_candidates_default),
@@ -1970,6 +2346,11 @@ def main():
     reconstructor.adjacent_overlap_trigger = max(0.0, float(args.adjacent_overlap_trigger))
     reconstructor.adjacent_lag_trigger = max(0.0, float(args.adjacent_lag_trigger))
     reconstructor.isolated_drift_trigger = max(0.0, float(args.isolated_drift_trigger))
+    reconstructor.cross_source_mapping_jump_trigger = max(0.0, float(args.cross_source_mapping_jump_trigger))
+    reconstructor.boundary_glitch_fix = bool(args.boundary_glitch_fix)
+    reconstructor.boundary_glitch_hi_threshold = min(1.0, max(0.0, float(args.boundary_glitch_hi_threshold)))
+    reconstructor.boundary_glitch_lo_threshold = min(1.0, max(0.0, float(args.boundary_glitch_lo_threshold)))
+    reconstructor.boundary_glitch_gap_threshold = min(1.0, max(0.0, float(args.boundary_glitch_gap_threshold)))
     reconstructor.use_audio_matching = bool(args.use_audio_matching)
     reconstructor.force_target_audio = bool(args.force_target_audio)
     verify_whisper_candidates = split_csv(args.verify_whisper_candidates)
@@ -1997,6 +2378,9 @@ def main():
                 asr_model=args.verify_asr_model,
                 language=args.verify_language,
                 whisper_python_candidates=verify_whisper_candidates,
+                clip_elapsed_sec=round(float(reconstructor.total_elapsed_sec), 3),
+                candidate_mode="reconstructed",
+                report_output_root=args.verify_output_root,
             )
             if evidence:
                 summary = evidence.get("summary", {}) or {}
