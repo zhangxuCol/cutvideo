@@ -195,7 +195,7 @@ def main():
     validator = DeepContentValidator()
     
     # 对比已有的对比帧
-    frame_dir = Path("/Users/zhangxu/work/项目/cutvideo/comparison_frames")
+    frame_dir = Path("/Users/zhangxu/work/项目/cutvideo/temp_outputs/comparison_frames")
     
     if frame_dir.exists():
         validator.compare_existing_frames(frame_dir)

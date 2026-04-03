@@ -158,7 +158,7 @@ def main():
     """测试 SSIM 验证器"""
     validator = SSIMValidator()
     
-    frame_dir = Path("/Users/zhangxu/work/项目/cutvideo/comparison_frames")
+    frame_dir = Path("/Users/zhangxu/work/项目/cutvideo/temp_outputs/comparison_frames")
     
     if frame_dir.exists():
         validator.compare_all_frames(frame_dir)

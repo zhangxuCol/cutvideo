@@ -19,7 +19,7 @@ def main():
     source = Path("/Users/zhangxu/work/项目/cutvideo/01_test_data_generation/source_videos/南城以北/剧集/1.mp4")
     
     temp_dir = Path(tempfile.mkdtemp())
-    output_dir = Path("/Users/zhangxu/work/项目/cutvideo/comparison_frames")
+    output_dir = Path("/Users/zhangxu/work/项目/cutvideo/temp_outputs/comparison_frames")
     output_dir.mkdir(exist_ok=True)
     
     try:

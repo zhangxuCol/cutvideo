@@ -11,12 +11,13 @@
 import cv2
 import numpy as np
 import argparse
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 import shutil
 from dataclasses import dataclass
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import wave
 import struct
@@ -108,7 +109,27 @@ class FastHighPrecisionReconstructor:
         # 配置
         self.match_threshold = 0.95
         self.segment_duration = 5.0  # 降低分段时长提高精度
-        self.max_workers = 4  # 并行线程数
+        cpu_count = os.cpu_count() or 8
+        self.max_workers = min(12, max(4, cpu_count // 2))  # 并行线程数（自动）
+        self.low_score_threshold = 0.82
+        self.rematch_window = 2
+        self.rematch_max_window = 12
+        self.continuity_weight = 0.05
+        self.total_segments = 0
+        self.use_audio_matching = False
+        self.force_target_audio = False
+        self.strict_visual_verify = True
+        self.strict_verify_min_sim = 0.78
+        self.tail_guard_seconds = 20.0
+        self.tail_verify_min_avg = 0.84
+        self.tail_verify_min_floor = 0.78
+        self.target_duration = 0.0
+        self.output_fps = 24.0
+        # 相邻段时间轴守卫阈值：用于拦截“轻微慢进导致的缺内容+重复画面”
+        self.adjacent_overlap_trigger = 0.6
+        self.adjacent_lag_trigger = 0.8
+        # 孤立段（无同源邻段）允许的最大时间漂移；超出则回退目标段
+        self.isolated_drift_trigger = 0.8
 
         # pHash 帧索引
         self.frame_index = {}  # {video_path: [(time, phash), ...]}
@@ -116,12 +137,42 @@ class FastHighPrecisionReconstructor:
         # 缓存
         self.source_fingerprints = {}
         self.target_fingerprint = None
+
+    def continuity_bonus(self, source_start: float, target_start: float, duration: float) -> float:
+        """连续性奖励（软约束），鼓励时间映射更平滑，不做硬性限制。"""
+        tolerance = max(duration * 8, 20.0)
+        delta = abs(source_start - target_start)
+        return max(0.0, 1.0 - (delta / tolerance)) * self.continuity_weight
         
     def get_video_duration(self, video_path: Path) -> float:
         cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
                '-of', 'default=noprint_wrappers=1:nokey=1', str(video_path)]
         result = subprocess.run(cmd, capture_output=True, text=True)
         return float(result.stdout.strip())
+
+    def get_video_fps(self, video_path: Path) -> float:
+        """读取视频平均帧率，失败时回退 24fps。"""
+        cmd = [
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=avg_frame_rate',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            str(video_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        rate = (result.stdout or "").strip()
+        if not rate:
+            return 24.0
+        try:
+            if '/' in rate:
+                num, den = rate.split('/', 1)
+                fps = float(num) / float(den)
+            else:
+                fps = float(rate)
+            if fps <= 0:
+                return 24.0
+            return min(120.0, max(12.0, fps))
+        except Exception:
+            return 24.0
     
     def extract_audio_fingerprint(self, video_path: Path, start: float = 0, duration: float = None) -> list:
         """提取音频指纹 - 使用 Chromaprint"""
@@ -231,7 +282,7 @@ class FastHighPrecisionReconstructor:
         print("   ✅ 预计算完成")
     
     def find_match_combined(self, target_start: float, duration: float, seg_index: int = 0) -> Tuple[Path, float, float]:
-        """三阶段匹配：pHash 预筛选 → 音频验证 → 画面精细定位"""
+        """三阶段匹配：pHash 预筛选 → (可选音频) → 画面精细定位"""
         best_source = None
         best_start = 0
         best_score = 0.0
@@ -240,8 +291,8 @@ class FastHighPrecisionReconstructor:
         phash_candidates = self.find_match_by_phash(target_start, duration, seg_index, top_k=10)
 
         if phash_candidates:
-            # 第二步：对 pHash 候选做音频+画面精细验证
-            target_fp = extract_chromaprint(self.target_video, target_start, duration)
+            # 第二步：对 pHash 候选做精细验证（默认纯画面，可选音频）
+            target_fp = extract_chromaprint(self.target_video, target_start, duration) if self.use_audio_matching else []
             target_frames = []
             check_offsets = [0, duration * 0.3, duration * 0.7]
             for i, offset in enumerate(check_offsets):
@@ -273,13 +324,17 @@ class FastHighPrecisionReconstructor:
 
                     # 音频验证
                     audio_sim = 0.0
-                    if target_fp and len(target_fp) >= 10:
+                    if self.use_audio_matching and target_fp and len(target_fp) >= 10:
                         source_fp = extract_chromaprint(source, start_sec, duration)
                         if source_fp and len(source_fp) >= 10:
                             audio_sim = compare_chromaprint(target_fp, source_fp)
 
-                    # 综合评分：pHash 20% + 音频 40% + 画面 40%
-                    combined_score = 0.2 * phash_sim + 0.4 * audio_sim + 0.4 * visual_sim
+                    if self.use_audio_matching:
+                        # 综合评分：pHash 20% + 音频 40% + 画面 40%
+                        combined_score = 0.2 * phash_sim + 0.4 * audio_sim + 0.4 * visual_sim
+                    else:
+                        # 默认纯画面：pHash 35% + 画面 65%
+                        combined_score = 0.35 * phash_sim + 0.65 * visual_sim
                     if combined_score > best_score:
                         best_score = combined_score
                         best_start = start_sec
@@ -296,7 +351,11 @@ class FastHighPrecisionReconstructor:
             if best_source and best_score >= 0.70:
                 return best_source, best_start, best_score
 
-        # Fallback：无 pHash 候选时，回退到原音频+画面搜索
+        # Fallback：无 pHash 候选时，默认回退纯画面搜索
+        if not self.use_audio_matching:
+            return self.find_best_match_by_visual(target_start, duration, seg_index)
+
+        # 启用音频匹配时，回退到音频+画面搜索
         target_fp = extract_chromaprint(self.target_video, target_start, duration)
         if not target_fp or len(target_fp) < 10:
             return self.find_best_match_by_visual(target_start, duration, seg_index)
@@ -426,6 +485,112 @@ class FastHighPrecisionReconstructor:
         if best_score >= 0.75:
             return best_source, best_start, best_score
         return None, 0, 0
+
+    def rematch_low_confidence_segment(
+        self,
+        target_start: float,
+        duration: float,
+        seg_index: int,
+        base_source: Optional[Path],
+        base_start: float,
+        base_score: float,
+    ) -> Tuple[Optional[Path], float, float, Dict]:
+        """
+        低置信度段局部重匹配：
+        - 动态触发，无固定时间点
+        - 以候选中心做逐步扩窗搜索
+        """
+        target_fp = []
+        if self.use_audio_matching:
+            target_fp = extract_chromaprint(self.target_video, target_start, duration)
+            if not target_fp or len(target_fp) < 10:
+                return base_source, base_start, base_score, {"triggered": True, "improved": False, "reason": "no_target_fp"}
+
+        target_frames = []
+        check_offsets = [0, duration * 0.5, max(0.0, duration - 0.2)]
+        for i, offset in enumerate(check_offsets):
+            tf = self.temp_dir / f"rematch_target_{seg_index}_{i}.jpg"
+            self.extract_frame(self.target_video, target_start + offset, tf)
+            if tf.exists():
+                target_frames.append((offset, tf))
+        if not target_frames:
+            return base_source, base_start, base_score, {"triggered": True, "improved": False, "reason": "no_target_frames"}
+
+        best_source = base_source
+        best_start = base_start
+        best_score = base_score
+        best_meta = {"triggered": True, "improved": False, "window": self.rematch_window}
+
+        candidates = self.find_match_by_phash(target_start, duration, seg_index, top_k=12)
+        if base_source is not None:
+            candidates.insert(0, (base_source, base_start + duration * 0.5, min(1.0, base_score + 0.05)))
+
+        seen = set()
+        for source, center_time, phash_sim in candidates:
+            source_duration = self.get_video_duration(source)
+            for window in range(self.rematch_window, self.rematch_max_window + 1, self.rematch_window):
+                left = max(0, int(center_time - window))
+                right = min(int(source_duration - duration), int(center_time + window))
+                if right < left:
+                    continue
+                for start_sec in range(left, right + 1):
+                    key = (str(source), start_sec)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    audio_sim = 0.0
+                    if self.use_audio_matching:
+                        source_fp = extract_chromaprint(source, start_sec, duration)
+                        if not source_fp or len(source_fp) < 10:
+                            continue
+                        audio_sim = compare_chromaprint(target_fp, source_fp)
+                        if audio_sim < 0.40:
+                            continue
+
+                    total_sim = 0.0
+                    valid = 0
+                    for offset, target_frame in target_frames:
+                        sf = self.temp_dir / f"rematch_src_{seg_index}_{source.stem}_{start_sec}_{int(offset*10)}.jpg"
+                        self.extract_frame(source, start_sec + offset, sf)
+                        if sf.exists():
+                            total_sim += self.calculate_frame_similarity(target_frame, sf)
+                            valid += 1
+                            sf.unlink()
+                    visual_sim = (total_sim / valid) if valid > 0 else 0.0
+
+                    if self.use_audio_matching:
+                        score = (
+                            0.15 * phash_sim
+                            + 0.45 * audio_sim
+                            + 0.35 * visual_sim
+                            + self.continuity_bonus(start_sec, target_start, duration)
+                        )
+                    else:
+                        score = (
+                            0.35 * phash_sim
+                            + 0.60 * visual_sim
+                            + self.continuity_bonus(start_sec, target_start, duration)
+                        )
+                    if score > best_score:
+                        best_source = source
+                        best_start = start_sec
+                        best_score = score
+                        best_meta = {
+                            "triggered": True,
+                            "improved": True,
+                            "window": window,
+                            "visual": visual_sim,
+                            "phash": phash_sim,
+                        }
+                        if self.use_audio_matching:
+                            best_meta["audio"] = audio_sim
+
+        for _, tf in target_frames:
+            if tf.exists():
+                tf.unlink()
+
+        return best_source, best_start, best_score, best_meta
     
     def _find_alternative_match(self, target_start: float, duration: float, 
                                  source: Path, min_start: float, seg_index: int) -> float:
@@ -505,9 +670,38 @@ class FastHighPrecisionReconstructor:
         avg_sim = np.mean(similarities) if similarities else 0
         min_sim = np.min(similarities) if similarities else 0
         
-        # 返回平均相似度和最小相似度
-        passed = avg_sim >= 0.80 and min_sim >= 0.72
+        # 返回平均相似度和最小相似度（阈值可配置）
+        min_avg = self.strict_verify_min_sim
+        min_floor = max(0.0, min_avg - 0.08)
+        passed = avg_sim >= min_avg and min_sim >= min_floor
         return passed, avg_sim
+
+    def verify_segment_visual(
+        self,
+        source: Path,
+        source_start: float,
+        target_start: float,
+        duration: float,
+        offsets: List[float],
+        min_avg: float,
+        min_floor: float,
+    ) -> Tuple[bool, float]:
+        """通用多点画面核验。"""
+        similarities = []
+        for offset in offsets:
+            clamped_offset = max(0.0, min(duration, offset))
+            target_frame = self.temp_dir / f"sv_t_{target_start + clamped_offset:.2f}.jpg"
+            source_frame = self.temp_dir / f"sv_s_{source_start + clamped_offset:.2f}.jpg"
+            self.extract_frame(self.target_video, target_start + clamped_offset, target_frame)
+            self.extract_frame(source, source_start + clamped_offset, source_frame)
+            if target_frame.exists() and source_frame.exists():
+                similarities.append(self.calculate_frame_similarity(target_frame, source_frame))
+                target_frame.unlink(missing_ok=True)
+                source_frame.unlink(missing_ok=True)
+
+        avg_sim = float(np.mean(similarities)) if similarities else 0.0
+        min_sim = float(np.min(similarities)) if similarities else 0.0
+        return avg_sim >= min_avg and min_sim >= min_floor, avg_sim
     
     def extract_frame(self, video_path: Path, time_sec: float, output_path: Path):
         """提取帧"""
@@ -552,25 +746,102 @@ class FastHighPrecisionReconstructor:
             task.target_start, task.duration, task.index
         )
 
+        quality = {
+            "combined": combined_score,
+            "low_confidence": combined_score < self.low_score_threshold,
+            "rematch_triggered": False,
+            "rematch_improved": False,
+        }
+
+        # 对低置信度段做局部重匹配
+        if source and combined_score < self.low_score_threshold:
+            rematch_source, rematch_start, rematch_score, rematch_meta = self.rematch_low_confidence_segment(
+                task.target_start,
+                task.duration,
+                task.index,
+                source,
+                source_start,
+                combined_score,
+            )
+            quality["rematch_triggered"] = rematch_meta.get("triggered", False)
+            quality["rematch_improved"] = rematch_meta.get("improved", False)
+            quality["rematch"] = rematch_meta
+            if rematch_source and rematch_score > combined_score:
+                source, source_start, combined_score = rematch_source, rematch_start, rematch_score
+                quality["combined"] = combined_score
+
         if not source or combined_score < 0.70:
             # 兜底：使用目标视频本身对应时间段
-            print(f"   段 {task.index}/44 ⚠️ 匹配失败 (score={combined_score:.2f})，使用目标视频兜底")
+            print(f"   段 {task.index + 1}/{self.total_segments} ⚠️ 匹配失败 (score={combined_score:.2f})，使用目标视频兜底")
             return SegmentResult(
                 index=task.index,
                 success=True,
                 source=self.target_video,
                 source_start=task.target_start,
-                quality={'combined': 0.0, 'fallback': True}
+                quality={**quality, "combined": 0.0, "fallback": True}
             )
 
-        print(f"   段 {task.index}/44 ✅ {source.name} @ {source_start}s (综合: {combined_score:.2f})")
+        # 通用防误匹配：段级画面快速核验，失败则回退目标片段
+        if self.strict_visual_verify:
+            passed, verify_avg = self.quick_verify(source, source_start, task.target_start, task.duration)
+            quality["strict_verify"] = {"passed": bool(passed), "avg": float(verify_avg)}
+            if not passed:
+                print(
+                    f"   段 {task.index + 1}/{self.total_segments} ⚠️ 画面核验失败 "
+                    f"(avg={verify_avg:.2f})，回退目标视频"
+                )
+                return SegmentResult(
+                    index=task.index,
+                    success=True,
+                    source=self.target_video,
+                    source_start=task.target_start,
+                    quality={
+                        **quality,
+                        "combined": 0.0,
+                        "fallback": True,
+                        "fallback_reason": "strict_visual_verify_failed",
+                    },
+                )
+
+        # 通用尾段守卫：末尾更严格核验，防止尾段误匹配导致“内容回跳”
+        if self.target_duration > 0 and task.target_start >= (self.target_duration - self.tail_guard_seconds):
+            offsets = [0.0, task.duration * 0.25, task.duration * 0.5, task.duration * 0.75, max(0.0, task.duration - 0.1)]
+            tail_passed, tail_avg = self.verify_segment_visual(
+                source,
+                source_start,
+                task.target_start,
+                task.duration,
+                offsets=offsets,
+                min_avg=self.tail_verify_min_avg,
+                min_floor=self.tail_verify_min_floor,
+            )
+            quality["tail_verify"] = {"passed": bool(tail_passed), "avg": float(tail_avg)}
+            if not tail_passed:
+                print(
+                    f"   段 {task.index + 1}/{self.total_segments} ⚠️ 尾段守卫失败 "
+                    f"(avg={tail_avg:.2f})，回退目标视频"
+                )
+                return SegmentResult(
+                    index=task.index,
+                    success=True,
+                    source=self.target_video,
+                    source_start=task.target_start,
+                    quality={
+                        **quality,
+                        "combined": 0.0,
+                        "fallback": True,
+                        "fallback_reason": "tail_guard_failed",
+                    },
+                )
+
+        print(f"   段 {task.index + 1}/{self.total_segments} ✅ {source.name} @ {source_start}s (综合: {combined_score:.2f})")
 
         return SegmentResult(
             index=task.index,
             success=True,
             source=source,
             source_start=source_start,
-            quality={'combined': combined_score}
+            quality=quality
         )
     
     def reconstruct_fast(self, output_path: str) -> bool:
@@ -587,7 +858,10 @@ class FastHighPrecisionReconstructor:
         self.build_frame_index(sample_interval=1.0)
 
         target_duration = self.get_video_duration(self.target_video)
+        self.target_duration = target_duration
+        self.output_fps = self.get_video_fps(self.target_video)
         print(f"\n📹 目标视频: {target_duration:.1f}s")
+        print(f"🎞️ 输出帧率: {self.output_fps:.3f} fps (自动读取目标视频)")
         
         # 创建任务列表
         tasks = []
@@ -598,6 +872,8 @@ class FastHighPrecisionReconstructor:
             duration = min(self.segment_duration, target_duration - start)
             if duration > 0:
                 tasks.append(SegmentTask(index=i, target_start=start, duration=duration))
+
+        self.total_segments = len(tasks)
         
         print(f"\n🔄 并行处理 {len(tasks)} 个段 (线程数: {self.max_workers})...")
         
@@ -621,121 +897,52 @@ class FastHighPrecisionReconstructor:
                     print(f"   段 {task.index+1} 错误: {e}")
                     results[task.index] = SegmentResult(index=task.index, success=False)
         
-        # 整理结果
-        confirmed_segments = []
+        # 整理结果：优先保全所有段，任何缺失段都用目标视频对应时间兜底
+        confirmed_by_index = {}
         for r in results:
             if r and r.success:
-                confirmed_segments.append({
+                confirmed_by_index[r.index] = {
                     'index': r.index,
                     'source': r.source,
                     'start': r.source_start,
                     'duration': tasks[r.index].duration,
                     'target_start': tasks[r.index].target_start,
-                    'quality': r.quality
-                })
-        
-        confirmed_segments.sort(key=lambda x: x['index'])
+                    'quality': r.quality or {}
+                }
 
-        # 强制单调递增：相邻两段使用同一源视频时，源时间必须单调递增
-        # 不同目标段可以独立地映射到同一源视频的任意位置
-        print(f"\n   强制单调递增校验...")
-        monotonic_segments = []
-        removed_count = 0
+        missing_count = 0
+        confirmed_segments = []
+        for task in tasks:
+            seg = confirmed_by_index.get(task.index)
+            if seg is None:
+                missing_count += 1
+                seg = {
+                    'index': task.index,
+                    'source': self.target_video,
+                    'start': task.target_start,
+                    'duration': task.duration,
+                    'target_start': task.target_start,
+                    'quality': {'combined': 0.0, 'fallback': True, 'reason': 'missing_result'}
+                }
+            confirmed_segments.append(seg)
 
-        for seg in confirmed_segments:
-            if monotonic_segments:
-                prev = monotonic_segments[-1]
-                if prev['source'] == seg['source']:
-                    prev_end = prev['start'] + prev['duration']
-                    if seg['start'] < prev_end - 0.5:
-                        print(f"   [单调] 剔除倒退段 {seg['index']}: {seg['source'].name} @ {seg['start']:.1f}s (前段结束 {prev_end:.1f}s)")
-                        removed_count += 1
-                        continue
-            monotonic_segments.append(seg)
+        if missing_count > 0:
+            print(f"   ⚠️ 自动补齐缺失段: {missing_count} 段")
 
-        if removed_count > 0:
-            print(f"   ✅ 剔除了 {removed_count} 个时间倒退段")
-        confirmed_segments = monotonic_segments
-        
-        # 去重：只跳过真正完全相同的片段（同一源+同一时间+同一段）
-        # 注意：不同段使用同一源的不同时间是正常的（连续片段）
-        seen_segments = set()
-        unique_segments = []
-        
-        for seg in confirmed_segments:
-            # 使用源路径、开始时间、段索引作为唯一标识
-            unique_key = f"{seg['source']}_{seg['start']:.1f}_{seg['index']}"
-            if unique_key not in seen_segments:
-                seen_segments.add(unique_key)
-                unique_segments.append(seg)
-            else:
-                print(f"   [去重] 跳过完全重复的段 {seg['index']}: {seg['source'].name} @ {seg['start']}s")
-        
-        confirmed_segments = unique_segments
-        
-        # 检查并修复相邻段的时间重叠（同一源视频）
-        print(f"\n   检查相邻段重叠...")
-        overlap_fixed = 0
-        for i in range(1, len(confirmed_segments)):
-            prev = confirmed_segments[i-1]
-            curr = confirmed_segments[i]
-            
-            if prev['source'] == curr['source']:
-                prev_end = prev['start'] + prev['duration']
-                overlap = prev_end - curr['start']
-                
-                if overlap > 0.5:  # 重叠超过0.5秒才处理
-                    print(f"   ⚠️ 段 {curr['index']} 与段 {prev['index']} 重叠 {overlap:.1f}s")
-                    
-                    # 策略1：尝试在同一源视频中向后搜索，找一个不重叠的替代匹配点
-                    alternative_start = self._find_alternative_match(
-                        curr['target_start'], curr['duration'], 
-                        curr['source'], prev_end, curr['index']
-                    )
-                    
-                    if alternative_start is not None:
-                        # 找到了替代匹配点
-                        print(f"   ✅ 段 {curr['index']} 找到替代匹配点: {curr['start']}s -> {alternative_start}s")
-                        curr['start'] = alternative_start
-                        overlap_fixed += 1
-                        continue
-                    
-                    # 策略2：尝试在其他源视频中搜索
-                    alt_source, alt_start, alt_score = self.find_best_match_by_visual(
-                        curr['target_start'], curr['duration'], curr['index']
-                    )
-                    
-                    if alt_source and alt_score >= 0.70 and alt_source != curr['source']:
-                        print(f"   ✅ 段 {curr['index']} 切换到新源: {alt_source.name} @ {alt_start}s (相似度: {alt_score:.2f})")
-                        curr['source'] = alt_source
-                        curr['start'] = alt_start
-                        overlap_fixed += 1
-                        continue
-                    
-                    # 策略3：如果当前段开始时间早于前一段，直接调整开始时间
-                    if curr['start'] < prev['start']:
-                        print(f"   ⚠️ 段 {curr['index']} 时间顺序错乱，强制调整: {curr['start']}s -> {prev_end}s")
-                        curr['start'] = prev_end
-                        overlap_fixed += 1
-                        continue
-                    
-                    # 策略4：重叠较小，尝试微调当前段
-                    if overlap <= 2.0:
-                        new_start = curr['start'] + overlap + 0.1
-                        print(f"   ⚠️ 段 {curr['index']} 微调: {curr['start']}s -> {new_start}s")
-                        curr['start'] = new_start
-                        overlap_fixed += 1
-                        continue
-                    
-                    # 策略5：重叠太大，直接调整（会丢失内容）
-                    print(f"   ⚠️ 段 {curr['index']} 重叠过大，强制调整: {curr['start']}s -> {prev_end}s")
-                    curr['start'] = prev_end
-                    overlap_fixed += 1
-        
-        if overlap_fixed > 0:
-            print(f"   ✅ 修复了 {overlap_fixed} 处重叠")
+        overlap_adjusted, overlap_fallback = self.smooth_adjacent_overlaps(confirmed_segments)
+        if overlap_adjusted > 0:
+            print(f"   🔧 去重叠平滑: 修正 {overlap_adjusted} 个相邻段")
+        if overlap_fallback > 0:
+            print(f"   🛟 反重复兜底: 切换 {overlap_fallback} 个段到目标素材")
+        global_repeat_fallback = self.suppress_temporal_loops(confirmed_segments)
+        if global_repeat_fallback > 0:
+            print(f"   🧯 全局反重复: 切换 {global_repeat_fallback} 个段到目标素材")
+        step_guard_fallback = self.enforce_temporal_step_consistency(confirmed_segments)
+        if step_guard_fallback > 0:
+            print(f"   🧷 步长一致性守卫: 切换 {step_guard_fallback} 个段到目标素材")
 
-        print(f"\n✅ 成功匹配: {len(confirmed_segments)}/{len(tasks)} 段")
+        print(f"\n✅ 可用段: {len(confirmed_segments)}/{len(tasks)} 段 (完整保留)")
+        self.save_quality_report(confirmed_segments, output_path)
         
         # 生成输出
         if confirmed_segments:
@@ -752,103 +959,463 @@ class FastHighPrecisionReconstructor:
             return success
         
         return False
-    
+
+    def save_quality_report(self, segments: List[dict], output_path: str):
+        """输出段级质量统计，便于排查局部错位。"""
+        low_segments = []
+        rematch_triggered = 0
+        rematch_improved = 0
+        fallback_count = 0
+        combined_scores = []
+
+        for seg in segments:
+            quality = seg.get("quality", {}) or {}
+            combined = float(quality.get("combined", 0.0))
+            combined_scores.append(combined)
+            if quality.get("rematch_triggered"):
+                rematch_triggered += 1
+            if quality.get("rematch_improved"):
+                rematch_improved += 1
+            if quality.get("fallback"):
+                fallback_count += 1
+            if combined < self.low_score_threshold:
+                low_segments.append({
+                    "index": seg["index"],
+                    "target_start": seg["target_start"],
+                    "source": str(seg["source"]),
+                    "source_start": seg["start"],
+                    "combined": combined,
+                    "fallback": bool(quality.get("fallback", False)),
+                })
+
+        avg_score = float(np.mean(combined_scores)) if combined_scores else 0.0
+        report = {
+            "total_segments": len(segments),
+            "avg_combined_score": avg_score,
+            "low_score_threshold": self.low_score_threshold,
+            "low_score_segments": len(low_segments),
+            "rematch_triggered": rematch_triggered,
+            "rematch_improved": rematch_improved,
+            "fallback_segments": fallback_count,
+            "low_segments": low_segments,
+        }
+
+        report_path = Path(output_path).with_suffix(".quality_report.json")
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        print(f"   📋 质量报告: {report_path}")
+        print(
+            f"   统计: 平均分 {avg_score:.3f}, 低分段 {len(low_segments)}, "
+            f"重匹配触发 {rematch_triggered}, 提升 {rematch_improved}, 兜底 {fallback_count}"
+        )
+
+    def smooth_adjacent_overlaps(self, segments: List[dict]) -> Tuple[int, int]:
+        """
+        全局时间轴连续性修正（避免连锁推移）：
+        - 仅处理“严重回跳/重叠/前跳”异常
+        - 优先在同源内重找可用起点，失败则切回目标段
+        - 不再对全部轻微重叠做连续平移，防止后半段整体被推偏
+        """
+        adjusted = 0
+        fallback_switched = 0
+
+        def fallback_segment(seg: dict, reason: str, metric: float):
+            nonlocal fallback_switched
+            seg["source"] = self.target_video
+            seg["start"] = seg["target_start"]
+            q = seg.get("quality", {}) or {}
+            q["fallback"] = True
+            q["fallback_reason"] = reason
+            q["timeline_guard_metric"] = float(metric)
+            seg["quality"] = q
+            fallback_switched += 1
+
+        for i in range(1, len(segments)):
+            prev = segments[i - 1]
+            curr = segments[i]
+            curr_start = float(curr["start"])
+            curr_target = float(curr["target_start"])
+
+            # 跨源边界守卫：如果前段已是目标兜底，后段又是孤立非目标段且时间漂移明显，
+            # 极易出现“某 1 秒错位后又恢复”的现象，直接回退当前段到目标素材。
+            if curr["source"] != self.target_video and prev["source"] != curr["source"]:
+                cross_drift = abs(curr_start - curr_target)
+                if prev["source"] == self.target_video and cross_drift > self.isolated_drift_trigger:
+                    fallback_segment(curr, "timeline_cross_source_after_target", cross_drift)
+                    continue
+
+            if prev["source"] != curr["source"] or curr["source"] == self.target_video:
+                continue
+
+            prev_end = float(prev["start"]) + float(prev["duration"])
+            overlap = prev_end - curr_start
+            source_delta = curr_start - float(prev["start"])
+            target_delta = float(curr["target_start"]) - float(prev["target_start"])
+            gap_allowance = max(1.0, float(curr["duration"]) * 0.25)
+
+            severe_overlap = overlap > max(self.adjacent_overlap_trigger, float(curr["duration"]) * 0.12)
+            backjump = source_delta < -0.5
+            fast_forward_gap = source_delta > target_delta + gap_allowance
+            lagging_step = (target_delta - source_delta) > max(self.adjacent_lag_trigger, float(curr["duration"]) * 0.12)
+
+            if not (severe_overlap or backjump or fast_forward_gap or lagging_step):
+                continue
+
+            # 只在确有异常时尝试替代匹配，避免对正常段做连锁平移。
+            min_start = max(curr_start, prev_end - 0.05)
+            alt_start = self._find_alternative_match(
+                curr["target_start"],
+                curr["duration"],
+                curr["source"],
+                min_start,
+                curr["index"],
+            )
+
+            if alt_start is not None and alt_start >= prev_end - 0.2:
+                step_tolerance = max(0.9, float(curr["duration"]) * 0.30)
+                adjusted_source_delta = float(alt_start) - float(prev["start"])
+                # 硬约束：禁止重匹配后出现明显“快进/慢进”步长偏差，避免局部短暂错位后又恢复。
+                if abs(adjusted_source_delta - target_delta) > step_tolerance:
+                    alt_start = None
+
+            if alt_start is not None and alt_start >= prev_end - 0.2:
+                passed, verify_avg = self.quick_verify(
+                    curr["source"],
+                    alt_start,
+                    curr["target_start"],
+                    curr["duration"],
+                )
+                if passed:
+                    curr["start"] = float(alt_start)
+                    q = curr.get("quality", {}) or {}
+                    q["timeline_guard_rematched"] = True
+                    q["timeline_guard_verify_avg"] = float(verify_avg)
+                    q["timeline_guard_overlap"] = float(overlap)
+                    q["timeline_guard_source_delta"] = float(source_delta)
+                    curr["quality"] = q
+                    adjusted += 1
+                    continue
+
+            reason = "timeline_guard_overlap"
+            metric = overlap
+            if backjump:
+                reason = "timeline_guard_backjump"
+                metric = source_delta
+            elif fast_forward_gap:
+                reason = "timeline_guard_fast_forward_gap"
+                metric = source_delta - target_delta
+            elif lagging_step:
+                reason = "timeline_guard_lagging_step"
+                metric = target_delta - source_delta
+            fallback_segment(curr, reason, metric)
+
+        return adjusted, fallback_switched
+
+    def suppress_temporal_loops(self, segments: List[dict]) -> int:
+        """
+        轻量全局反重复（仅基于时间轴，避免额外帧提取开销）：
+        - 同源回跳：目标时间前进但源时间倒退
+        - 同源前跳：源时间前进过快导致中间内容被跳过（丢帧/缺内容）
+        - 同源缓慢前进：连续多段几乎停在同一时间附近
+        - 远距复用：隔很远的目标段复用同一源时间桶
+        """
+        switched = 0
+
+        def fallback_segment(seg: dict, reason: str):
+            nonlocal switched
+            if seg["source"] == self.target_video:
+                return
+            seg["source"] = self.target_video
+            seg["start"] = seg["target_start"]
+            q = seg.get("quality", {}) or {}
+            q["fallback"] = True
+            q["fallback_reason"] = reason
+            seg["quality"] = q
+            switched += 1
+
+        # 规则1：逐段回跳/停滞检测
+        slow_streak = 0
+        for i, seg in enumerate(segments):
+            if seg["source"] == self.target_video:
+                slow_streak = 0
+                continue
+
+            fallback_reason: Optional[str] = None
+            duration = float(seg["duration"])
+            if i > 0:
+                prev = segments[i - 1]
+                if prev["source"] == seg["source"]:
+                    source_delta = float(seg["start"]) - float(prev["start"])
+                    target_delta = float(seg["target_start"]) - float(prev["target_start"])
+
+                    # 同源回跳：目标时间前进，但源时间倒退，容易出现内容回放/重复。
+                    if target_delta > duration * 0.8 and source_delta < -0.5:
+                        fallback_reason = "temporal_loop_step_backjump"
+
+                    # 同源前跳：源时间推进明显快于目标时间，容易跳过中间内容（用户感知为丢帧/缺内容）。
+                    gap_allowance = max(1.0, duration * 0.25)
+                    if source_delta > target_delta + gap_allowance:
+                        fallback_reason = "temporal_gap_step"
+
+                    if source_delta < max(0.8, duration * 0.35):
+                        slow_streak += 1
+                    else:
+                        slow_streak = 0
+
+                    if slow_streak >= 2 and fallback_reason is None:
+                        fallback_reason = "temporal_loop_step_stall"
+                else:
+                    slow_streak = 0
+
+            if fallback_reason is not None:
+                fallback_segment(seg, fallback_reason)
+                slow_streak = 0
+
+        # 规则2：连续同源段“时间压缩”检测（强制）
+        i = 0
+        while i < len(segments):
+            src = segments[i]["source"]
+            if src == self.target_video:
+                i += 1
+                continue
+
+            j = i + 1
+            while j < len(segments) and segments[j]["source"] == src:
+                j += 1
+
+            run = segments[i:j]
+            if len(run) >= 3:
+                d = float(run[0]["duration"])
+                target_span = float(run[-1]["target_start"] - run[0]["target_start"] + run[-1]["duration"])
+                src_starts = [float(s["start"]) for s in run]
+                source_span = max(src_starts) - min(src_starts) + d
+                compression_ratio = source_span / target_span if target_span > 1e-6 else 1.0
+
+                # 目标覆盖明显更长，但源时间只在小范围抖动，判定为循环重复
+                if target_span >= d * 3 and compression_ratio < 0.60:
+                    for seg in run[1:]:
+                        fallback_segment(seg, "temporal_loop_run_compression")
+
+            i = j
+
+        return switched
+
+    def enforce_temporal_step_consistency(self, segments: List[dict]) -> int:
+        """
+        同源步长一致性硬守卫：
+        - 对同源相邻段（前后双向）要求 source 步长与 target 步长近似一致
+        - 如果出现突变（短暂错位后恢复的常见根因），直接兜底到目标段
+        """
+        switched = 0
+
+        def fallback_segment(seg: dict, reason: str, metric: float):
+            nonlocal switched
+            if seg["source"] == self.target_video:
+                return
+            seg["source"] = self.target_video
+            seg["start"] = seg["target_start"]
+            q = seg.get("quality", {}) or {}
+            q["fallback"] = True
+            q["fallback_reason"] = reason
+            q["timeline_step_metric"] = float(metric)
+            seg["quality"] = q
+            switched += 1
+
+        for i, curr in enumerate(segments):
+            if curr["source"] == self.target_video:
+                continue
+
+            curr_start = float(curr["start"])
+            curr_target = float(curr["target_start"])
+            step_tolerance = max(0.9, float(curr["duration"]) * 0.30)
+            hard_tolerance = max(2.0, step_tolerance * 2.2)
+            step_deviations: List[float] = []
+            mapping_jumps: List[float] = []
+            has_same_source_neighbor = False
+
+            def collect_with_neighbor(nei: dict):
+                nonlocal has_same_source_neighbor
+                if nei["source"] != curr["source"]:
+                    return
+                has_same_source_neighbor = True
+                nei_start = float(nei["start"])
+                nei_target = float(nei["target_start"])
+                target_delta = abs(curr_target - nei_target)
+                source_delta = abs(curr_start - nei_start)
+                if target_delta <= 0:
+                    return
+                step_deviations.append(abs(source_delta - target_delta))
+                curr_mapping = curr_start - curr_target
+                nei_mapping = nei_start - nei_target
+                mapping_jumps.append(abs(curr_mapping - nei_mapping))
+
+            if i > 0:
+                collect_with_neighbor(segments[i - 1])
+            if i + 1 < len(segments):
+                collect_with_neighbor(segments[i + 1])
+
+            # 孤立段守卫：前后都非同源时，限制 target/source 的绝对偏移，避免“单段跳错后又恢复”。
+            if not has_same_source_neighbor:
+                isolated_drift = abs(curr_start - curr_target)
+                isolated_limit = max(self.isolated_drift_trigger, float(curr["duration"]) * 0.16)
+                if isolated_drift > isolated_limit:
+                    fallback_segment(curr, "timeline_isolated_drift", isolated_drift)
+                    continue
+
+            if not step_deviations and not mapping_jumps:
+                continue
+
+            max_step_dev = max(step_deviations) if step_deviations else 0.0
+            max_map_jump = max(mapping_jumps) if mapping_jumps else 0.0
+            bad_step_pairs = sum(1 for d in step_deviations if d > step_tolerance)
+            bad_map_pairs = sum(1 for m in mapping_jumps if m > step_tolerance)
+            severe = (max_step_dev > hard_tolerance) or (max_map_jump > hard_tolerance)
+
+            if severe:
+                reason = "timeline_step_deviation_hard"
+                metric = max_step_dev
+                if max_map_jump > max_step_dev:
+                    reason = "timeline_mapping_jump_hard"
+                    metric = max_map_jump
+                fallback_segment(curr, reason, metric)
+                continue
+
+            if (bad_step_pairs + bad_map_pairs) >= 2:
+                metric = max(max_step_dev, max_map_jump)
+                fallback_segment(curr, "timeline_step_bi_mismatch", metric)
+                continue
+
+        return switched
+
+    def _extract_av_clip(self, source: Path, start: float, duration: float, output_clip: Path, fps_expr: str) -> Tuple[bool, str]:
+        """提取单段 AV 片段，返回 (是否成功, 错误信息)。"""
+        cmd = [
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+            '-i', str(source),
+            '-ss', str(start),
+            '-t', str(duration),
+            '-vf', fps_expr,
+            '-af', 'aresample=async=1:first_pts=0',
+            '-reset_timestamps', '1',
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k',
+            str(output_clip)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return False, (result.stderr or "").strip()
+        if not output_clip.exists() or output_clip.stat().st_size <= 0:
+            return False, "empty_output"
+        return True, ""
+
     def _generate_output(self, segments: List[dict], output_path: str, target_duration: float) -> bool:
         """生成输出 - 同步音视频"""
         
-        video_clips = []
-        audio_clips = []
+        av_clips = []
+        output_fps = max(12.0, float(self.output_fps))
+        fps_expr = f"fps={output_fps:.6f},format=yuv420p"
+        fps_out = f"{output_fps:.6f}"
+        render_fallbacks = 0
         
         for seg in segments:
             seg_source = seg['source']
             seg_start = seg['start']
             
-            # 提取视频片段 - 使用精确提取（-ss在-i之前）
-            video_clip = self.temp_dir / f"seg_{seg['index']:03d}_v.mp4"
-            cmd = [
-                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                '-ss', str(seg_start),  # 放在-i之前，逐帧精确seek
-                '-t', str(seg['duration']),
-                '-i', str(seg_source),
-                '-an', '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-                str(video_clip)
-            ]
-            subprocess.run(cmd, capture_output=True)
-            
-            # 提取音频片段（从同一源，同样精确提取）
-            audio_clip = self.temp_dir / f"seg_{seg['index']:03d}_a.aac"
-            cmd = [
-                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                '-ss', str(seg_start),  # 放在-i之前，逐帧精确seek
-                '-t', str(seg['duration']),
-                '-i', str(seg_source),
-                '-vn', '-c:a', 'aac', '-b:a', '128k',
-                str(audio_clip)
-            ]
-            subprocess.run(cmd, capture_output=True)
-            
-            if video_clip.exists() and audio_clip.exists():
-                video_clips.append(video_clip)
-                audio_clips.append(audio_clip)
-        
-        if not video_clips or not audio_clips:
-            print("❌ 没有有效的音视频片段")
+            # 一次性提取 AV 片段，避免音视频分离切片造成边界漂移
+            av_clip = self.temp_dir / f"seg_{seg['index']:03d}_av.mp4"
+            ok, err = self._extract_av_clip(seg_source, seg_start, seg['duration'], av_clip, fps_expr)
+            if not ok and seg_source != self.target_video:
+                render_fallbacks += 1
+                q = seg.get("quality", {}) or {}
+                q["fallback"] = True
+                q["fallback_reason"] = "render_extract_failed"
+                q["render_extract_error"] = err[:240]
+                seg["quality"] = q
+                seg["source"] = self.target_video
+                seg["start"] = seg["target_start"]
+                ok, err = self._extract_av_clip(seg["source"], seg["start"], seg["duration"], av_clip, fps_expr)
+
+            if not ok:
+                print(f"❌ 段 {seg['index']+1} 提取失败，无法生成完整时间轴: {err}")
+                return False
+
+            av_clips.append(av_clip)
+
+        if not av_clips:
+            print("❌ 没有有效的 AV 片段")
             return False
-        
-        print(f"   视频片段: {len(video_clips)}, 音频片段: {len(audio_clips)}")
-        
-        # 拼接视频
-        video_concat = self.temp_dir / "video_concat.txt"
-        with open(video_concat, 'w') as f:
-            for clip in video_clips:
+
+        print(f"   AV片段: {len(av_clips)}")
+        if render_fallbacks > 0:
+            print(f"   🛟 渲染期自动兜底: {render_fallbacks} 段（防止静默丢段）")
+
+        # 直接拼接 AV 片段
+        av_concat = self.temp_dir / "av_concat.txt"
+        with open(av_concat, 'w') as f:
+            for clip in av_clips:
                 f.write(f"file '{clip}'\n")
-        
-        temp_video = self.temp_dir / "temp_video.mp4"
+
+        temp_output = self.temp_dir / "temp_output.mp4"
         cmd = [
             'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
             '-f', 'concat', '-safe', '0',
-            '-i', str(video_concat),
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',  # 重新编码而不是copy
-            str(temp_video)
-        ]
-        subprocess.run(cmd, capture_output=True)
-        
-        # 拼接音频
-        audio_concat = self.temp_dir / "audio_concat.txt"
-        with open(audio_concat, 'w') as f:
-            for clip in audio_clips:
-                f.write(f"file '{clip}'\n")
-        
-        temp_audio = self.temp_dir / "temp_audio.aac"
-        cmd = [
-            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-            '-f', 'concat', '-safe', '0',
-            '-i', str(audio_concat),
-            '-c:a', 'aac', '-b:a', '128k',  # 重新编码而不是copy
-            str(temp_audio)
-        ]
-        subprocess.run(cmd, capture_output=True)
-        
-        if not temp_video.exists() or not temp_audio.exists():
-            print("❌ 音视频拼接失败")
-            return False
-        
-        # 合并音视频
-        current_duration = self.get_video_duration(temp_video)
-        print(f"   当前视频时长: {current_duration:.2f}s, 目标: {target_duration:.2f}s")
-        
-        # 直接合并音视频，不调速、不截断
-        cmd = [
-            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-            '-i', str(temp_video),
-            '-i', str(temp_audio),
+            '-i', str(av_concat),
+            '-vsync', 'cfr',
+            '-r', fps_out,
             '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
             '-c:a', 'aac', '-b:a', '128k',
-            str(output_path)
+            str(temp_output)
         ]
-        
         subprocess.run(cmd, capture_output=True)
-        
+
+        if not temp_output.exists():
+            print("❌ AV 拼接失败")
+            return False
+
+        current_duration = self.get_video_duration(temp_output)
+        print(f"   当前视频时长: {current_duration:.2f}s, 目标: {target_duration:.2f}s")
+
+        # 统一做精确截断，保证输出时长不超过目标
+        trimmed_output = self.temp_dir / "temp_output_trimmed.mp4"
+        cmd = [
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+            '-i', str(temp_output),
+            '-t', f"{target_duration:.3f}",
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k',
+            str(trimmed_output)
+        ]
+        subprocess.run(cmd, capture_output=True)
+        if trimmed_output.exists():
+            temp_output = trimmed_output
+
+        if self.force_target_audio:
+            # 可选：使用目标音轨进行最终封装
+            muxed_output = self.temp_dir / "temp_output_target_audio.mp4"
+            cmd = [
+                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                '-i', str(temp_output),
+                '-i', str(self.target_video),
+                '-map', '0:v:0',
+                '-map', '1:a:0',
+                '-c:v', 'copy',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-t', f"{target_duration:.3f}",
+                '-shortest',
+                str(muxed_output)
+            ]
+            subprocess.run(cmd, capture_output=True)
+
+            if muxed_output.exists():
+                shutil.copy(muxed_output, output_path)
+                print("   🔊 已使用目标音轨封装")
+            else:
+                shutil.copy(temp_output, output_path)
+                print("   ⚠️ 目标音轨封装失败，回退为原拼接音轨")
+        else:
+            shutil.copy(temp_output, output_path)
+            print("   🔊 保留拼接片段原音轨（未使用目标音轨封装）")
+
         if Path(output_path).exists():
             final_duration = self.get_video_duration(Path(output_path))
             print(f"   最终视频时长: {final_duration:.2f}s")
@@ -875,8 +1442,13 @@ class FastHighPrecisionReconstructor:
         check_dir = Path("temp_outputs/ai_check_round" + str(getattr(self, 'round_num', 'X')))
         check_dir.mkdir(exist_ok=True)
         
-        # 关键时间点检查
-        check_points = [0, 75, 100, 165, 200]
+        # 关键时间点检查（动态采样，适配任意时长）
+        output_duration = self.get_video_duration(Path(output_path))
+        if output_duration <= 1:
+            check_points = [0]
+        else:
+            raw_points = np.linspace(0, output_duration - 1, num=5)
+            check_points = sorted(set(int(p) for p in raw_points))
         
         frame_pairs = []  # 存储帧路径用于后续查看
         
@@ -936,21 +1508,29 @@ class FastHighPrecisionReconstructor:
 
 def main():
     root = Path(__file__).resolve().parent
-    default_target = root / "01_test_data_generation" / "source_videos" / "南城以北" / "adx原" / "115196-1-363935819124715523.mp4"
-    default_source_dir = root / "01_test_data_generation" / "source_videos" / "南城以北" / "剧集"
-    default_output = root / "01_test_data_generation" / "source_videos" / "南城以北" / "output_v6_base" / "115196_V3_FAST.mp4"
     default_cache = root / "cache"
 
-    parser = argparse.ArgumentParser(description="115196 极速高精度重构 V3 + pHash")
-    parser.add_argument("--target", default=str(default_target), help="目标视频路径")
-    parser.add_argument("--source-dir", default=str(default_source_dir), help="源视频目录")
-    parser.add_argument("--output", default=str(default_output), help="输出视频路径")
+    parser = argparse.ArgumentParser(description="通用极速高精度重构器 V3 + pHash")
+    parser.add_argument("--target", required=True, help="目标视频路径")
+    parser.add_argument("--source-dir", required=True, help="源视频目录")
+    parser.add_argument("--output", help="输出视频路径")
     parser.add_argument("--cache", default=str(default_cache), help="缓存目录")
+    parser.add_argument("--segment-duration", type=float, default=5.0, help="分段时长（秒）")
+    parser.add_argument("--workers", type=int, default=0, help="并行线程数（0=自动）")
+    parser.add_argument("--low-score-threshold", type=float, default=0.82, help="低分段重匹配阈值")
+    parser.add_argument("--rematch-window", type=int, default=2, help="局部重匹配起始窗口（秒）")
+    parser.add_argument("--rematch-max-window", type=int, default=12, help="局部重匹配最大窗口（秒）")
+    parser.add_argument("--continuity-weight", type=float, default=0.05, help="连续性奖励权重（0~0.2）")
+    parser.add_argument("--use-audio-matching", action="store_true", help="启用音频指纹参与匹配（默认关闭）")
+    parser.add_argument("--force-target-audio", action="store_true", help="最终封装强制使用目标音轨（默认关闭）")
     args = parser.parse_args()
 
     target = Path(args.target)
     source_dir = Path(args.source_dir)
-    output = Path(args.output)
+    if args.output:
+        output = Path(args.output)
+    else:
+        output = root / "temp_outputs" / f"{target.stem}_reconstructed_v3.mp4"
     cache = Path(args.cache)
 
     if not target.exists():
@@ -966,13 +1546,22 @@ def main():
         return
     
     print("="*70)
-    print("115196 极速高精度重构 V3")
+    print("通用极速高精度重构 V3")
     print("="*70)
     
     cache.mkdir(exist_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
     
     reconstructor = FastHighPrecisionReconstructor(str(target), source_videos, str(cache))
+    reconstructor.segment_duration = max(1.0, args.segment_duration)
+    if args.workers and args.workers > 0:
+        reconstructor.max_workers = max(1, args.workers)
+    reconstructor.low_score_threshold = min(0.95, max(0.60, args.low_score_threshold))
+    reconstructor.rematch_window = max(1, args.rematch_window)
+    reconstructor.rematch_max_window = max(reconstructor.rematch_window, args.rematch_max_window)
+    reconstructor.continuity_weight = min(0.2, max(0.0, args.continuity_weight))
+    reconstructor.use_audio_matching = bool(args.use_audio_matching)
+    reconstructor.force_target_audio = bool(args.force_target_audio)
     
     try:
         success = reconstructor.reconstruct_fast(str(output))
