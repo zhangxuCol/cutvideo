@@ -7,13 +7,37 @@ import argparse
 import html
 import json
 import subprocess
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from pipeline_config import (
+    load_section_config,
+    cfg_str,
+    cfg_int,
+    cfg_float,
+    cfg_bool,
+)
+
 
 def run_cmd(cmd: List[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def add_bool_arg(parser: argparse.ArgumentParser, name: str, default: bool, help_text: str) -> None:
+    if hasattr(argparse, "BooleanOptionalAction"):
+        parser.add_argument(name, action=argparse.BooleanOptionalAction, default=default, help=help_text)
+        return
+    dest = name.lstrip("-").replace("-", "_")
+    parser.add_argument(name, dest=dest, action="store_true", help=help_text)
+    parser.add_argument(f"--no-{name.lstrip('-')}", dest=dest, action="store_false", help=argparse.SUPPRESS)
+    parser.set_defaults(**{dest: default})
 
 
 def ensure_dir(path: Path) -> None:
@@ -40,7 +64,18 @@ def find_candidate(material: Path, candidate_dir: Path) -> Optional[Path]:
     return None
 
 
-def reconstruct_with_v6_fast(repo_root: Path, target: Path, source_dir: Path, output: Path, cache_dir: Path) -> Tuple[bool, str]:
+def reconstruct_with_v6_fast(
+    repo_root: Path,
+    target: Path,
+    source_dir: Path,
+    output: Path,
+    cache_dir: Path,
+    workers: int,
+    segment_duration: float,
+    low_score_threshold: float,
+    force_target_audio: bool,
+    config_path: str = "",
+) -> Tuple[bool, str]:
     ensure_dir(output.parent)
     ensure_dir(cache_dir)
     cmd = [
@@ -49,11 +84,14 @@ def reconstruct_with_v6_fast(repo_root: Path, target: Path, source_dir: Path, ou
         "--source-dir", str(source_dir),
         "--output", str(output),
         "--cache", str(cache_dir),
-        "--workers", "5",
-        "--segment-duration", "5.0",
-        "--low-score-threshold", "0.82",
-        "--force-target-audio",
+        "--workers", str(max(0, int(workers))),
+        "--segment-duration", str(float(segment_duration)),
+        "--low-score-threshold", str(float(low_score_threshold)),
     ]
+    if force_target_audio:
+        cmd.append("--force-target-audio")
+    if config_path:
+        cmd.extend(["--config", str(config_path)])
     result = run_cmd(cmd)
     if result.returncode != 0:
         msg = (result.stderr or result.stdout or "v6_fast_failed").strip()
@@ -73,10 +111,12 @@ def run_single_audit(
     max_points: int,
     asr_mode: str,
     asr_cmd: str,
+    asr_python: str,
     asr_model: str,
     language: str,
     target_sub: str,
     candidate_sub: str,
+    config_path: str = "",
 ) -> Tuple[bool, str]:
     ensure_dir(output_dir)
     script = repo_root / "skills" / "ai-video-audit" / "scripts" / "build_ai_video_audit_bundle.py"
@@ -94,10 +134,14 @@ def run_single_audit(
     ]
     if asr_cmd:
         cmd.extend(["--asr-cmd", asr_cmd])
+    if asr_python:
+        cmd.extend(["--asr-python", asr_python])
     if target_sub:
         cmd.extend(["--target-sub", target_sub])
     if candidate_sub:
         cmd.extend(["--candidate-sub", candidate_sub])
+    if config_path:
+        cmd.extend(["--config", str(config_path)])
 
     result = run_cmd(cmd)
     if result.returncode != 0:
@@ -147,6 +191,9 @@ def build_total_report(output_root: Path, rows: List[Dict], started_at: str, fin
                   <td>{(summ.get("avg_overall") or 0) * 100:.1f}%</td>
                   <td>{summ.get("mismatch_points", 0)}</td>
                   <td>{html.escape(summ.get("overall_verdict", "未知"))}</td>
+                  <td>{row.get("clip_elapsed_sec") if row.get("clip_elapsed_sec") is not None else "-"}</td>
+                  <td>{row.get("audit_elapsed_sec") if row.get("audit_elapsed_sec") is not None else "-"}</td>
+                  <td>{row.get("total_elapsed_sec") if row.get("total_elapsed_sec") is not None else "-"}</td>
                   <td><a href="{html.escape(report_rel)}">详细页面</a></td>
                   <td><a href="{html.escape(manifest_rel)}">manifest</a></td>
                 </tr>
@@ -159,7 +206,10 @@ def build_total_report(output_root: Path, rows: List[Dict], started_at: str, fin
                   <td>{i}</td>
                   <td>{html.escape(row.get("name", ""))}</td>
                   <td>FAILED</td>
-                  <td colspan="8">{html.escape(row.get("error", ""))}</td>
+                  <td colspan="7">{html.escape(row.get("error", ""))}</td>
+                  <td>{row.get("clip_elapsed_sec") if row.get("clip_elapsed_sec") is not None else "-"}</td>
+                  <td>{row.get("audit_elapsed_sec") if row.get("audit_elapsed_sec") is not None else "-"}</td>
+                  <td>{row.get("total_elapsed_sec") if row.get("total_elapsed_sec") is not None else "-"}</td>
                   <td>-</td>
                   <td>-</td>
                 </tr>
@@ -201,6 +251,9 @@ def build_total_report(output_root: Path, rows: List[Dict], started_at: str, fin
         <th>综合均分</th>
         <th>不一致点</th>
         <th>结论</th>
+        <th>二剪耗时(s)</th>
+        <th>审片耗时(s)</th>
+        <th>总耗时(s)</th>
         <th>详细页</th>
         <th>清单</th>
       </tr>
@@ -217,35 +270,73 @@ def build_total_report(output_root: Path, rows: List[Dict], started_at: str, fin
 
 
 def main() -> int:
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default="", help="配置文件路径（JSON）")
+    pre_args, _ = pre_parser.parse_known_args()
+
+    try:
+        cfg, cfg_path = load_section_config(REPO_ROOT, "batch_ai_audit_3s", explicit_path=pre_args.config)
+        source_dir_default = cfg_str(cfg, "source_dir", "")
+        interval_default = cfg_float(cfg, "interval", 3.0)
+        clip_duration_default = cfg_float(cfg, "clip_duration", 2.0)
+        max_points_default = cfg_int(cfg, "max_points", 1200)
+        asr_default = cfg_str(cfg, "asr", "auto")
+        asr_cmd_default = cfg_str(cfg, "asr_cmd", "")
+        asr_python_default = cfg_str(cfg, "asr_python", "")
+        asr_model_default = cfg_str(cfg, "asr_model", "base")
+        language_default = cfg_str(cfg, "language", "zh")
+        target_sub_default = cfg_str(cfg, "target_sub", "")
+        candidate_sub_default = cfg_str(cfg, "candidate_sub", "")
+        output_root_default = cfg_str(cfg, "output_root", "")
+        cache_dir_default = cfg_str(cfg, "cache_dir", "")
+        reconstruct_workers_default = cfg_int(cfg, "reconstruct_workers", 5)
+        reconstruct_segment_duration_default = cfg_float(cfg, "reconstruct_segment_duration", 5.0)
+        reconstruct_low_score_threshold_default = cfg_float(cfg, "reconstruct_low_score_threshold", 0.82)
+        reconstruct_force_target_audio_default = cfg_bool(cfg, "reconstruct_force_target_audio", True)
+    except RuntimeError as exc:
+        print(f"❌ {exc}")
+        return 2
+
     parser = argparse.ArgumentParser(description="批量执行 3 秒间隔 AI 审片")
+    parser.add_argument("--config", default=str(cfg_path) if cfg_path else "", help="配置文件路径（JSON）")
     parser.add_argument("--material-dir", required=True, help="原素材目录")
     parser.add_argument("--candidate-dir", required=True, help="二剪目录")
-    parser.add_argument("--source-dir", default="", help="源剧集目录（缺失候选时用于重构）")
+    parser.add_argument("--source-dir", default=source_dir_default, help="源剧集目录（缺失候选时用于重构）")
     parser.add_argument("--reconstruct-missing", action="store_true", help="候选缺失时自动用 v6_fast 重构")
-    parser.add_argument("--interval", type=float, default=3.0, help="抽检间隔秒数")
-    parser.add_argument("--clip-duration", type=float, default=2.0, help="每个点音频切片时长")
-    parser.add_argument("--max-points", type=int, default=1200, help="每条视频最大检查点")
-    parser.add_argument("--asr", default="auto", choices=["auto", "none", "faster_whisper", "whisper"])
-    parser.add_argument("--asr-cmd", default="", help="whisper 命令路径")
-    parser.add_argument("--asr-model", default="base", help="ASR 模型")
-    parser.add_argument("--language", default="zh", help="ASR 语种")
-    parser.add_argument("--target-sub", default="", help="原素材字幕文件（可选）")
-    parser.add_argument("--candidate-sub", default="", help="二剪字幕文件（可选）")
-    parser.add_argument("--output-root", default="", help="报告输出根目录")
-    parser.add_argument("--cache-dir", default="", help="v6_fast 缓存目录")
+    parser.add_argument("--interval", type=float, default=interval_default, help="抽检间隔秒数")
+    parser.add_argument("--clip-duration", type=float, default=clip_duration_default, help="每个点音频切片时长")
+    parser.add_argument("--max-points", type=int, default=max_points_default, help="每条视频最大检查点")
+    parser.add_argument("--asr", default=asr_default, choices=["auto", "none", "faster_whisper", "whisper"])
+    parser.add_argument("--asr-cmd", default=asr_cmd_default, help="whisper 命令路径")
+    parser.add_argument("--asr-python", default=asr_python_default, help="whisper 所在 python 路径")
+    parser.add_argument("--asr-model", default=asr_model_default, help="ASR 模型")
+    parser.add_argument("--language", default=language_default, help="ASR 语种")
+    parser.add_argument("--target-sub", default=target_sub_default, help="原素材字幕文件（可选）")
+    parser.add_argument("--candidate-sub", default=candidate_sub_default, help="二剪字幕文件（可选）")
+    parser.add_argument("--output-root", default=output_root_default, help="报告输出根目录")
+    parser.add_argument("--cache-dir", default=cache_dir_default, help="v6_fast 缓存目录")
+    parser.add_argument("--reconstruct-workers", type=int, default=reconstruct_workers_default, help="缺失候选时 v6_fast 并发数")
+    parser.add_argument("--reconstruct-segment-duration", type=float, default=reconstruct_segment_duration_default, help="缺失候选时 v6_fast 分段时长")
+    parser.add_argument("--reconstruct-low-score-threshold", type=float, default=reconstruct_low_score_threshold_default, help="缺失候选时 v6_fast 低分阈值")
+    add_bool_arg(
+        parser,
+        "--reconstruct-force-target-audio",
+        reconstruct_force_target_audio_default,
+        "缺失候选时重构是否强制使用目标音轨",
+    )
     args = parser.parse_args()
 
-    repo_root = Path(__file__).resolve().parents[3]
+    repo_root = REPO_ROOT
     material_dir = Path(args.material_dir).resolve()
     candidate_dir = Path(args.candidate_dir).resolve()
     source_dir = Path(args.source_dir).resolve() if args.source_dir else None
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_root = Path(args.output_root).resolve() if args.output_root else (repo_root / "temp_outputs" / "ai_video_audit_batch" / ts)
+    output_root = Path(args.output_root).resolve() if args.output_root else (repo_root / "runtime" / "temp_outputs" / "ai_video_audit_batch" / ts)
     ensure_dir(output_root)
     ensure_dir(candidate_dir)
 
-    cache_dir = Path(args.cache_dir).resolve() if args.cache_dir else (repo_root / "cache")
+    cache_dir = Path(args.cache_dir).resolve() if args.cache_dir else (repo_root / "runtime" / "cache")
 
     materials = discover_materials(material_dir)
     if not materials:
@@ -261,19 +352,43 @@ def main() -> int:
     print(f"二剪目录: {candidate_dir}")
     print(f"素材数量: {len(materials)}")
     print(f"输出目录: {output_root}")
+    if args.config:
+        print(f"配置文件: {args.config}")
 
     for idx, material in enumerate(materials, start=1):
         print(f"\n[{idx}/{len(materials)}] {material.name}")
+        item_start = time.perf_counter()
+        clip_elapsed_sec: Optional[float] = None
+        audit_elapsed_sec: Optional[float] = None
+        candidate_mode = "existing"
         candidate = find_candidate(material, candidate_dir)
         if candidate is None and args.reconstruct_missing and source_dir:
             candidate = candidate_dir / f"{material.stem}_V3_FAST.mp4"
             print(f"  - 候选缺失，启动重构: {candidate.name}")
-            ok, err = reconstruct_with_v6_fast(repo_root, material, source_dir, candidate, cache_dir)
+            clip_start = time.perf_counter()
+            ok, err = reconstruct_with_v6_fast(
+                repo_root=repo_root,
+                target=material,
+                source_dir=source_dir,
+                output=candidate,
+                cache_dir=cache_dir,
+                workers=args.reconstruct_workers,
+                segment_duration=args.reconstruct_segment_duration,
+                low_score_threshold=args.reconstruct_low_score_threshold,
+                force_target_audio=bool(args.reconstruct_force_target_audio),
+                config_path=args.config,
+            )
+            clip_elapsed_sec = round(time.perf_counter() - clip_start, 3)
+            candidate_mode = "reconstructed"
             if not ok:
                 rows.append({
                     "name": material.name,
                     "status": "failed",
                     "error": f"reconstruct_failed: {err}",
+                    "candidate_mode": candidate_mode,
+                    "clip_elapsed_sec": clip_elapsed_sec,
+                    "audit_elapsed_sec": audit_elapsed_sec,
+                    "total_elapsed_sec": round(time.perf_counter() - item_start, 3),
                 })
                 continue
 
@@ -282,10 +397,18 @@ def main() -> int:
                 "name": material.name,
                 "status": "failed",
                 "error": "candidate_not_found",
+                "candidate_mode": candidate_mode,
+                "clip_elapsed_sec": clip_elapsed_sec,
+                "audit_elapsed_sec": audit_elapsed_sec,
+                "total_elapsed_sec": round(time.perf_counter() - item_start, 3),
             })
             continue
 
+        if clip_elapsed_sec is None:
+            clip_elapsed_sec = 0.0
+
         report_dir = output_root / f"{material.stem}_3s"
+        audit_start = time.perf_counter()
         ok, err = run_single_audit(
             repo_root=repo_root,
             target=material,
@@ -296,17 +419,25 @@ def main() -> int:
             max_points=args.max_points,
             asr_mode=args.asr,
             asr_cmd=args.asr_cmd,
+            asr_python=args.asr_python,
             asr_model=args.asr_model,
             language=args.language,
             target_sub=args.target_sub,
             candidate_sub=args.candidate_sub,
+            config_path=args.config,
         )
+        audit_elapsed_sec = round(time.perf_counter() - audit_start, 3)
+        total_elapsed_sec = round(time.perf_counter() - item_start, 3)
         if not ok:
             rows.append({
                 "name": material.name,
                 "status": "failed",
                 "error": f"audit_failed: {err}",
                 "candidate": str(candidate),
+                "candidate_mode": candidate_mode,
+                "clip_elapsed_sec": clip_elapsed_sec,
+                "audit_elapsed_sec": audit_elapsed_sec,
+                "total_elapsed_sec": total_elapsed_sec,
             })
             continue
 
@@ -319,10 +450,14 @@ def main() -> int:
             "status": "ok",
             "material": str(material),
             "candidate": str(candidate),
+            "candidate_mode": candidate_mode,
             "manifest": str(manifest_path),
             "report_html": str(report_html),
             "manifest_rel": str(manifest_path.relative_to(output_root)),
             "report_rel": str(report_html.relative_to(output_root)),
+            "clip_elapsed_sec": clip_elapsed_sec,
+            "audit_elapsed_sec": audit_elapsed_sec,
+            "total_elapsed_sec": total_elapsed_sec,
             "summary": summary,
         })
         print(f"  - 完成: {report_html}")

@@ -47,19 +47,17 @@ temp_*
 concat_list.txt
 reconstruct_video.sh
 
-# Temporary files organized into directories
-temp_frames/
-temp_logs/
-temp_outputs/
+# Runtime outputs
+runtime/cache/
+runtime/temp_outputs/
+runtime/comparison_frames/
 ai_check*
-comparison_frames/
 debug_sync/
 verify_output/
 v6_validation/
 
-# Log files (kept for history in temp_logs/)
+# Log files
 *.log
-logs/
 
 # Test data and output
 01_test_data_generation/**/output/
@@ -88,7 +86,7 @@ logs/
 *.zip
 *.tar.gz
 01_test_data_generation/source_videos/
-cache/
+runtime/cache_v*/
 cache_v*/
 *.pkl
 ai_check/

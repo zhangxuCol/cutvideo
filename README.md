@@ -14,52 +14,24 @@
 
 ```
 cutvideo/
-├── 01_test_data_generation/       # 测试数据生成
-│   ├── create_clip1_v2.sh
-│   ├── create_clip2_correct.sh
-│   ├── create_real_clip1.py
-│   ├── create_real_clip2.py
-│   ├── generate_clip2_v2.sh
-│   ├── generate_test_videos.py
-│   ├── quick_generate_clip2.sh
-│   ├── real_videos/
-│   ├── source_videos/
-│   └── test_videos/
-├── 02_video_download/             # 视频下载
-│   ├── download_video.py
-│   ├── download_with_ffmpeg.sh
-│   └── download_with_playwright.py
-├── 03_reconstruction_algorithms/  # 重构算法
-│   ├── auto_reconstruct.py
-│   ├── multi_source_reconstructor.py
-│   ├── multi_source_reconstructor_config.py
-│   ├── reconstruct_clip2_high_threshold.py
-│   ├── reconstruct_clip2_improved.py
-│   ├── reconstruct_clip2_intelligent.py
-│   ├── reconstruct_improved_algorithm.py
-│   ├── reconstruct_true_content_match.py
-│   ├── reconstruct_video.sh
-│   ├── video_reconstructor_fixed.py
-│   ├── video_reconstructor_hybrid.py
-│   ├── video_reconstructor_optimized.py
-│   └── video_reconstructor_parallel.py
-├── 04_comparison_validation/      # 比较验证
-│   ├── compare_content.py
-│   ├── compare_precise.py
-│   ├── compare_real_videos.py
-│   ├── compare_v2.py
-│   └── compare_videos.py
-├── 05_utilities/                   # 工具
-│   ├── concat_list.txt
-│   └── video_timestamp_finder.py
+├── v6_fast.py                      # 主链路：视频重构
+├── av_consistency_checker.py       # 一致性检查
+├── skills/ai-video-audit/          # AI 每 3 秒抽检与报告
+├── 01_test_data_generation/        # 测试数据与样本生成脚本
+├── 02_video_download/              # 下载脚本
+├── 03_reconstruction_algorithms/   # 研究型算法目录（非主链路）
+├── 04_comparison_validation/       # 对比验证占位目录
+├── 05_utilities/                   # 工具占位目录
 ├── 06_configurations/              # 配置文件
-│   ├── clip2_reconstructed_reconstruction_log.json
-│   ├── cut_reconstruction_config.yaml
-│   ├── video_reconstruct_config.yaml
-│   └── video_reconstruct_real_config.yaml
-├── batch_reconstructor.py          # 批量重构主程序
-├── requirements.txt                # Python依赖
-└── README.md                       # 项目说明
+├── docs/                           # 项目文档
+├── logs/                           # 历史运行日志
+├── runtime/                        # 运行时产物（缓存/输出）
+│   ├── cache/
+│   └── temp_outputs/
+├── archive/                        # 历史归档
+│   ├── deprecated_project_20260403/
+│   └── backups/
+└── memory/                         # 会话与维护记录
 ```
 
 ## 环境要求
@@ -138,6 +110,43 @@ python 03_reconstruction_algorithms/video_reconstructor_hybrid.py
 - `use_target_audio`: 是否使用目标视频的音频（默认true）
 - `min_segment_duration`: 最小片段时长（默认0.2秒）
 - `max_segment_gap`: 最大片段间隔（默认3.0秒）
+
+### 主链路统一配置（推荐）
+
+新增统一 JSON 配置文件：`06_configurations/ai_pipeline.defaults.json`
+
+- `v6_fast`：主重构链路默认参数
+- `build_ai_video_audit_bundle`：单视频证据审片默认参数
+- `batch_ai_audit_3s`：批量 3 秒审片与缺失重构默认参数
+- 全量参数备注与示例：`docs/CLI_CONFIG_REFERENCE.md`
+
+使用方式（配置文件默认 + CLI 覆盖）：
+
+```bash
+# 主链路重构 + 证据验证
+python v6_fast.py --config 06_configurations/ai_pipeline.defaults.json \
+  --target /abs/target.mp4 \
+  --source-dir /abs/source_dir \
+  --output /abs/output.mp4
+
+# 单视频证据审片
+python skills/ai-video-audit/scripts/build_ai_video_audit_bundle.py \
+  --config 06_configurations/ai_pipeline.defaults.json \
+  --target /abs/source.mp4 \
+  --candidate /abs/candidate.mp4
+
+# 批量 3 秒审片
+python skills/ai-video-audit/scripts/run_batch_ai_audit_3s.py \
+  --config 06_configurations/ai_pipeline.defaults.json \
+  --material-dir /abs/materials \
+  --candidate-dir /abs/output
+```
+
+也可通过环境变量指定配置文件：
+
+```bash
+export CUTVIDEO_CONFIG=/abs/path/ai_pipeline.local.json
+```
 
 ## 输出说明
 

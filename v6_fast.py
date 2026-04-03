@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 import argparse
 import os
+import sys
 from pathlib import Path
 import subprocess
 import tempfile
@@ -24,8 +25,29 @@ import struct
 import json
 import pickle
 import re
+from datetime import datetime
 from PIL import Image
 import imagehash
+from pipeline_config import (
+    load_section_config,
+    cfg_str,
+    cfg_int,
+    cfg_float,
+    cfg_bool,
+    cfg_str_list,
+    split_csv,
+)
+
+
+def add_bool_arg(parser: argparse.ArgumentParser, name: str, default: bool, help_text: str) -> None:
+    if hasattr(argparse, "BooleanOptionalAction"):
+        parser.add_argument(name, action=argparse.BooleanOptionalAction, default=default, help=help_text)
+        return
+    dest = name.lstrip("-").replace("-", "_")
+    parser.add_argument(name, dest=dest, action="store_true", help=help_text)
+    parser.add_argument(f"--no-{name.lstrip('-')}", dest=dest, action="store_false", help=argparse.SUPPRESS)
+    parser.set_defaults(**{dest: default})
+
 
 def extract_chromaprint(video_path: Path, start: float = 0, duration: float = None) -> list:
     """使用 Chromaprint (fpcalc) 提取音频指纹"""
@@ -417,6 +439,61 @@ class FastHighPrecisionReconstructor:
                 tf.unlink()
 
         return best_source, best_start, best_score
+
+    def refine_start_by_visual(
+        self,
+        source: Path,
+        initial_start: float,
+        target_start: float,
+        duration: float,
+        window: float = 1.2,
+        step: float = 0.2,
+    ) -> Tuple[float, float]:
+        """
+        在初始匹配点附近做细粒度视觉对齐，降低整秒步进导致的轻微时间偏移。
+        返回 (最佳起点, 对齐分数)。
+        """
+        try:
+            source_duration = self.get_video_duration(source)
+        except Exception:
+            return float(initial_start), 0.0
+
+        max_start = max(0.0, source_duration - duration)
+        left = max(0.0, float(initial_start) - window)
+        right = min(max_start, float(initial_start) + window)
+        if right < left:
+            return float(initial_start), 0.0
+
+        offsets = [0.1, duration * 0.25, duration * 0.5, duration * 0.75, max(0.1, duration - 0.1)]
+        best_start = float(initial_start)
+        best_score = -1.0
+
+        cursor = left
+        probe_idx = 0
+        while cursor <= right + 1e-6:
+            sims: List[float] = []
+            for off in offsets:
+                tgt_t = target_start + off
+                src_t = cursor + off
+                target_frame = self.temp_dir / f"rf_t_{probe_idx}_{tgt_t:.2f}.jpg"
+                source_frame = self.temp_dir / f"rf_s_{probe_idx}_{src_t:.2f}.jpg"
+                self.extract_frame(self.target_video, tgt_t, target_frame)
+                self.extract_frame(source, src_t, source_frame)
+                if target_frame.exists() and source_frame.exists():
+                    sims.append(float(self.calculate_frame_similarity(target_frame, source_frame)))
+                target_frame.unlink(missing_ok=True)
+                source_frame.unlink(missing_ok=True)
+            if sims:
+                score = float(np.mean(sims))
+                if score > best_score:
+                    best_score = score
+                    best_start = float(cursor)
+            probe_idx += 1
+            cursor += step
+
+        if best_score < 0:
+            return float(initial_start), 0.0
+        return best_start, best_score
     
     def find_best_match_by_visual(self, target_start: float, duration: float, seg_index: int = 0) -> Tuple[Path, float, float]:
         """当音频匹配失败时，遍历所有源视频进行画面匹配（更精细的搜索）"""
@@ -651,30 +728,61 @@ class FastHighPrecisionReconstructor:
         return best_start
 
     def quick_verify(self, source: Path, source_start: float, target_start: float, duration: float) -> Tuple[bool, float]:
-        """快速画面验证 - 3个时间点"""
-        
-        check_times = [0, duration * 0.5, duration]
-        similarities = []
-        
-        for offset in check_times:
-            target_frame = self.temp_dir / f"qv_t_{target_start+offset:.0f}.jpg"
-            source_frame = self.temp_dir / f"qv_s_{source_start+offset:.0f}.jpg"
-            
-            self.extract_frame(self.target_video, target_start + offset, target_frame)
-            self.extract_frame(source, source_start + offset, source_frame)
-            
+        """快速画面验证 + 时间偏移偏置检测（防“短暂快进/慢进后恢复”）。"""
+
+        def frame_sim_with_target_shift(offset: float, target_shift: float = 0.0) -> float:
+            """比较 source(t) 与 target(t + shift) 的相似度。"""
+            src_t = source_start + offset
+            tgt_t = target_start + offset + target_shift
+            target_frame = self.temp_dir / f"qv_t_{tgt_t:.2f}.jpg"
+            source_frame = self.temp_dir / f"qv_s_{src_t:.2f}.jpg"
+            self.extract_frame(self.target_video, tgt_t, target_frame)
+            self.extract_frame(source, src_t, source_frame)
             if target_frame.exists() and source_frame.exists():
                 sim = self.calculate_frame_similarity(target_frame, source_frame)
-                similarities.append(sim)
-        
-        avg_sim = np.mean(similarities) if similarities else 0
-        min_sim = np.min(similarities) if similarities else 0
-        
-        # 返回平均相似度和最小相似度（阈值可配置）
+                target_frame.unlink(missing_ok=True)
+                source_frame.unlink(missing_ok=True)
+                return float(sim)
+            return 0.0
+
+        # 原有段级核验：增加采样点，降低“边界错位漏检”概率
+        check_times = [0.0, duration * 0.25, duration * 0.5, duration * 0.75, max(0.0, duration - 0.1)]
+        similarities = [frame_sim_with_target_shift(offset, 0.0) for offset in check_times]
+
+        avg_sim = float(np.mean(similarities)) if similarities else 0.0
+        min_sim = float(np.min(similarities)) if similarities else 0.0
+
         min_avg = self.strict_verify_min_sim
         min_floor = max(0.0, min_avg - 0.08)
         passed = avg_sim >= min_avg and min_sim >= min_floor
-        return passed, avg_sim
+        if not passed:
+            return False, avg_sim
+
+        # 新增：时间偏移偏置检测
+        # 如果同一段在多个采样点都“对齐 +1/+2 秒或 -1/-2 秒更像”，说明存在系统性快进/慢进错位。
+        core_offsets = [duration * 0.2, duration * 0.5, duration * 0.8]
+        bias_votes: List[int] = []
+        for offset in core_offsets:
+            base_sim = frame_sim_with_target_shift(offset, 0.0)
+            best_shift = 0
+            best_sim = base_sim
+            for shift in (-2.0, -1.0, 1.0, 2.0):
+                shifted_sim = frame_sim_with_target_shift(offset, shift)
+                if shifted_sim > best_sim:
+                    best_sim = shifted_sim
+                    best_shift = int(shift)
+
+            # 只有“偏移显著优于对齐”才记票，避免静态画面导致误判。
+            if best_shift != 0 and (best_sim - base_sim) >= 0.10 and base_sim < 0.93:
+                bias_votes.append(best_shift)
+
+        if len(bias_votes) >= 2:
+            forward_votes = sum(1 for v in bias_votes if v > 0)
+            backward_votes = sum(1 for v in bias_votes if v < 0)
+            if forward_votes >= 2 or backward_votes >= 2:
+                return False, avg_sim
+
+        return True, avg_sim
 
     def verify_segment_visual(
         self,
@@ -769,6 +877,21 @@ class FastHighPrecisionReconstructor:
             if rematch_source and rematch_score > combined_score:
                 source, source_start, combined_score = rematch_source, rematch_start, rematch_score
                 quality["combined"] = combined_score
+
+        # 对候选段做局部起点微调，降低整秒匹配带来的 1~2 秒偏移风险
+        if source and source != self.target_video:
+            refined_start, refined_score = self.refine_start_by_visual(
+                source=source,
+                initial_start=float(source_start),
+                target_start=float(task.target_start),
+                duration=float(task.duration),
+            )
+            quality["start_refine"] = {
+                "before": float(source_start),
+                "after": float(refined_start),
+                "score": float(refined_score),
+            }
+            source_start = float(refined_start)
 
         if not source or combined_score < 0.70:
             # 兜底：使用目标视频本身对应时间段
@@ -940,6 +1063,9 @@ class FastHighPrecisionReconstructor:
         step_guard_fallback = self.enforce_temporal_step_consistency(confirmed_segments)
         if step_guard_fallback > 0:
             print(f"   🧷 步长一致性守卫: 切换 {step_guard_fallback} 个段到目标素材")
+        alignment_bias_fallback = self.enforce_target_alignment_bias(confirmed_segments)
+        if alignment_bias_fallback > 0:
+            print(f"   🎯 对齐偏置守卫: 切换 {alignment_bias_fallback} 个段到目标素材")
 
         print(f"\n✅ 可用段: {len(confirmed_segments)}/{len(tasks)} 段 (完整保留)")
         self.save_quality_report(confirmed_segments, output_path)
@@ -1200,6 +1326,92 @@ class FastHighPrecisionReconstructor:
 
         return switched
 
+    def enforce_target_alignment_bias(self, segments: List[dict]) -> int:
+        """
+        目标时间对齐偏置守卫：
+        - 检测某段是否在多个采样点都更像 target 的 +/-1~3 秒位置
+        - 若存在稳定同向偏置（例如整体领先 2 秒），直接回退目标段
+        用于拦截“局部画面提前/滞后，音频仍正常”的错位问题。
+        """
+        switched = 0
+
+        def fallback_segment(seg: dict, reason: str, metric: float):
+            nonlocal switched
+            if seg["source"] == self.target_video:
+                return
+            seg["source"] = self.target_video
+            seg["start"] = seg["target_start"]
+            q = seg.get("quality", {}) or {}
+            q["fallback"] = True
+            q["fallback_reason"] = reason
+            q["timeline_bias_metric"] = float(metric)
+            seg["quality"] = q
+            switched += 1
+
+        def frame_sim(source: Path, source_time: float, target_time: float) -> float:
+            source_frame = self.temp_dir / f"ab_s_{source_time:.2f}.jpg"
+            target_frame = self.temp_dir / f"ab_t_{target_time:.2f}.jpg"
+            self.extract_frame(source, source_time, source_frame)
+            self.extract_frame(self.target_video, target_time, target_frame)
+            if source_frame.exists() and target_frame.exists():
+                sim = self.calculate_frame_similarity(source_frame, target_frame)
+                source_frame.unlink(missing_ok=True)
+                target_frame.unlink(missing_ok=True)
+                return float(sim)
+            return 0.0
+
+        for seg in segments:
+            if seg["source"] == self.target_video:
+                continue
+
+            duration = float(seg["duration"])
+            start = float(seg["start"])
+            target_start = float(seg["target_start"])
+            if duration <= 0.5:
+                continue
+
+            raw_offsets = [duration * 0.2, duration * 0.4, duration * 0.6, duration * 0.8]
+            offsets = [max(0.1, min(duration - 0.1, o)) for o in raw_offsets]
+
+            bias_votes: List[int] = []
+            gains: List[float] = []
+            for offset in offsets:
+                src_t = start + offset
+                tgt_t = target_start + offset
+                aligned = frame_sim(seg["source"], src_t, tgt_t)
+                best_shift = 0
+                best_sim = aligned
+
+                for shift in (-3.0, -2.0, -1.0, 1.0, 2.0, 3.0):
+                    shifted_sim = frame_sim(seg["source"], src_t, tgt_t + shift)
+                    if shifted_sim > best_sim:
+                        best_sim = shifted_sim
+                        best_shift = int(shift)
+
+                if best_shift != 0:
+                    gain = best_sim - aligned
+                    if gain >= 0.08:
+                        bias_votes.append(best_shift)
+                        gains.append(gain)
+
+            if len(bias_votes) < 2:
+                continue
+
+            forward_votes = sum(1 for v in bias_votes if v > 0)
+            backward_votes = sum(1 for v in bias_votes if v < 0)
+            dominant = max(forward_votes, backward_votes)
+            avg_gain = float(np.mean(gains)) if gains else 0.0
+
+            if dominant >= 2 and avg_gain >= 0.09:
+                reason = (
+                    "timeline_target_alignment_bias_forward"
+                    if forward_votes >= backward_votes
+                    else "timeline_target_alignment_bias_backward"
+                )
+                fallback_segment(seg, reason, avg_gain)
+
+        return switched
+
     def enforce_temporal_step_consistency(self, segments: List[dict]) -> int:
         """
         同源步长一致性硬守卫：
@@ -1439,8 +1651,9 @@ class FastHighPrecisionReconstructor:
         print("⚠️  警告：必须实际查看每一帧，不能只看百分比！")
         
         # 创建检查目录
-        check_dir = Path("temp_outputs/ai_check_round" + str(getattr(self, 'round_num', 'X')))
-        check_dir.mkdir(exist_ok=True)
+        project_root = Path(__file__).resolve().parent
+        check_dir = project_root / "runtime" / "temp_outputs" / ("ai_check_round" + str(getattr(self, 'round_num', 'X')))
+        check_dir.mkdir(parents=True, exist_ok=True)
         
         # 关键时间点检查（动态采样，适配任意时长）
         output_duration = self.get_video_duration(Path(output_path))
@@ -1506,23 +1719,210 @@ class FastHighPrecisionReconstructor:
         return True
 
 
+def run_evidence_validation(
+    root: Path,
+    target_video: Path,
+    candidate_video: Path,
+    interval: float = 3.0,
+    clip_duration: float = 2.0,
+    max_points: int = 1200,
+    asr_mode: str = "auto",
+    target_sub: str = "",
+    candidate_sub: str = "",
+    asr_cmd: str = "",
+    asr_python: str = "",
+    asr_model: str = "base",
+    language: str = "zh",
+    whisper_python_candidates: Optional[List[str]] = None,
+) -> Optional[Dict]:
+    """
+    证据级一致性验证：
+    - 抽帧画面
+    - OCR 字幕
+    - ASR 音频文本（可用时）
+    """
+    script = root / "skills" / "ai-video-audit" / "scripts" / "build_ai_video_audit_bundle.py"
+    if not script.exists():
+        print(f"⚠️ 未找到证据验证脚本: {script}")
+        return None
+
+    def detect_whisper_python() -> str:
+        candidates: List[str] = []
+
+        def add_candidate(raw: Optional[str]) -> None:
+            p = (raw or "").strip()
+            if p:
+                candidates.append(p)
+
+        add_candidate(sys.executable)
+        add_candidate(shutil.which("python3"))
+        add_candidate(shutil.which("python"))
+        for item in (whisper_python_candidates or []):
+            add_candidate(item)
+
+        seen = set()
+        for p in candidates:
+            if not p or p in seen:
+                continue
+            seen.add(p)
+            pp = Path(p)
+            if not pp.exists():
+                continue
+            try:
+                probe = subprocess.run([p, "-m", "whisper", "--help"], capture_output=True, text=True)
+            except Exception:
+                continue
+            if probe.returncode == 0:
+                return p
+        return ""
+
+    if not asr_cmd and not asr_python:
+        auto_asr_python = detect_whisper_python()
+        if auto_asr_python:
+            asr_python = auto_asr_python
+            print(f"   🔎 自动探测到 Whisper Python: {asr_python}")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = root / "runtime" / "temp_outputs" / "ai_evidence_check" / f"{target_video.stem}_{ts}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable,
+        str(script),
+        "--target", str(target_video),
+        "--candidate", str(candidate_video),
+        "--interval", f"{interval:.3f}",
+        "--clip-duration", f"{max(0.2, float(clip_duration)):.3f}",
+        "--max-points", str(max(1, int(max_points))),
+        "--asr", str(asr_mode),
+        "--asr-model", str(asr_model),
+        "--language", str(language),
+        "--output-dir", str(out_dir),
+    ]
+    if target_sub:
+        cmd.extend(["--target-sub", target_sub])
+    if candidate_sub:
+        cmd.extend(["--candidate-sub", candidate_sub])
+    if asr_cmd:
+        cmd.extend(["--asr-cmd", asr_cmd])
+    if asr_python:
+        cmd.extend(["--asr-python", asr_python])
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "evidence_validation_failed").strip()
+        print(f"⚠️ 证据级验证执行失败: {err[:500]}")
+        return None
+
+    manifest_path = out_dir / "audit_manifest.json"
+    if not manifest_path.exists():
+        print(f"⚠️ 证据级验证缺少清单: {manifest_path}")
+        return None
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"⚠️ 证据清单解析失败: {exc}")
+        return {
+            "output_dir": str(out_dir),
+            "manifest_path": str(manifest_path),
+        }
+
+    return {
+        "output_dir": str(out_dir),
+        "manifest_path": str(manifest_path),
+        "report_html": manifest.get("comparison_report_html"),
+        "summary": manifest.get("summary", {}),
+        "asr_backend": manifest.get("asr_backend"),
+        "asr_error": manifest.get("asr_error"),
+    }
+
+
 def main():
     root = Path(__file__).resolve().parent
-    default_cache = root / "cache"
+    default_cache = root / "runtime" / "cache"
+
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default="", help="配置文件路径（JSON）")
+    pre_args, _ = pre_parser.parse_known_args()
+
+    try:
+        cfg, cfg_path = load_section_config(root, "v6_fast", explicit_path=pre_args.config)
+        cache_default = cfg_str(cfg, "cache", str(default_cache))
+        segment_duration_default = cfg_float(cfg, "segment_duration", 5.0)
+        workers_default = cfg_int(cfg, "workers", 0)
+        low_score_threshold_default = cfg_float(cfg, "low_score_threshold", 0.82)
+        rematch_window_default = cfg_int(cfg, "rematch_window", 2)
+        rematch_max_window_default = cfg_int(cfg, "rematch_max_window", 12)
+        continuity_weight_default = cfg_float(cfg, "continuity_weight", 0.05)
+        strict_visual_verify_default = cfg_bool(cfg, "strict_visual_verify", True)
+        strict_verify_min_sim_default = cfg_float(cfg, "strict_verify_min_sim", 0.78)
+        tail_guard_seconds_default = cfg_float(cfg, "tail_guard_seconds", 20.0)
+        tail_verify_min_avg_default = cfg_float(cfg, "tail_verify_min_avg", 0.84)
+        tail_verify_min_floor_default = cfg_float(cfg, "tail_verify_min_floor", 0.78)
+        adjacent_overlap_trigger_default = cfg_float(cfg, "adjacent_overlap_trigger", 0.6)
+        adjacent_lag_trigger_default = cfg_float(cfg, "adjacent_lag_trigger", 0.8)
+        isolated_drift_trigger_default = cfg_float(cfg, "isolated_drift_trigger", 0.8)
+        use_audio_matching_default = cfg_bool(cfg, "use_audio_matching", False)
+        force_target_audio_default = cfg_bool(cfg, "force_target_audio", False)
+        verify_interval_default = cfg_float(cfg, "verify_interval", 3.0)
+        verify_clip_duration_default = cfg_float(cfg, "verify_clip_duration", 2.0)
+        verify_max_points_default = cfg_int(cfg, "verify_max_points", 1200)
+        verify_asr_mode_default = cfg_str(cfg, "verify_asr_mode", "auto")
+        verify_target_sub_default = cfg_str(cfg, "verify_target_sub", "")
+        verify_output_sub_default = cfg_str(cfg, "verify_output_sub", "")
+        verify_asr_cmd_default = cfg_str(cfg, "verify_asr_cmd", "")
+        verify_asr_python_default = cfg_str(cfg, "verify_asr_python", "")
+        verify_asr_model_default = cfg_str(cfg, "verify_asr_model", "base")
+        verify_language_default = cfg_str(cfg, "verify_language", "zh")
+        verify_whisper_candidates_default = cfg_str_list(cfg, "verify_whisper_python_candidates", [])
+        allow_numeric_fallback_default = cfg_bool(cfg, "allow_numeric_fallback", False)
+    except RuntimeError as exc:
+        print(f"❌ {exc}")
+        return
 
     parser = argparse.ArgumentParser(description="通用极速高精度重构器 V3 + pHash")
+    parser.add_argument("--config", default=str(cfg_path) if cfg_path else "", help="配置文件路径（JSON）")
     parser.add_argument("--target", required=True, help="目标视频路径")
     parser.add_argument("--source-dir", required=True, help="源视频目录")
     parser.add_argument("--output", help="输出视频路径")
-    parser.add_argument("--cache", default=str(default_cache), help="缓存目录")
-    parser.add_argument("--segment-duration", type=float, default=5.0, help="分段时长（秒）")
-    parser.add_argument("--workers", type=int, default=0, help="并行线程数（0=自动）")
-    parser.add_argument("--low-score-threshold", type=float, default=0.82, help="低分段重匹配阈值")
-    parser.add_argument("--rematch-window", type=int, default=2, help="局部重匹配起始窗口（秒）")
-    parser.add_argument("--rematch-max-window", type=int, default=12, help="局部重匹配最大窗口（秒）")
-    parser.add_argument("--continuity-weight", type=float, default=0.05, help="连续性奖励权重（0~0.2）")
-    parser.add_argument("--use-audio-matching", action="store_true", help="启用音频指纹参与匹配（默认关闭）")
-    parser.add_argument("--force-target-audio", action="store_true", help="最终封装强制使用目标音轨（默认关闭）")
+    parser.add_argument("--cache", default=cache_default, help="缓存目录")
+    parser.add_argument("--segment-duration", type=float, default=segment_duration_default, help="分段时长（秒）")
+    parser.add_argument("--workers", type=int, default=workers_default, help="并行线程数（0=自动）")
+    parser.add_argument("--low-score-threshold", type=float, default=low_score_threshold_default, help="低分段重匹配阈值")
+    parser.add_argument("--rematch-window", type=int, default=rematch_window_default, help="局部重匹配起始窗口（秒）")
+    parser.add_argument("--rematch-max-window", type=int, default=rematch_max_window_default, help="局部重匹配最大窗口（秒）")
+    parser.add_argument("--continuity-weight", type=float, default=continuity_weight_default, help="连续性奖励权重（0~0.2）")
+    add_bool_arg(parser, "--strict-visual-verify", strict_visual_verify_default, "启用严格画面核验")
+    parser.add_argument("--strict-verify-min-sim", type=float, default=strict_verify_min_sim_default, help="严格画面核验最低相似度阈值")
+    parser.add_argument("--tail-guard-seconds", type=float, default=tail_guard_seconds_default, help="尾段守卫时长（秒）")
+    parser.add_argument("--tail-verify-min-avg", type=float, default=tail_verify_min_avg_default, help="尾段守卫平均相似度阈值")
+    parser.add_argument("--tail-verify-min-floor", type=float, default=tail_verify_min_floor_default, help="尾段守卫最低点相似度阈值")
+    parser.add_argument("--adjacent-overlap-trigger", type=float, default=adjacent_overlap_trigger_default, help="相邻段重叠触发阈值（秒）")
+    parser.add_argument("--adjacent-lag-trigger", type=float, default=adjacent_lag_trigger_default, help="相邻段慢进触发阈值（秒）")
+    parser.add_argument("--isolated-drift-trigger", type=float, default=isolated_drift_trigger_default, help="孤立段时间漂移触发阈值（秒）")
+    add_bool_arg(parser, "--use-audio-matching", use_audio_matching_default, "启用音频指纹参与匹配")
+    add_bool_arg(parser, "--force-target-audio", force_target_audio_default, "最终封装强制使用目标音轨")
+    parser.add_argument("--verify-interval", type=float, default=verify_interval_default, help="证据级验证间隔（秒）")
+    parser.add_argument("--verify-clip-duration", type=float, default=verify_clip_duration_default, help="证据级验证音频切片时长（秒）")
+    parser.add_argument("--verify-max-points", type=int, default=verify_max_points_default, help="证据级验证最大检查点数量")
+    parser.add_argument(
+        "--verify-asr-mode",
+        choices=["auto", "none", "faster_whisper", "whisper"],
+        default=verify_asr_mode_default,
+        help="证据级验证 ASR 模式",
+    )
+    parser.add_argument("--verify-target-sub", default=verify_target_sub_default, help="证据级验证：目标字幕文件（可选）")
+    parser.add_argument("--verify-output-sub", default=verify_output_sub_default, help="证据级验证：输出字幕文件（可选）")
+    parser.add_argument("--verify-asr-cmd", default=verify_asr_cmd_default, help="证据级验证：whisper 命令（可选）")
+    parser.add_argument("--verify-asr-python", default=verify_asr_python_default, help="证据级验证：whisper 所在 python（可选）")
+    parser.add_argument("--verify-asr-model", default=verify_asr_model_default, help="证据级验证：ASR 模型")
+    parser.add_argument("--verify-language", default=verify_language_default, help="证据级验证：ASR 语种")
+    parser.add_argument(
+        "--verify-whisper-candidates",
+        default=",".join(verify_whisper_candidates_default),
+        help="证据级验证：Whisper Python 候选列表（逗号分隔）",
+    )
+    add_bool_arg(parser, "--allow-numeric-fallback", allow_numeric_fallback_default, "证据级验证失败时是否允许回退到数值一致性检查")
     args = parser.parse_args()
 
     target = Path(args.target)
@@ -1530,7 +1930,7 @@ def main():
     if args.output:
         output = Path(args.output)
     else:
-        output = root / "temp_outputs" / f"{target.stem}_reconstructed_v3.mp4"
+        output = root / "runtime" / "temp_outputs" / f"{target.stem}_reconstructed_v3.mp4"
     cache = Path(args.cache)
 
     if not target.exists():
@@ -1544,14 +1944,16 @@ def main():
     if not source_videos:
         print(f"❌ 源视频目录中未找到 mp4: {source_dir}")
         return
-    
+
     print("="*70)
     print("通用极速高精度重构 V3")
     print("="*70)
-    
-    cache.mkdir(exist_ok=True)
+    if args.config:
+        print(f"🧩 配置文件: {args.config}")
+
+    cache.mkdir(parents=True, exist_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
-    
+
     reconstructor = FastHighPrecisionReconstructor(str(target), source_videos, str(cache))
     reconstructor.segment_duration = max(1.0, args.segment_duration)
     if args.workers and args.workers > 0:
@@ -1560,23 +1962,69 @@ def main():
     reconstructor.rematch_window = max(1, args.rematch_window)
     reconstructor.rematch_max_window = max(reconstructor.rematch_window, args.rematch_max_window)
     reconstructor.continuity_weight = min(0.2, max(0.0, args.continuity_weight))
+    reconstructor.strict_visual_verify = bool(args.strict_visual_verify)
+    reconstructor.strict_verify_min_sim = min(1.0, max(0.0, args.strict_verify_min_sim))
+    reconstructor.tail_guard_seconds = max(0.0, float(args.tail_guard_seconds))
+    reconstructor.tail_verify_min_avg = min(1.0, max(0.0, float(args.tail_verify_min_avg)))
+    reconstructor.tail_verify_min_floor = min(1.0, max(0.0, float(args.tail_verify_min_floor)))
+    reconstructor.adjacent_overlap_trigger = max(0.0, float(args.adjacent_overlap_trigger))
+    reconstructor.adjacent_lag_trigger = max(0.0, float(args.adjacent_lag_trigger))
+    reconstructor.isolated_drift_trigger = max(0.0, float(args.isolated_drift_trigger))
     reconstructor.use_audio_matching = bool(args.use_audio_matching)
     reconstructor.force_target_audio = bool(args.force_target_audio)
-    
+    verify_whisper_candidates = split_csv(args.verify_whisper_candidates)
+
     try:
         success = reconstructor.reconstruct_fast(str(output))
-        
+
         if success:
             print("\n🎉 极速重构完成!")
-            
-            # 立即验证
-            print("\n正在进行一致性验证...")
-            from av_consistency_checker import AVConsistencyChecker
-            checker = AVConsistencyChecker(str(target), str(output))
-            results = checker.check_consistency(interval=5.0)
-            
-            if results['statistics']['poor'] == 0:
-                print("\n✅✅✅ 100%通过一致性检查！✅✅✅")
+
+            # 立即做证据级验证（抽帧 + OCR + ASR）
+            print("\n正在进行证据级一致性验证（抽帧+OCR+ASR）...")
+            evidence = run_evidence_validation(
+                root=root,
+                target_video=target,
+                candidate_video=output,
+                interval=max(0.5, float(args.verify_interval)),
+                clip_duration=max(0.2, float(args.verify_clip_duration)),
+                max_points=max(1, int(args.verify_max_points)),
+                asr_mode=args.verify_asr_mode,
+                target_sub=args.verify_target_sub,
+                candidate_sub=args.verify_output_sub,
+                asr_cmd=args.verify_asr_cmd,
+                asr_python=args.verify_asr_python,
+                asr_model=args.verify_asr_model,
+                language=args.verify_language,
+                whisper_python_candidates=verify_whisper_candidates,
+            )
+            if evidence:
+                summary = evidence.get("summary", {}) or {}
+                print("\n✅ 证据级验证完成")
+                print(f"   证据目录: {evidence.get('output_dir')}")
+                print(f"   清单文件: {evidence.get('manifest_path')}")
+                if evidence.get("report_html"):
+                    print(f"   详细报告: {evidence.get('report_html')}")
+                print(f"   asr_backend: {evidence.get('asr_backend')}")
+                if evidence.get("asr_error"):
+                    print(f"   asr_note: {evidence.get('asr_error')}")
+                if summary:
+                    print(
+                        f"   汇总: 检查点 {summary.get('total_points')}, "
+                        f"总体 {summary.get('overall_verdict')}, "
+                        f"不一致点 {summary.get('mismatch_points')}"
+                    )
+            else:
+                if args.allow_numeric_fallback:
+                    print("\n⚠️ 证据级验证失败，按参数回退到数值一致性检查...")
+                    from av_consistency_checker import AVConsistencyChecker
+                    checker = AVConsistencyChecker(str(target), str(output))
+                    results = checker.check_consistency(interval=5.0)
+                    if results['statistics']['poor'] == 0:
+                        print("\n✅✅✅ 100%通过一致性检查！✅✅✅")
+                else:
+                    print("\n⚠️ 证据级验证失败，已禁用数值回退。")
+                    print("   若需临时启用旧逻辑，可增加参数: --allow-numeric-fallback")
         else:
             print("\n❌ 重构失败")
     finally:

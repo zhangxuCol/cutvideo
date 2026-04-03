@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -17,6 +18,17 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from pipeline_config import (
+    load_section_config,
+    cfg_str,
+    cfg_int,
+    cfg_float,
+)
 
 
 @dataclass
@@ -541,6 +553,16 @@ def verdict_from_score(score: Optional[float]) -> str:
     return "明显不一致"
 
 
+def modality_flag(score: Optional[float], ok_threshold: float = 0.75, mismatch_threshold: float = 0.55) -> str:
+    if score is None:
+        return "unknown"
+    if score < mismatch_threshold:
+        return "mismatch"
+    if score >= ok_threshold:
+        return "ok"
+    return "warning"
+
+
 def score_to_pct(score: Optional[float]) -> str:
     if score is None:
         return "N/A"
@@ -696,25 +718,47 @@ def build_checkpoints(duration: float, interval: float, max_points: int) -> List
 
 
 def main() -> int:
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default="", help="配置文件路径（JSON）")
+    pre_args, _ = pre_parser.parse_known_args()
+
+    try:
+        cfg, cfg_path = load_section_config(REPO_ROOT, "build_ai_video_audit_bundle", explicit_path=pre_args.config)
+        interval_default = cfg_float(cfg, "interval", 8.0)
+        clip_duration_default = cfg_float(cfg, "clip_duration", 6.0)
+        max_points_default = cfg_int(cfg, "max_points", 40)
+        ocr_lang_default = cfg_str(cfg, "ocr_lang", "chi_sim+eng")
+        language_default = cfg_str(cfg, "language", "zh")
+        asr_model_default = cfg_str(cfg, "asr_model", "small")
+        asr_default = cfg_str(cfg, "asr", "auto")
+        asr_cmd_default = cfg_str(cfg, "asr_cmd", "")
+        asr_python_default = cfg_str(cfg, "asr_python", "")
+        output_dir_default = cfg_str(cfg, "output_dir", "")
+    except RuntimeError as exc:
+        print(f"❌ {exc}")
+        return 2
+
     parser = argparse.ArgumentParser(description="构建 AI 视频审片证据包")
+    parser.add_argument("--config", default=str(cfg_path) if cfg_path else "", help="配置文件路径（JSON）")
     parser.add_argument("--target", required=True, help="基准视频")
     parser.add_argument("--candidate", required=True, help="候选视频")
     parser.add_argument("--target-sub", help="基准字幕文件（可选）")
     parser.add_argument("--candidate-sub", help="候选字幕文件（可选）")
 
-    parser.add_argument("--interval", type=float, default=8.0, help="抽检间隔（秒）")
-    parser.add_argument("--clip-duration", type=float, default=6.0, help="每个检查点音频切片长度（秒）")
-    parser.add_argument("--max-points", type=int, default=40, help="最大检查点数量")
+    parser.add_argument("--interval", type=float, default=interval_default, help="抽检间隔（秒）")
+    parser.add_argument("--clip-duration", type=float, default=clip_duration_default, help="每个检查点音频切片长度（秒）")
+    parser.add_argument("--max-points", type=int, default=max_points_default, help="最大检查点数量")
 
-    parser.add_argument("--ocr-lang", default="chi_sim+eng", help="Tesseract 语言")
-    parser.add_argument("--language", default="zh", help="ASR 语种")
-    parser.add_argument("--asr-model", default="small", help="ASR 模型名")
-    parser.add_argument("--asr", choices=["auto", "none", "faster_whisper", "whisper"], default="auto")
-    parser.add_argument("--asr-cmd", default="", help="指定 whisper 命令路径或命令串（跨环境）")
-    parser.add_argument("--asr-python", default="", help="指定装有 whisper 的 python 解释器路径")
+    parser.add_argument("--ocr-lang", default=ocr_lang_default, help="Tesseract 语言")
+    parser.add_argument("--language", default=language_default, help="ASR 语种")
+    parser.add_argument("--asr-model", default=asr_model_default, help="ASR 模型名")
+    parser.add_argument("--asr", choices=["auto", "none", "faster_whisper", "whisper"], default=asr_default)
+    parser.add_argument("--asr-cmd", default=asr_cmd_default, help="指定 whisper 命令路径或命令串（跨环境）")
+    parser.add_argument("--asr-python", default=asr_python_default, help="指定装有 whisper 的 python 解释器路径")
 
-    parser.add_argument("--output-dir", default="", help="输出目录，默认 temp_outputs/ai_video_audit/<timestamp>")
+    parser.add_argument("--output-dir", default=output_dir_default, help="输出目录，默认 runtime/temp_outputs/ai_video_audit/<timestamp>")
     args = parser.parse_args()
+    repo_root = REPO_ROOT
 
     ensure_bin("ffmpeg")
     ensure_bin("ffprobe")
@@ -731,7 +775,7 @@ def main() -> int:
         out_dir = Path(args.output_dir).resolve()
     else:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = (Path("temp_outputs") / "ai_video_audit" / ts).resolve()
+        out_dir = (repo_root / "runtime" / "temp_outputs" / "ai_video_audit" / ts).resolve()
 
     frames_dir = out_dir / "frames"
     audio_dir = out_dir / "audio"
@@ -757,6 +801,8 @@ def main() -> int:
     print(f"duration(min): {duration:.2f}s")
     print(f"checkpoints: {len(checkpoints)}")
     print(f"asr_backend: {backend}")
+    if args.config:
+        print(f"config: {args.config}")
     if asr_error:
         print(f"asr_note: {asr_error}")
 
@@ -807,9 +853,13 @@ def main() -> int:
 
         subtitle_target_file = cue_text_at(target_cues, t)
         subtitle_candidate_file = cue_text_at(candidate_cues, t)
-        subtitle_source = "subtitle_file" if (subtitle_target_file or subtitle_candidate_file) else "ocr"
-        subtitle_target_used = subtitle_target_file if subtitle_source == "subtitle_file" else ocr_t
-        subtitle_candidate_used = subtitle_candidate_file if subtitle_source == "subtitle_file" else ocr_c
+        # 只有两边都命中字幕文件时才使用字幕文件对比，避免“一边字幕文件一边OCR”导致误判。
+        has_target_sub_file = bool((subtitle_target_file or "").strip())
+        has_candidate_sub_file = bool((subtitle_candidate_file or "").strip())
+        use_subtitle_file_pair = has_target_sub_file and has_candidate_sub_file
+        subtitle_source = "subtitle_file_pair" if use_subtitle_file_pair else "ocr"
+        subtitle_target_used = subtitle_target_file if use_subtitle_file_pair else ocr_t
+        subtitle_candidate_used = subtitle_candidate_file if use_subtitle_file_pair else ocr_c
 
         visual_similarity = calculate_frame_similarity(tf, cf)
         subtitle_similarity = text_similarity(subtitle_target_used, subtitle_candidate_used)
@@ -825,7 +875,13 @@ def main() -> int:
                 (audio_similarity, 0.25),
             ]
         )
-        verdict = verdict_from_score(overall_similarity)
+        visual_flag = modality_flag(visual_similarity)
+        subtitle_flag = modality_flag(subtitle_similarity)
+        audio_flag = modality_flag(audio_similarity)
+        if "mismatch" in [visual_flag, subtitle_flag, audio_flag]:
+            verdict = "明显不一致"
+        else:
+            verdict = verdict_from_score(overall_similarity)
 
         report_points.append({
             "index": i,
@@ -848,6 +904,9 @@ def main() -> int:
             "subtitle_similarity": subtitle_similarity,
             "audio_similarity": audio_similarity,
             "overall_similarity": overall_similarity,
+            "visual_flag": visual_flag,
+            "subtitle_flag": subtitle_flag,
+            "audio_flag": audio_flag,
             "verdict": verdict,
         })
 
@@ -862,8 +921,8 @@ def main() -> int:
     avg_audio = avg_score("audio_similarity")
     avg_overall = avg_score("overall_similarity")
 
-    high_match_points = sum(1 for p in report_points if (p.get("overall_similarity") or 0.0) >= 0.90)
-    mismatch_points = sum(1 for p in report_points if (p.get("overall_similarity") or 0.0) < 0.55)
+    high_match_points = sum(1 for p in report_points if p.get("verdict") == "高度一致")
+    mismatch_points = sum(1 for p in report_points if p.get("verdict") == "明显不一致")
     lowest_points = sorted(report_points, key=lambda x: x.get("overall_similarity") if x.get("overall_similarity") is not None else 9.0)[:10]
     overall_verdict = verdict_from_score(avg_overall)
 
