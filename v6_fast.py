@@ -186,6 +186,27 @@ class FastHighPrecisionReconstructor:
         result = subprocess.run(cmd, capture_output=True, text=True)
         return float(result.stdout.strip())
 
+    def get_audio_duration(self, video_path: Path) -> float:
+        """读取首条音轨时长；无音轨或解析失败时返回 0。"""
+        cmd = [
+            'ffprobe', '-v', 'error', '-select_streams', 'a:0',
+            '-show_entries', 'stream=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            str(video_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        value = (result.stdout or "").strip().splitlines()
+        if not value:
+            return 0.0
+        raw = value[0].strip()
+        if not raw or raw.upper() == "N/A":
+            return 0.0
+        try:
+            dur = float(raw)
+            return max(0.0, dur)
+        except Exception:
+            return 0.0
+
     def get_video_fps(self, video_path: Path) -> float:
         """读取视频平均帧率，失败时回退 24fps。"""
         cmd = [
@@ -1275,6 +1296,33 @@ class FastHighPrecisionReconstructor:
             fast_forward_gap = source_delta > target_delta + gap_allowance
             lagging_step = (target_delta - source_delta) > max(self.adjacent_lag_trigger, float(curr["duration"]) * 0.12)
 
+            # 轻度边界重叠定点矫正：
+            # 命中“刚好贴阈值”的回放风险时，优先将当前段起点吸附到前段末尾，
+            # 避免 0.5~1s 的局部重复/倒放观感，同时不触发大范围兜底。
+            overlap_floor = max(self.adjacent_overlap_trigger * 0.95, float(curr["duration"]) * 0.12)
+            eps = 1e-6
+            mild_overlap_nudge = (
+                overlap > 0.0
+                and overlap + eps >= overlap_floor
+                and overlap <= max(1.2, float(curr["duration"]) * 0.30)
+                and not backjump
+                and not fast_forward_gap
+                and not lagging_step
+            )
+            if mild_overlap_nudge:
+                adjusted_start = prev_end
+                step_tolerance = max(0.9, float(curr["duration"]) * 0.30)
+                adjusted_source_delta = float(adjusted_start) - float(prev["start"])
+                if abs(adjusted_source_delta - target_delta) <= step_tolerance:
+                    curr["start"] = float(adjusted_start)
+                    q = curr.get("quality", {}) or {}
+                    q["timeline_guard_overlap_nudged"] = True
+                    q["timeline_guard_overlap_before"] = float(overlap)
+                    q["timeline_guard_source_delta_before"] = float(source_delta)
+                    curr["quality"] = q
+                    adjusted += 1
+                    continue
+
             if not (severe_overlap or backjump or fast_forward_gap or lagging_step):
                 continue
 
@@ -1794,6 +1842,9 @@ class FastHighPrecisionReconstructor:
         trim_elapsed = 0.0
         mux_elapsed = 0.0
         boundary_glitch_fixed_frames = 0
+        stitched_audio_duration = 0.0
+        final_audio_duration = 0.0
+        auto_target_audio_fallback = False
         self.last_render_metrics = {
             "status": "running",
             "segments_total": len(segments),
@@ -1803,6 +1854,9 @@ class FastHighPrecisionReconstructor:
             "trim_elapsed_sec": 0.0,
             "mux_elapsed_sec": 0.0,
             "boundary_glitch_fixed_frames": 0,
+            "stitched_audio_duration": 0.0,
+            "final_audio_duration": 0.0,
+            "auto_target_audio_fallback": False,
             "render_total_sec": 0.0,
         }
         
@@ -1887,13 +1941,14 @@ class FastHighPrecisionReconstructor:
             str(temp_output)
         ]
         concat_perf = time.perf_counter()
-        subprocess.run(cmd, capture_output=True)
+        concat_proc = subprocess.run(cmd, capture_output=True, text=True)
         concat_elapsed = time.perf_counter() - concat_perf
 
-        if not temp_output.exists():
+        if concat_proc.returncode != 0 or not temp_output.exists():
             self.last_render_metrics = {
                 "status": "failed",
                 "error": "concat_failed",
+                "error_detail": (concat_proc.stderr or "").strip()[:240],
                 "segments_total": len(segments),
                 "render_fallback_segments": render_fallbacks,
                 "clip_extract_total_sec": round(float(clip_extract_total), 3),
@@ -1901,6 +1956,9 @@ class FastHighPrecisionReconstructor:
                 "trim_elapsed_sec": round(float(trim_elapsed), 3),
                 "mux_elapsed_sec": round(float(mux_elapsed), 3),
                 "boundary_glitch_fixed_frames": int(boundary_glitch_fixed_frames),
+                "stitched_audio_duration": round(float(stitched_audio_duration), 3),
+                "final_audio_duration": round(float(final_audio_duration), 3),
+                "auto_target_audio_fallback": bool(auto_target_audio_fallback),
                 "render_total_sec": round(float(time.perf_counter() - render_perf), 3),
             }
             print("❌ AV 拼接失败")
@@ -1934,8 +1992,22 @@ class FastHighPrecisionReconstructor:
             temp_output = repaired_output
             print(f"   🩹 边界单帧突刺修复: {boundary_glitch_fixed_frames} 帧")
 
-        if self.force_target_audio:
-            # 可选：使用目标音轨进行最终封装
+        stitched_audio_duration = self.get_audio_duration(temp_output)
+        min_audio_required = max(5.0, float(target_duration) * 0.90)
+        auto_target_audio_fallback = (
+            stitched_audio_duration <= 0.0
+            or (stitched_audio_duration + 0.5) < min_audio_required
+        )
+        if auto_target_audio_fallback and not self.force_target_audio:
+            print(
+                f"   ⚠️ 拼接音轨偏短: {stitched_audio_duration:.2f}s/{target_duration:.2f}s，"
+                "自动切换目标音轨封装"
+            )
+
+        use_target_audio_mux = bool(self.force_target_audio or auto_target_audio_fallback)
+
+        if use_target_audio_mux:
+            # 使用目标音轨进行最终封装（显式启用或音轨偏短自动兜底）
             muxed_output = self.temp_dir / "temp_output_target_audio.mp4"
             cmd = [
                 'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
@@ -1955,12 +2027,33 @@ class FastHighPrecisionReconstructor:
 
             if muxed_output.exists():
                 shutil.copy(muxed_output, output_path)
+                final_audio_duration = self.get_audio_duration(muxed_output)
                 print("   🔊 已使用目标音轨封装")
             else:
+                if auto_target_audio_fallback:
+                    self.last_render_metrics = {
+                        "status": "failed",
+                        "error": "target_audio_mux_failed_after_short_audio",
+                        "segments_total": len(segments),
+                        "render_fallback_segments": render_fallbacks,
+                        "clip_extract_total_sec": round(float(clip_extract_total), 3),
+                        "concat_elapsed_sec": round(float(concat_elapsed), 3),
+                        "trim_elapsed_sec": round(float(trim_elapsed), 3),
+                        "mux_elapsed_sec": round(float(mux_elapsed), 3),
+                        "boundary_glitch_fixed_frames": int(boundary_glitch_fixed_frames),
+                        "stitched_audio_duration": round(float(stitched_audio_duration), 3),
+                        "final_audio_duration": round(float(final_audio_duration), 3),
+                        "auto_target_audio_fallback": bool(auto_target_audio_fallback),
+                        "render_total_sec": round(float(time.perf_counter() - render_perf), 3),
+                    }
+                    print("❌ 目标音轨封装失败，且拼接音轨明显偏短，终止输出")
+                    return False
                 shutil.copy(temp_output, output_path)
+                final_audio_duration = stitched_audio_duration
                 print("   ⚠️ 目标音轨封装失败，回退为原拼接音轨")
         else:
             shutil.copy(temp_output, output_path)
+            final_audio_duration = stitched_audio_duration
             print("   🔊 保留拼接片段原音轨（未使用目标音轨封装）")
 
         if Path(output_path).exists():
@@ -1975,6 +2068,9 @@ class FastHighPrecisionReconstructor:
                 "trim_elapsed_sec": round(float(trim_elapsed), 3),
                 "mux_elapsed_sec": round(float(mux_elapsed), 3),
                 "boundary_glitch_fixed_frames": int(boundary_glitch_fixed_frames),
+                "stitched_audio_duration": round(float(stitched_audio_duration), 3),
+                "final_audio_duration": round(float(final_audio_duration), 3),
+                "auto_target_audio_fallback": bool(auto_target_audio_fallback),
                 "render_total_sec": round(float(time.perf_counter() - render_perf), 3),
                 "final_duration": round(float(final_duration), 3),
             }
@@ -1992,6 +2088,9 @@ class FastHighPrecisionReconstructor:
             "trim_elapsed_sec": round(float(trim_elapsed), 3),
             "mux_elapsed_sec": round(float(mux_elapsed), 3),
             "boundary_glitch_fixed_frames": int(boundary_glitch_fixed_frames),
+            "stitched_audio_duration": round(float(stitched_audio_duration), 3),
+            "final_audio_duration": round(float(final_audio_duration), 3),
+            "auto_target_audio_fallback": bool(auto_target_audio_fallback),
             "render_total_sec": round(float(time.perf_counter() - render_perf), 3),
         }
         return False
