@@ -147,7 +147,7 @@ class BatchVideoReconstructorV3:
         self.debug = debug
         
         # 加载配置
-        config_path = '/Users/zhangxu/work/项目/cutvideo/06_configurations/cut_reconstruction_config.yaml'
+        config_path = '/Users/zhangxu/work/项目/cutvideo/configurations/cut_reconstruction_config.yaml'
         self.config = load_config(config_path)
         
         # 获取源视频

@@ -47,6 +47,14 @@ temp_*
 concat_list.txt
 reconstruct_video.sh
 
+# Local session identity/context files (keep local only)
+AGENTS.md
+SOUL.md
+USER.md
+TOOLS.md
+HEARTBEAT.md
+IDENTITY.md
+
 # Runtime outputs
 runtime/cache/
 runtime/temp_outputs/

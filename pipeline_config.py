@@ -20,8 +20,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 DEFAULT_CONFIG_RELATIVE_PATHS = (
-    "06_configurations/ai_pipeline.defaults.json",
-    "06_configurations/ai_pipeline.local.json",
+    "configurations/ai_pipeline.defaults.json",
+    "configurations/ai_pipeline.local.json",
 )
 
 

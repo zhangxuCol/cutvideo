@@ -13,7 +13,7 @@ import subprocess
 
 ROOT_DIR = Path(__file__).resolve().parent
 ALGORITHMS_DIR = ROOT_DIR / "03_reconstruction_algorithms"
-DEFAULT_CONFIG_PATH = ROOT_DIR / "06_configurations" / "cut_reconstruction_config.yaml"
+DEFAULT_CONFIG_PATH = ROOT_DIR / "configurations" / "cut_reconstruction_config.yaml"
 DEFAULT_CUT_VIDEOS_DIR = ROOT_DIR / "01_test_data_generation" / "source_videos" / "南城以北" / "adx原"
 DEFAULT_SOURCE_VIDEOS_DIR = ROOT_DIR / "01_test_data_generation" / "source_videos" / "南城以北" / "剧集"
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "01_test_data_generation" / "source_videos" / "南城以北" / "output"

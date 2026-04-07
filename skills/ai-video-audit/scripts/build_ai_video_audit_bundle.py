@@ -11,6 +11,7 @@ import re
 import shlex
 import subprocess
 import sys
+import wave
 from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
+import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
@@ -28,6 +30,7 @@ from pipeline_config import (
     cfg_str,
     cfg_int,
     cfg_float,
+    cfg_str_list,
 )
 
 
@@ -102,6 +105,16 @@ def normalize_text(text: str) -> str:
     text = text.replace("\\N", " ").replace("\\n", " ")
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def normalize_ocr_text(text: str) -> str:
+    t = normalize_text(text)
+    # 常见片名水印（如《南城以北》）会导致 OCR 误报，先做轻量剔除。
+    t = re.sub(r"《[^》]{2,10}》", " ", t)
+    t = re.sub(r"\[[^\]]{2,10}\]", " ", t)
+    t = re.sub(r"\([^)]{2,10}\)", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 
 def parse_srt(path: Path) -> List[Cue]:
@@ -265,7 +278,10 @@ def ocr_bottom_subtitle(frame_path: Path, ocr_lang: str) -> str:
     if img is None:
         return ""
     h, w = img.shape[:2]
-    crop = img[int(h * 0.62):h, 0:w]
+    # 避免左右角标/水印污染字幕抽取，保留中间字幕主区域。
+    x1 = int(w * 0.08)
+    x2 = int(w * 0.92)
+    crop = img[int(h * 0.62):h, x1:x2]
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -282,7 +298,7 @@ def ocr_bottom_subtitle(frame_path: Path, ocr_lang: str) -> str:
     tmp.unlink(missing_ok=True)
     if result.returncode != 0:
         return ""
-    return normalize_text(result.stdout or "")
+    return normalize_ocr_text(result.stdout or "")
 
 
 def detect_asr_backend() -> str:
@@ -307,12 +323,29 @@ def detect_whisper_cli_cmd() -> Optional[List[str]]:
     return None
 
 
+def detect_whisper_python_cmd(candidates: List[str]) -> Optional[List[str]]:
+    checked: List[str] = []
+    for c in candidates:
+        c = (c or "").strip()
+        if not c or c in checked:
+            continue
+        checked.append(c)
+        if validate_cmd_help([c, "-m", "whisper"]):
+            return [c, "-m", "whisper"]
+    return None
+
+
 def validate_cmd_help(cmd: List[str]) -> bool:
     result = run_cmd(cmd + ["--help"])
     return result.returncode == 0
 
 
-def select_asr_backend(asr_mode: str, asr_cmd: str, asr_python: str) -> Tuple[str, Optional[List[str]], Optional[str]]:
+def select_asr_backend(
+    asr_mode: str,
+    asr_cmd: str,
+    asr_python: str,
+    asr_python_candidates: List[str],
+) -> Tuple[str, Optional[List[str]], Optional[str]]:
     """
     返回 (backend, cmd_base, error)
     backend:
@@ -340,6 +373,11 @@ def select_asr_backend(asr_mode: str, asr_cmd: str, asr_python: str) -> Tuple[st
         cli = detect_whisper_cli_cmd()
         if cli and validate_cmd_help(cli):
             return "whisper_cli", cli, None
+
+        py_cli = detect_whisper_python_cmd(asr_python_candidates)
+        if py_cli:
+            return "whisper_py_cli", py_cli, None
+
         module_backend = detect_asr_backend()
         if module_backend in {"faster_whisper", "whisper"}:
             return module_backend, None, None
@@ -349,6 +387,10 @@ def select_asr_backend(asr_mode: str, asr_cmd: str, asr_python: str) -> Tuple[st
         module_backend = detect_asr_backend()
         if module_backend == asr_mode:
             return module_backend, None, None
+        if asr_mode == "whisper":
+            py_cli = detect_whisper_python_cmd(asr_python_candidates)
+            if py_cli:
+                return "whisper_py_cli", py_cli, None
         return "none", None, f"requested_backend_unavailable:{asr_mode}"
 
     return "none", None, "unknown_asr_mode"
@@ -516,6 +558,97 @@ def text_similarity(a: str, b: str) -> Optional[float]:
     return float(SequenceMatcher(None, a, b).ratio())
 
 
+def audio_wave_similarity(audio_a: Path, audio_b: Path) -> Optional[float]:
+    """
+    基于波形的音频相似度（0~1）：
+    - 使用短时零均值标准化相关系数
+    - 在 ±0.2s 内做小范围对齐，减少编码延迟导致的误报
+    """
+    try:
+        with wave.open(str(audio_a), "rb") as wa:
+            fa = wa.getframerate()
+            da = wa.readframes(wa.getnframes())
+        with wave.open(str(audio_b), "rb") as wb:
+            fb = wb.getframerate()
+            db = wb.readframes(wb.getnframes())
+    except Exception:
+        return None
+
+    if fa <= 0 or fb <= 0:
+        return None
+    if fa != fb:
+        # 当前抽样流程统一 16k；若意外不一致，直接跳过波形证据。
+        return None
+
+    a = np.frombuffer(da, dtype=np.int16).astype(np.float32)
+    b = np.frombuffer(db, dtype=np.int16).astype(np.float32)
+    n = min(a.size, b.size)
+    if n < 512:
+        return None
+    a = a[:n]
+    b = b[:n]
+
+    std_a = float(np.std(a))
+    std_b = float(np.std(b))
+    if std_a < 8.0 and std_b < 8.0:
+        # 双静音（或近静音）按一致处理，避免 ASR 文本空洞触发误报。
+        return 1.0
+
+    a = a - float(np.mean(a))
+    b = b - float(np.mean(b))
+    std_a = float(np.std(a))
+    std_b = float(np.std(b))
+    if std_a < 1e-6 or std_b < 1e-6:
+        return None
+    a = a / std_a
+    b = b / std_b
+
+    max_lag = min(int(0.2 * fa), n // 5)
+    lag_step = max(1, int(0.025 * fa))  # 25ms
+    best = -1.0
+
+    for lag in range(-max_lag, max_lag + 1, lag_step):
+        if lag < 0:
+            aa = a[-lag:]
+            bb = b[: n + lag]
+        elif lag > 0:
+            aa = a[: n - lag]
+            bb = b[lag:]
+        else:
+            aa = a
+            bb = b
+        if aa.size < 256 or bb.size < 256:
+            continue
+        corr = float(np.dot(aa, bb) / aa.size)
+        if corr > best:
+            best = corr
+
+    if best < -0.999:
+        return None
+    return max(0.0, min(1.0, best))
+
+
+def audio_level_dbfs(audio_path: Path) -> Optional[float]:
+    """
+    计算 WAV 片段平均电平（dBFS），用于识别“有声/静音”。
+    返回值越小越安静；完全静音约为 -120dB。
+    """
+    try:
+        with wave.open(str(audio_path), "rb") as w:
+            raw = w.readframes(w.getnframes())
+    except Exception:
+        return None
+    if not raw:
+        return -120.0
+    x = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+    if x.size == 0:
+        return -120.0
+    rms = float(np.sqrt(np.mean(np.square(x))))
+    if rms <= 1e-9:
+        return -120.0
+    return float(20.0 * np.log10(rms / 32768.0))
+
+
 def valid_asr_text(text: str) -> bool:
     t = (text or "").strip()
     if not t:
@@ -582,6 +715,21 @@ def generate_html_report(
     rows = []
     for p in points:
         subtitle_source = p.get("subtitle_source_used", "ocr")
+        audio_detail_parts = []
+        if p.get("audio_similarity_wave") is not None:
+            audio_detail_parts.append(f"wave {score_to_pct(p.get('audio_similarity_wave'))}")
+        if p.get("audio_similarity_asr") is not None:
+            audio_detail_parts.append(f"asr {score_to_pct(p.get('audio_similarity_asr'))}")
+        tgt_db = p.get("audio_target_dbfs")
+        cand_db = p.get("audio_candidate_dbfs")
+        if isinstance(tgt_db, (int, float)) and isinstance(cand_db, (int, float)):
+            audio_detail_parts.append(f"db {tgt_db:.1f}/{cand_db:.1f}")
+        audio_window = p.get("audio_effective_window_sec")
+        if isinstance(audio_window, (int, float)):
+            audio_detail_parts.append(f"win {audio_window:.2f}s")
+        if p.get("tail_audio_short_window"):
+            audio_detail_parts.append("tail-guard")
+        audio_detail = " / ".join(audio_detail_parts) if audio_detail_parts else "N/A"
         rows.append(
             f"""
             <tr>
@@ -598,7 +746,7 @@ def generate_html_report(
               </td>
               <td>{score_to_pct(p.get('visual_similarity'))}</td>
               <td>{score_to_pct(p.get('subtitle_similarity'))}<br><small>{html.escape(subtitle_source)}</small></td>
-              <td>{score_to_pct(p.get('audio_similarity'))}</td>
+              <td>{score_to_pct(p.get('audio_similarity'))}<br><small>{html.escape(audio_detail)}</small></td>
               <td>{score_to_pct(p.get('overall_similarity'))}</td>
               <td>{html.escape(p.get('verdict', '未知'))}</td>
               <td>
@@ -735,6 +883,11 @@ def main() -> int:
         asr_default = cfg_str(cfg, "asr", "auto")
         asr_cmd_default = cfg_str(cfg, "asr_cmd", "")
         asr_python_default = cfg_str(cfg, "asr_python", "")
+        asr_python_candidates_default = cfg_str_list(
+            cfg,
+            "asr_python_candidates",
+            [sys.executable, "/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3", "python3"],
+        )
         output_dir_default = cfg_str(cfg, "output_dir", "")
     except RuntimeError as exc:
         print(f"❌ {exc}")
@@ -757,6 +910,11 @@ def main() -> int:
     parser.add_argument("--asr", choices=["auto", "none", "faster_whisper", "whisper"], default=asr_default)
     parser.add_argument("--asr-cmd", default=asr_cmd_default, help="指定 whisper 命令路径或命令串（跨环境）")
     parser.add_argument("--asr-python", default=asr_python_default, help="指定装有 whisper 的 python 解释器路径")
+    parser.add_argument(
+        "--asr-python-candidates",
+        default=",".join(asr_python_candidates_default),
+        help="ASR 自动探测的 Python 候选列表（逗号分隔）",
+    )
     parser.add_argument("--clip-elapsed-sec", type=float, default=0.0, help="二次裁剪耗时（秒，可由批处理注入）")
     parser.add_argument("--candidate-mode", default="existing", help="候选来源模式（existing/reconstructed）")
 
@@ -795,7 +953,13 @@ def main() -> int:
     target_cues = load_cues(Path(args.target_sub).resolve()) if args.target_sub else []
     candidate_cues = load_cues(Path(args.candidate_sub).resolve()) if args.candidate_sub else []
 
-    backend, asr_cmd_base, asr_error = select_asr_backend(args.asr, args.asr_cmd, args.asr_python)
+    asr_python_candidates = [x.strip() for x in str(args.asr_python_candidates).split(",") if x.strip()]
+    backend, asr_cmd_base, asr_error = select_asr_backend(
+        args.asr,
+        args.asr_cmd,
+        args.asr_python,
+        asr_python_candidates,
+    )
 
     print("=" * 70)
     print("AI审片证据包构建")
@@ -805,6 +969,8 @@ def main() -> int:
     print(f"duration(min): {duration:.2f}s")
     print(f"checkpoints: {len(checkpoints)}")
     print(f"asr_backend: {backend}")
+    if asr_python_candidates:
+        print(f"asr_python_candidates: {','.join(asr_python_candidates)}")
     if args.config:
         print(f"config: {args.config}")
     if asr_error:
@@ -826,19 +992,27 @@ def main() -> int:
             print(f"asr_init_error: {asr_init_error}")
 
     report_points = []
+    audio_hard_min_window_sec = max(0.8, min(float(args.clip_duration), float(args.clip_duration) * 0.3))
     for i, t in enumerate(checkpoints, start=1):
-        t_sample = min(max(0.0, t), max(0.0, duration - 0.2))
-        print(f"[{i}/{len(checkpoints)}] t={t:.3f}s sample={t_sample:.3f}s")
+        frame_sample_time = min(max(0.0, t), max(0.0, duration - 0.2))
+        # 音频采样采用“尾段左移”，保证窗口长度稳定，避免只抽到尾巴 0.x 秒造成误报。
+        audio_sample_time = min(max(0.0, t), max(0.0, duration - max(0.2, float(args.clip_duration))))
+        audio_effective_window = max(0.0, min(duration, audio_sample_time + float(args.clip_duration)) - audio_sample_time)
+        tail_audio_short_window = bool(audio_effective_window < audio_hard_min_window_sec)
+        print(
+            f"[{i}/{len(checkpoints)}] t={t:.3f}s frame={frame_sample_time:.3f}s "
+            f"audio={audio_sample_time:.3f}s audio_window={audio_effective_window:.3f}s"
+        )
 
-        tf = frames_dir / f"target_{i:03d}_{int(t_sample*1000):09d}.jpg"
-        cf = frames_dir / f"candidate_{i:03d}_{int(t_sample*1000):09d}.jpg"
-        ta = audio_dir / f"target_{i:03d}_{int(t_sample*1000):09d}.wav"
-        ca = audio_dir / f"candidate_{i:03d}_{int(t_sample*1000):09d}.wav"
+        tf = frames_dir / f"target_{i:03d}_{int(frame_sample_time*1000):09d}.jpg"
+        cf = frames_dir / f"candidate_{i:03d}_{int(frame_sample_time*1000):09d}.jpg"
+        ta = audio_dir / f"target_{i:03d}_{int(audio_sample_time*1000):09d}.wav"
+        ca = audio_dir / f"candidate_{i:03d}_{int(audio_sample_time*1000):09d}.wav"
 
-        extract_frame(target, t_sample, tf)
-        extract_frame(candidate, t_sample, cf)
-        extract_audio_clip(target, t_sample, args.clip_duration, ta)
-        extract_audio_clip(candidate, t_sample, args.clip_duration, ca)
+        extract_frame(target, frame_sample_time, tf)
+        extract_frame(candidate, frame_sample_time, cf)
+        extract_audio_clip(target, audio_sample_time, args.clip_duration, ta)
+        extract_audio_clip(candidate, audio_sample_time, args.clip_duration, ca)
 
         ocr_t = ocr_bottom_subtitle(tf, args.ocr_lang)
         ocr_c = ocr_bottom_subtitle(cf, args.ocr_lang)
@@ -849,8 +1023,8 @@ def main() -> int:
         asr_t = ""
         asr_c = ""
         if backend != "none" and not asr_init_error:
-            asr_t = cue_text_window(asr_target_cues, t_sample, t_sample + args.clip_duration)
-            asr_c = cue_text_window(asr_candidate_cues, t_sample, t_sample + args.clip_duration)
+            asr_t = cue_text_window(asr_target_cues, audio_sample_time, audio_sample_time + args.clip_duration)
+            asr_c = cue_text_window(asr_candidate_cues, audio_sample_time, audio_sample_time + args.clip_duration)
 
         (asr_dir / f"target_{i:03d}.txt").write_text(asr_t, encoding="utf-8")
         (asr_dir / f"candidate_{i:03d}.txt").write_text(asr_c, encoding="utf-8")
@@ -868,21 +1042,56 @@ def main() -> int:
         visual_similarity = calculate_frame_similarity(tf, cf)
         subtitle_similarity = text_similarity(subtitle_target_used, subtitle_candidate_used)
 
-        audio_similarity = None
+        audio_similarity_asr = None
         if valid_asr_text(asr_t) and valid_asr_text(asr_c):
-            audio_similarity = text_similarity(asr_t, asr_c)
+            audio_similarity_asr = text_similarity(asr_t, asr_c)
+        audio_similarity_wave = audio_wave_similarity(ta, ca)
+        target_audio_dbfs = audio_level_dbfs(ta)
+        candidate_audio_dbfs = audio_level_dbfs(ca)
+        target_audio_active = target_audio_dbfs is not None and target_audio_dbfs > -45.0
+        candidate_audio_active = candidate_audio_dbfs is not None and candidate_audio_dbfs > -45.0
 
+        # 音频主分值：优先信任硬证据（波形），同时保留 ASR 语义证据。
+        # 目的：减少“波形已一致但 ASR 识别差异导致的误报”。
+        if audio_similarity_wave is not None and audio_similarity_asr is not None:
+            audio_similarity = max(float(audio_similarity_wave), float(audio_similarity_asr))
+        elif audio_similarity_wave is not None:
+            audio_similarity = float(audio_similarity_wave)
+        else:
+            audio_similarity = audio_similarity_asr
+
+        # 关键兜底：目标有声而二剪静音，强制判为音频不一致，避免“无声漏检”。
+        audio_silence_mismatch = bool(target_audio_active and not candidate_audio_active)
+        if audio_silence_mismatch:
+            audio_similarity = 0.0
+
+        subtitle_weight = 0.25 if use_subtitle_file_pair else 0.10
+        audio_weight = 0.25
+        visual_weight = 0.65
         overall_similarity = combine_scores(
             [
-                (visual_similarity, 0.50),
-                (subtitle_similarity, 0.25),
-                (audio_similarity, 0.25),
+                (visual_similarity, visual_weight),
+                (subtitle_similarity, subtitle_weight),
+                (audio_similarity, audio_weight),
             ]
         )
         visual_flag = modality_flag(visual_similarity)
         subtitle_flag = modality_flag(subtitle_similarity)
         audio_flag = modality_flag(audio_similarity)
-        if "mismatch" in [visual_flag, subtitle_flag, audio_flag]:
+        hard_mismatch_reasons: List[str] = []
+        if visual_flag == "mismatch":
+            hard_mismatch_reasons.append("visual")
+        if audio_silence_mismatch:
+            hard_mismatch_reasons.append("audio_silence")
+        elif audio_similarity is not None and audio_flag == "mismatch":
+            # 若波形证据显示一致，仅 ASR 文本低分不作为“硬不一致”。
+            # 尾段短窗（例如只剩 0.x 秒）只作为软证据，不触发硬不一致。
+            if (not tail_audio_short_window) and (audio_similarity_wave is None or float(audio_similarity_wave) < 0.72):
+                hard_mismatch_reasons.append("audio")
+        if use_subtitle_file_pair and subtitle_flag == "mismatch":
+            hard_mismatch_reasons.append("subtitle_file")
+
+        if hard_mismatch_reasons:
             verdict = "明显不一致"
         else:
             verdict = verdict_from_score(overall_similarity)
@@ -890,7 +1099,10 @@ def main() -> int:
         report_points.append({
             "index": i,
             "time_sec": t,
-            "sample_time_sec": t_sample,
+            "sample_time_sec": frame_sample_time,
+            "audio_sample_time_sec": audio_sample_time,
+            "audio_effective_window_sec": audio_effective_window,
+            "tail_audio_short_window": tail_audio_short_window,
             "target_frame": str(tf),
             "candidate_frame": str(cf),
             "target_audio": str(ta),
@@ -907,10 +1119,15 @@ def main() -> int:
             "visual_similarity": visual_similarity,
             "subtitle_similarity": subtitle_similarity,
             "audio_similarity": audio_similarity,
+            "audio_similarity_asr": audio_similarity_asr,
+            "audio_similarity_wave": audio_similarity_wave,
+            "audio_target_dbfs": target_audio_dbfs,
+            "audio_candidate_dbfs": candidate_audio_dbfs,
             "overall_similarity": overall_similarity,
             "visual_flag": visual_flag,
             "subtitle_flag": subtitle_flag,
             "audio_flag": audio_flag,
+            "hard_mismatch_reasons": hard_mismatch_reasons,
             "verdict": verdict,
         })
 
@@ -956,6 +1173,7 @@ def main() -> int:
         "asr_backend": backend,
         "asr_error": asr_error or asr_init_error,
         "asr_cmd_used": " ".join(asr_cmd_base) if asr_cmd_base else None,
+        "asr_python_candidates": asr_python_candidates,
         "asr_model": args.asr_model,
         "candidate_mode": str(args.candidate_mode),
         "clip_elapsed_sec": round(float(args.clip_elapsed_sec), 3),

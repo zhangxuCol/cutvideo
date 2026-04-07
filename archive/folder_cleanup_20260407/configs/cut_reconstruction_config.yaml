@@ -15,7 +15,7 @@ source_videos:
 output_video: /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/output/cut2_reconstructed.mp4
 
 # 重构日志路径
-reconstruction_log: /Users/zhangxu/work/项目/cutvideo/06_configurations/cut_reconstruction_log.json
+reconstruction_log: /Users/zhangxu/work/项目/cutvideo/configurations/cut_reconstruction_log.json
 
 # 帧率设置: 1秒6帧
 fps: 6

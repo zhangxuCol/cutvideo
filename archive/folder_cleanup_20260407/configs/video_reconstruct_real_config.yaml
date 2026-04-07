@@ -13,7 +13,7 @@ source_videos:
 output_video: /Users/zhangxu/work/项目/cutvideo/01_test_data_generation/test_videos/clip2_reconstructed_real.mp4
 
 # 重构日志路径
-reconstruction_log: /Users/zhangxu/work/项目/cutvideo/06_configurations/real_videos_reconstruction_log.json
+reconstruction_log: /Users/zhangxu/work/项目/cutvideo/configurations/real_videos_reconstruction_log.json
 
 # 帧率设置（降低以提高处理速度）
 fps: 2

@@ -37,7 +37,7 @@ class SmartVideoReconstructor:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # 加载配置
-        self.config = load_config('/Users/zhangxu/work/项目/cutvideo/06_configurations/cut_reconstruction_config.yaml')
+        self.config = load_config('/Users/zhangxu/work/项目/cutvideo/configurations/cut_reconstruction_config.yaml')
         
         # 获取并分析所有源视频
         self.source_videos = self._analyze_source_videos()

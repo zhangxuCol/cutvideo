@@ -21,7 +21,7 @@ class BatchVideoReconstructorV2:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # 加载默认配置
-        self.config = load_config('/Users/zhangxu/work/项目/cutvideo/06_configurations/cut_reconstruction_config.yaml')
+        self.config = load_config('/Users/zhangxu/work/项目/cutvideo/configurations/cut_reconstruction_config.yaml')
 
         # 获取源视频列表
         self.source_videos = self._get_source_videos()
