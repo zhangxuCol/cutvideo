@@ -179,6 +179,13 @@ class FastHighPrecisionReconstructor:
         self.audio_guard_hard_floor = 0.18
         self.audio_guard_shift_margin = 0.16
         self.audio_guard_shift_candidates = [-2.0, -1.0, 1.0, 2.0]
+        # 桥接恢复动态守卫：避免恢复后出现“音频在走、画面像不动”的观感问题
+        self.bridge_motion_guard_enabled = True
+        self.bridge_motion_min_target_motion = 0.010
+        self.bridge_motion_min_ratio = 0.60
+        self.bridge_motion_samples = 7
+        # 桥接恢复起始保护：避免开头几段被“桥接”后出现主观卡顿观感
+        self.bridge_recover_min_target_start = 12.0
 
         # 运行期统计（用于质量报告）
         self.match_elapsed_sec = 0.0
@@ -1183,6 +1190,45 @@ class FastHighPrecisionReconstructor:
 
         return True, avg_sim
 
+    def estimate_segment_motion(
+        self,
+        video: Path,
+        start: float,
+        duration: float,
+        sample_count: int = 7,
+    ) -> Optional[float]:
+        """
+        估算片段动态量（0~1）：抽样帧之间的平均归一化差异。
+        值越低，画面越“静止”。
+        """
+        if duration <= 0.3:
+            return None
+        count = max(3, int(sample_count))
+        max_offset = max(0.0, float(duration) - 0.05)
+        if max_offset <= 0:
+            return None
+
+        offsets = np.linspace(0.0, max_offset, num=count)
+        last_small = None
+        diffs: List[float] = []
+        for off in offsets:
+            t = max(0.0, float(start) + float(off))
+            frame_path = self.get_cached_frame_path(video, t)
+            if not frame_path or not frame_path.exists():
+                continue
+            gray = cv2.imread(str(frame_path), cv2.IMREAD_GRAYSCALE)
+            if gray is None:
+                continue
+            small = cv2.resize(gray, (160, 90), interpolation=cv2.INTER_AREA)
+            if last_small is not None:
+                mad = np.mean(np.abs(small.astype(np.int16) - last_small.astype(np.int16))) / 255.0
+                diffs.append(float(mad))
+            last_small = small
+
+        if not diffs:
+            return None
+        return float(np.mean(diffs))
+
     def verify_segment_visual(
         self,
         source: Path,
@@ -1309,7 +1355,12 @@ class FastHighPrecisionReconstructor:
                 success=True,
                 source=self.target_video,
                 source_start=task.target_start,
-                quality={**quality, "combined": 0.0, "fallback": True}
+                quality={
+                    **quality,
+                    "combined": 0.0,
+                    "fallback": True,
+                    "fallback_reason": "match_failed_low_score",
+                }
             )
 
         # 通用防误匹配：段级画面快速核验，失败则回退目标片段
@@ -1510,6 +1561,9 @@ class FastHighPrecisionReconstructor:
         alignment_bias_fallback = self.enforce_target_alignment_bias(confirmed_segments)
         if alignment_bias_fallback > 0:
             print(f"   🎯 对齐偏置守卫: 切换 {alignment_bias_fallback} 个段到目标素材")
+        bridge_recovered = self.recover_isolated_fallback_bridges(confirmed_segments)
+        if bridge_recovered > 0:
+            print(f"   🧩 孤立兜底桥接恢复: 恢复 {bridge_recovered} 个段到同源时间轴")
 
         self.timeline_guard_elapsed_sec = time.perf_counter() - guard_perf
         self.guard_stats = {
@@ -1519,6 +1573,7 @@ class FastHighPrecisionReconstructor:
             "global_repeat_fallback": int(global_repeat_fallback),
             "step_guard_fallback": int(step_guard_fallback),
             "alignment_bias_fallback": int(alignment_bias_fallback),
+            "bridge_recovered": int(bridge_recovered),
         }
 
         print(f"\n✅ 可用段: {len(confirmed_segments)}/{len(tasks)} 段 (完整保留)")
@@ -2097,6 +2152,119 @@ class FastHighPrecisionReconstructor:
 
         return switched
 
+    def recover_isolated_fallback_bridges(self, segments: List[dict]) -> int:
+        """
+        孤立兜底桥接恢复：
+        - 仅处理被“前后同源高置信段”夹住的单个 fallback 段
+        - 优先按前后连续性推导候选起点，再做 quick_verify 复核
+        - 通过后恢复为同源段，降低“中间 5 秒像卡住/跳源”的观感风险
+        """
+        recovered = 0
+        if len(segments) < 3:
+            return recovered
+
+        for i in range(1, len(segments) - 1):
+            prev = segments[i - 1]
+            curr = segments[i]
+            nxt = segments[i + 1]
+
+            curr_q = curr.get("quality", {}) or {}
+            if curr["source"] != self.target_video:
+                continue
+            if not bool(curr_q.get("fallback", False)):
+                continue
+            if float(curr.get("target_start", 0.0)) < float(self.bridge_recover_min_target_start):
+                continue
+
+            # 仅恢复“原始匹配失败型”兜底，避免覆盖 timeline_guard 的主动保护决策。
+            fallback_reason = str(curr_q.get("fallback_reason", "") or "")
+            if fallback_reason not in {"", "match_failed_low_score", "missing_result"}:
+                continue
+
+            if prev["source"] == self.target_video or nxt["source"] == self.target_video:
+                continue
+            if prev["source"] != nxt["source"]:
+                continue
+
+            prev_q = prev.get("quality", {}) or {}
+            next_q = nxt.get("quality", {}) or {}
+            if bool(prev_q.get("fallback", False)) or bool(next_q.get("fallback", False)):
+                continue
+
+            quality_floor = max(0.82, float(self.strict_verify_min_sim))
+            if float(prev_q.get("combined", 0.0)) < quality_floor:
+                continue
+            if float(next_q.get("combined", 0.0)) < quality_floor:
+                continue
+
+            dur = float(curr["duration"])
+            cand_from_prev = float(prev["start"]) + float(prev["duration"])
+            cand_from_next = float(nxt["start"]) - dur
+            bridge_gap = abs(cand_from_prev - cand_from_next)
+            bridge_tol = max(0.45, dur * 0.12)
+            if bridge_gap > bridge_tol:
+                continue
+
+            candidate = 0.5 * (cand_from_prev + cand_from_next)
+            if candidate < 0.0:
+                continue
+
+            step_tolerance = max(0.9, dur * 0.30)
+            target_step = float(curr["target_start"]) - float(prev["target_start"])
+            source_step = float(candidate) - float(prev["start"])
+            if abs(source_step - target_step) > step_tolerance:
+                continue
+
+            passed, verify_avg = self.quick_verify(
+                source=prev["source"],
+                source_start=float(candidate),
+                target_start=float(curr["target_start"]),
+                duration=dur,
+            )
+            if not passed:
+                continue
+
+            if self.bridge_motion_guard_enabled:
+                target_motion = self.estimate_segment_motion(
+                    self.target_video,
+                    float(curr["target_start"]),
+                    dur,
+                    sample_count=self.bridge_motion_samples,
+                )
+                source_motion = self.estimate_segment_motion(
+                    prev["source"],
+                    float(candidate),
+                    dur,
+                    sample_count=self.bridge_motion_samples,
+                )
+                curr_q["bridge_target_motion"] = None if target_motion is None else float(target_motion)
+                curr_q["bridge_source_motion"] = None if source_motion is None else float(source_motion)
+                if (
+                    target_motion is not None
+                    and source_motion is not None
+                    and target_motion >= float(self.bridge_motion_min_target_motion)
+                    and target_motion > 1e-6
+                ):
+                    ratio = float(source_motion / target_motion)
+                    curr_q["bridge_motion_ratio"] = ratio
+                    if ratio < float(self.bridge_motion_min_ratio):
+                        curr_q["bridge_recover_blocked"] = "motion_guard_source_too_static"
+                        curr["quality"] = curr_q
+                        continue
+
+            curr["source"] = prev["source"]
+            curr["start"] = float(candidate)
+            curr_q["fallback"] = False
+            curr_q["fallback_reason"] = "bridge_recovered_from_neighbors"
+            curr_q["bridge_recovered"] = True
+            curr_q["bridge_verify_avg"] = float(verify_avg)
+            curr_q["bridge_gap_sec"] = float(bridge_gap)
+            curr_q["combined"] = max(float(curr_q.get("combined", 0.0)), float(verify_avg))
+            curr["quality"] = curr_q
+            recovered += 1
+
+        return recovered
+
     def _extract_av_clip(
         self,
         source: Path,
@@ -2109,6 +2277,8 @@ class FastHighPrecisionReconstructor:
     ) -> Tuple[bool, str]:
         """提取单段 AV 片段，返回 (是否成功, 错误信息)。"""
         frame_count = max(1, int(expected_frames)) if expected_frames else 0
+        # 播放兼容优先：固定 GOP + 关闭 B 帧，降低个别播放器“音频前进/画面卡住”观感概率。
+        gop = max(12, int(round(float(self.output_fps or 25.0))))
         cmd = [
             'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
             '-i', str(source),
@@ -2117,6 +2287,10 @@ class FastHighPrecisionReconstructor:
             '-vf', fps_expr,
             '-reset_timestamps', '1',
             '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+            '-bf', '0',
+            '-g', str(gop),
+            '-keyint_min', str(gop),
+            '-sc_threshold', '0',
         ]
         if include_audio:
             cmd.extend([
@@ -2221,7 +2395,14 @@ class FastHighPrecisionReconstructor:
             return input_video, 0
 
         repaired_video_only = self.temp_dir / "temp_output_boundary_repaired_video.mp4"
-        encoder_args = ['-c:v', 'libx264', '-preset', 'fast', '-crf', '23']
+        gop = max(12, int(round(float(source_fps))))
+        encoder_args = [
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+            '-bf', '0',
+            '-g', str(gop),
+            '-keyint_min', str(gop),
+            '-sc_threshold', '0',
+        ]
         if self.boundary_glitch_use_videotoolbox and self._ffmpeg_has_encoder('h264_videotoolbox'):
             # Mac 硬编优先：显著降低单帧突刺修复耗时；高码率保证观感。
             encoder_args = [
@@ -2446,41 +2627,82 @@ class FastHighPrecisionReconstructor:
         temp_output = self.temp_dir / "temp_output.mp4"
         concat_mode = ""
         concat_perf = time.perf_counter()
+        # 经验阈值：当大量段已兜底到目标素材时，copy 拼接更容易在个别播放器出现边界卡顿观感。
+        concat_reencode_fallback_ratio = 0.85
+        fallback_count = sum(1 for seg in segments if bool(seg.get("fallback", False)))
+        fallback_ratio = (float(fallback_count) / float(len(segments))) if segments else 0.0
 
-        copy_cmd = [
-            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-            '-f', 'concat', '-safe', '0',
-            '-i', str(av_concat),
-            '-t', f"{target_duration:.3f}",
-            '-c', 'copy',
-            str(temp_output)
-        ]
-        concat_proc = subprocess.run(copy_cmd, capture_output=True, text=True)
-        if concat_proc.returncode == 0 and temp_output.exists():
-            concat_mode = "copy"
-        else:
+        def _run_concat_reencode(out_path: Path) -> Tuple[bool, str]:
             reencode_cmd = [
                 'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
                 '-f', 'concat', '-safe', '0',
                 '-i', str(av_concat),
                 '-t', f"{target_duration:.3f}",
                 '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+                '-bf', '0',
+                '-g', str(max(12, int(round(output_fps)))),
+                '-keyint_min', str(max(12, int(round(output_fps)))),
+                '-sc_threshold', '0',
+                '-r', fps_out,
+                '-vsync', 'cfr',
+                '-movflags', '+faststart',
             ]
             if render_target_audio_only:
                 reencode_cmd.extend(['-an'])
             else:
                 reencode_cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
-            reencode_cmd.append(str(temp_output))
-            concat_proc = subprocess.run(reencode_cmd, capture_output=True, text=True)
+            reencode_cmd.append(str(out_path))
+            reencode_proc = subprocess.run(reencode_cmd, capture_output=True, text=True)
+            if reencode_proc.returncode == 0 and out_path.exists():
+                return True, ""
+            return False, (reencode_proc.stderr or "").strip()
+
+        concat_error = ""
+        if fallback_ratio >= concat_reencode_fallback_ratio:
+            # 高兜底场景直接使用稳定重编码拼接，优先播放兼容性。
+            ok, concat_error = _run_concat_reencode(temp_output)
+            if ok:
+                concat_mode = "reencode_high_fallback"
+            else:
+                concat_mode = ""
+        else:
+            copy_cmd = [
+                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                '-f', 'concat', '-safe', '0',
+                '-i', str(av_concat),
+                '-t', f"{target_duration:.3f}",
+                '-c', 'copy',
+                str(temp_output)
+            ]
+            concat_proc = subprocess.run(copy_cmd, capture_output=True, text=True)
             if concat_proc.returncode == 0 and temp_output.exists():
-                concat_mode = "reencode"
+                # copy 虽成功，但若音轨长度异常偏短，通常意味着时间戳/流参数不可靠，
+                # 这时切到重编码拼接可显著降低播放器边界卡顿观感。
+                quick_audio = self.get_audio_duration(temp_output)
+                min_audio_required_quick = max(5.0, float(target_duration) * 0.90)
+                if quick_audio <= 0.0 or (quick_audio + 0.5) < min_audio_required_quick:
+                    stable_output = self.temp_dir / "temp_output_reencode_stable.mp4"
+                    ok, concat_error = _run_concat_reencode(stable_output)
+                    if ok:
+                        temp_output = stable_output
+                        concat_mode = "reencode_after_copy_short_audio"
+                    else:
+                        concat_mode = "copy"
+                else:
+                    concat_mode = "copy"
+            else:
+                ok, concat_error = _run_concat_reencode(temp_output)
+                if ok:
+                    concat_mode = "reencode_after_copy_fail"
+                else:
+                    concat_mode = ""
         concat_elapsed = time.perf_counter() - concat_perf
 
         if not concat_mode:
             self.last_render_metrics = {
                 "status": "failed",
                 "error": "concat_failed",
-                "error_detail": (concat_proc.stderr or "").strip()[:240],
+                "error_detail": concat_error[:240],
                 "segments_total": len(segments),
                 "render_fallback_segments": render_fallbacks,
                 "clip_extract_total_sec": round(float(clip_extract_total), 3),
