@@ -1,0 +1,4 @@
+interface:
+  display_name: "Goal Self-Improver"
+  short_description: "持续迭代优化代码，直到目标验收通过并严格满足约束条件"
+  default_prompt: "请依据目标与约束持续优化代码：优先走自动循环（auto_improve + auto_modify.command），每轮都运行验收门，未通过就继续迭代，直至通过或触发停止规则。"
