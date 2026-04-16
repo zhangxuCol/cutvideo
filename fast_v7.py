@@ -27,17 +27,18 @@ import pickle
 import re
 import hashlib
 import threading
+import uuid
 from datetime import datetime
 from collections import OrderedDict
 from PIL import Image
 import imagehash
 from pipeline_config import (
     load_section_config,
-    cfg_str,
-    cfg_int,
-    cfg_float,
-    cfg_bool,
-    cfg_str_list,
+    cfg_req_str,
+    cfg_req_int,
+    cfg_req_float,
+    cfg_req_bool,
+    cfg_req_str_list,
     split_csv,
 )
 
@@ -54,7 +55,79 @@ def add_bool_arg(parser: argparse.ArgumentParser, name: str, default: bool, help
 
 def extract_chromaprint(video_path: Path, start: float = 0, duration: float = None) -> list:
     """使用 Chromaprint (fpcalc) 提取音频指纹"""
+    def extract_waveform_fallback() -> list:
+        """
+        fpcalc 不可用时的后备指纹：
+        - 用 ffmpeg 抽取单声道 PCM；
+        - 做短时频谱并量化为 32-bit 位码序列（可复用现有汉明距离比较）。
+        """
+        try:
+            sample_rate = 8000
+            frame_size = 1024
+            hop = 512
+            band_count = 32
+            max_codes = 320
+            clip_dur = max(0.3, float(duration)) if duration is not None else None
+
+            cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error']
+            if float(start) > 0:
+                cmd.extend(['-ss', f"{float(start):.3f}"])
+            cmd.extend(['-i', str(video_path)])
+            if clip_dur is not None:
+                cmd.extend(['-t', f"{clip_dur:.3f}"])
+            cmd.extend([
+                '-vn',
+                '-ac', '1',
+                '-ar', str(sample_rate),
+                '-f', 's16le',
+                '-',
+            ])
+            result = subprocess.run(cmd, capture_output=True)
+            if result.returncode != 0 or (not result.stdout):
+                return []
+
+            samples = np.frombuffer(result.stdout, dtype=np.int16)
+            if samples.size < max(sample_rate // 3, frame_size):
+                return []
+
+            x = samples.astype(np.float32)
+            x -= float(np.mean(x))
+            std = float(np.std(x))
+            if std < 2.0:
+                return []
+            x /= std
+
+            window = np.hanning(frame_size).astype(np.float32)
+            fingerprint: List[int] = []
+            total = int(x.size)
+            for pos in range(0, max(1, total - frame_size + 1), hop):
+                if pos + frame_size > total:
+                    break
+                seg = x[pos:pos + frame_size] * window
+                spec = np.abs(np.fft.rfft(seg))
+                if spec.size <= band_count:
+                    continue
+                bands = np.array_split(spec[1:], band_count)
+                vals = np.array([float(np.mean(b)) for b in bands], dtype=np.float32)
+                vals = np.log1p(vals)
+                med = float(np.median(vals))
+                bits = (vals >= med).astype(np.uint32)
+                code = 0
+                for bit in bits:
+                    code = ((code << 1) | int(bit)) & 0xFFFFFFFF
+                fingerprint.append(int(code))
+                if len(fingerprint) >= max_codes:
+                    break
+
+            return fingerprint
+        except Exception:
+            return []
+
     try:
+        fpcalc_path = shutil.which('fpcalc')
+        if not fpcalc_path:
+            return extract_waveform_fallback()
+
         cmd = ['fpcalc', '-raw']
         if start > 0:
             cmd.extend(['-start', str(int(start))])
@@ -65,7 +138,7 @@ def extract_chromaprint(video_path: Path, start: float = 0, duration: float = No
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode != 0:
-            return []
+            return extract_waveform_fallback()
         
         # 解析 fpcalc 输出
         # 格式: DURATION=xxx\nFINGERPRINT=xxx
@@ -77,10 +150,10 @@ def extract_chromaprint(video_path: Path, start: float = 0, duration: float = No
             fingerprint_str = fingerprint_match.group(1)
             fingerprint = [int(x) for x in fingerprint_str.split(',')]
             return fingerprint
-        return []
+        return extract_waveform_fallback()
     except Exception as e:
         print(f"   Chromaprint 提取失败: {e}")
-        return []
+        return extract_waveform_fallback()
 
 def compare_chromaprint(fp1: list, fp2: list) -> float:
     """比较两个 Chromaprint 指纹的相似度"""
@@ -134,6 +207,10 @@ class FastHighPrecisionReconstructor:
         # 配置
         self.match_threshold = 0.95
         self.segment_duration = 5.0  # 降低分段时长提高精度
+        self.frame_index_sample_interval = 1.0 / 3.0
+        self.phash_preprocess_version = 2
+        # 当前策略：禁止回退到目标素材，避免输出混入原视频内容。
+        self.enable_target_video_fallback = False
         cpu_count = os.cpu_count() or 8
         # v7: 提高默认并发（在不改算法的前提下优先提速）
         auto_workers = max(1, cpu_count - 1)
@@ -179,6 +256,30 @@ class FastHighPrecisionReconstructor:
         self.audio_guard_hard_floor = 0.18
         self.audio_guard_shift_margin = 0.16
         self.audio_guard_shift_candidates = [-2.0, -1.0, 1.0, 2.0]
+        # 音频守卫自动纠偏：检测到稳定偏移时，自动微调段起点并复核。
+        self.audio_guard_auto_shift_enabled = True
+        self.audio_guard_auto_shift_min_abs_sec = 0.45
+        self.audio_guard_auto_shift_min_gain = 0.045
+        self.audio_guard_auto_shift_max_verify_drop = 0.02
+        # 分段提取精确寻址（含音轨段）：减少关键帧回退导致的词尾重复/音画错位
+        self.audio_segment_accurate_seek = True
+        # 当命中源片尾导致分段素材天然不足时，自动补齐静音与末帧，避免局部掉音/黑帧
+        self.segment_shortfall_pad = True
+        # 分段短缺硬阈值：短缺过大时不再静音补齐，改为让提取策略重试。
+        self.segment_shortfall_pad_hard_fail_sec = 0.90
+        self.segment_shortfall_pad_hard_fail_ratio = 0.22
+        # 跨源短缺拼桥：当当前段命中源尾且下一段从新源片头接入时，
+        # 允许把下一源的开头借到当前段尾部，避免“前面重复、后面缺字”。
+        self.cross_source_shortfall_bridge_enabled = True
+        self.cross_source_shortfall_bridge_min_sec = 0.12
+        self.cross_source_shortfall_bridge_max_sec = 1.20
+        self.cross_source_shortfall_bridge_next_head_window = 0.95
+        self.cross_source_shortfall_bridge_base_search_cap = 0.40
+        self.cross_source_shortfall_bridge_extra_trim_cap = 0.90
+        # 轻微音频前移补偿（秒）：用于抵消分段编码/拼接带来的主观音频滞后感。
+        self.audio_sync_advance_sec = 0.05
+        # 中间分段默认沿用 AAC，优先稳定可听性；PCM 仅按需手动开启。
+        self.segment_intermediate_pcm_audio = False
         # 桥接恢复动态守卫：避免恢复后出现“音频在走、画面像不动”的观感问题
         self.bridge_motion_guard_enabled = True
         self.bridge_motion_min_target_motion = 0.010
@@ -186,6 +287,62 @@ class FastHighPrecisionReconstructor:
         self.bridge_motion_samples = 7
         # 桥接恢复起始保护：避免开头几段被“桥接”后出现主观卡顿观感
         self.bridge_recover_min_target_start = 12.0
+        # 源片尾安全边距：避免命中分片尾部黑场/尾音异常（非目标尾段）
+        self.source_tail_safety_enabled = True
+        self.source_tail_safety_margin = 0.6
+        self.source_tail_safety_target_tail_ignore_sec = 10.0
+        self.source_tail_safety_switch_min_gain = 0.02
+        # 近尾软切换：当剩余尾量极小且候选不显著更差时，允许切到非尾段，降低“尾字被切/单帧”风险。
+        self.source_tail_safety_soft_force_margin = 0.5
+        self.source_tail_safety_soft_force_max_drop = 0.03
+        # 跨源边界头部微调：处理“前段到片尾 + 后段从片头起”时的轻微重复词/接缝感
+        self.cross_source_head_nudge_enabled = True
+        self.cross_source_head_nudge_prev_tail_window = 1.5
+        self.cross_source_head_nudge_curr_head_window = 1.2
+        self.cross_source_head_nudge_max_offset = 1.0
+        self.cross_source_head_nudge_score_bias = 0.004
+        self.cross_source_head_nudge_max_verify_drop = 0.015
+        # 跨源片头保护：限制“向前挪头”过大，避免切掉句头/词尾。
+        self.cross_source_head_nudge_forward_cap = 0.35
+        self.cross_source_head_nudge_forward_gain_trigger = 0.06
+        # 跨源片头回拉：允许将片头段轻微向前回拉到更接近句首，降低“上一句被吃掉”的风险。
+        self.cross_source_head_nudge_allow_backward = True
+        self.cross_source_head_nudge_backward_cap = 0.8
+        self.cross_source_head_nudge_backward_gain_trigger = 0.015
+        self.cross_source_head_nudge_boundary_audio_weight = 0.06
+        # 禁兜底模式下的同源尾段重叠回推修复：
+        # 当当前段已贴到源尾无法后移时，把重叠量向前分摊，避免词尾重复/回放感。
+        self.no_target_backprop_overlap_fix = True
+        self.no_target_backprop_max_shift = 3.0
+        self.no_target_backprop_min_quality = 0.78
+        self.no_target_backprop_neg_trigger_floor = 0.04
+        # 禁兜底同源严重重叠 run 前推修复：
+        # 对 1~3 秒级负重叠做整段链前推，避免后段重复/倒放观感。
+        self.no_target_severe_overlap_run_fix = True
+        self.no_target_severe_overlap_trigger = 0.85
+        self.no_target_severe_overlap_safe_tol = 0.02
+        self.no_target_severe_overlap_force_combined_max = 0.92
+        # 禁兜底尾段容忍短缺：尾部若仍存在重复边界，优先裁掉前段尾巴，宁可整片略短也不回放补时长。
+        self.no_target_tail_shortfall_tolerance_sec = 1.0
+        # 同源 run 尾部容量不足时，允许更大幅度的均摊，避免把重叠集中到尾部个别边界。
+        self.no_target_run_overflow_max_per_boundary = 0.32
+        self.no_target_run_overflow_tiny_forward_freeze = 0.03
+        self.no_target_boundary_rematch_enabled = True
+        self.no_target_boundary_rematch_max_attempts = 4
+        # 边界硬约束 + 边界音频探针（用于自动发现重读/丢词/局部静音风险）
+        self.boundary_hard_max_negative_overlap = 0.01
+        self.boundary_hard_max_positive_gap = 0.06
+        # 边界硬约束单次最大位移：防止一次性大幅硬夹紧造成后续内容缺失/跨段错位。
+        self.boundary_hard_max_shift_sec = 1.2
+        self.boundary_audio_probe_window_sec = 0.45
+        self.boundary_audio_expected_gain_trigger = 0.08
+        self.boundary_audio_repair_max_offset = 0.5
+        self.boundary_audio_repair_max_passes = 2
+        # 混合源池降级策略：
+        # 当目录里同时存在“结构化分片文件”和“1.mp4/2.mp4 这类通用短名文件”时，
+        # 默认将短数字名文件降级为次级救援源，避免污染主匹配链。
+        self.secondary_source_name_rescue_only = True
+        self.secondary_source_numeric_stem_max_len = 3
 
         # 运行期统计（用于质量报告）
         self.match_elapsed_sec = 0.0
@@ -193,6 +350,7 @@ class FastHighPrecisionReconstructor:
         self.total_elapsed_sec = 0.0
         self.guard_stats: Dict[str, int] = {}
         self.last_render_metrics: Dict[str, object] = {}
+        self.last_boundary_repair_stats: Dict[str, int] = {}
 
         # pHash 帧索引
         self.frame_index = {}  # {video_path: [(time, phash), ...]}
@@ -218,12 +376,131 @@ class FastHighPrecisionReconstructor:
         self.video_duration_cache: Dict[str, float] = {}
         self.audio_duration_cache: Dict[str, float] = {}
         self.video_fps_cache: Dict[str, float] = {}
+        self.primary_source_videos: List[Path] = []
+        self.secondary_source_videos: List[Path] = []
+        self.primary_source_video_keys: Set[str] = set()
+        self.secondary_source_video_keys: Set[str] = set()
 
         # v7.3: 帧特征缓存（减少重复 imread/resize/cvtColor）
         self.frame_feature_cache_max_items = 1500
         self.frame_feature_cache: "OrderedDict[str, Tuple[np.ndarray, np.ndarray]]" = OrderedDict()
         self.frame_feature_lock = threading.Lock()
         self._ffmpeg_encoder_cache: Dict[str, bool] = {}
+        self._rebuild_source_priority_sets()
+
+    def _source_key(self, video_path: Path) -> str:
+        return str(Path(video_path).resolve())
+
+    def _is_secondary_source(self, video_path: Optional[Path]) -> bool:
+        if video_path is None:
+            return False
+        path = Path(video_path)
+        key = self._source_key(path)
+        if key in self.secondary_source_video_keys:
+            return True
+        return bool(self.secondary_source_videos) and self._is_secondary_source_filename(path)
+
+    def _is_secondary_source_filename(self, video_path: Path) -> bool:
+        stem = str(Path(video_path).stem).strip().lower()
+        if not stem:
+            return False
+        max_len = max(1, int(getattr(self, "secondary_source_numeric_stem_max_len", 3)))
+        return bool(re.fullmatch(rf"\d{{1,{max_len}}}", stem))
+
+    def _rebuild_source_priority_sets(self) -> None:
+        if not bool(getattr(self, "secondary_source_name_rescue_only", True)):
+            self.primary_source_videos = list(self.source_videos)
+            self.secondary_source_videos = []
+        else:
+            primary: List[Path] = []
+            secondary: List[Path] = []
+            for source in self.source_videos:
+                if self._is_secondary_source_filename(source):
+                    secondary.append(source)
+                else:
+                    primary.append(source)
+            # 只有在“结构化分片源 + 短数字名源”混用时才降级，避免影响本来就只有 1.mp4/2.mp4 的项目。
+            if primary and secondary:
+                self.primary_source_videos = primary
+                self.secondary_source_videos = secondary
+            else:
+                self.primary_source_videos = list(self.source_videos)
+                self.secondary_source_videos = []
+        self.primary_source_video_keys = {self._source_key(p) for p in self.primary_source_videos}
+        self.secondary_source_video_keys = {self._source_key(p) for p in self.secondary_source_videos}
+
+    def _candidate_source_videos(self, include_secondary: bool = False) -> List[Path]:
+        if include_secondary or not self.secondary_source_videos:
+            return list(self.source_videos)
+        return list(self.primary_source_videos)
+
+    def _no_target_boundary_thresholds(self, curr: dict) -> Tuple[float, float]:
+        duration = max(0.0, float(curr.get("duration", 0.0)))
+        q = curr.get("quality", {}) or {}
+        recover_mode = str(q.get("recover_mode", "") or "")
+        neg_trigger = max(0.12, duration * 0.02)
+        pos_trigger = max(0.20, duration * 0.04)
+        if recover_mode == "neighbors_last_resort_no_target":
+            neg_trigger = min(neg_trigger, max(0.06, duration * 0.012))
+            pos_trigger = min(pos_trigger, max(0.12, duration * 0.024))
+        return float(neg_trigger), float(pos_trigger)
+
+    def _no_target_boundary_unresolved_meta(self, prev: dict, curr: dict) -> Tuple[bool, float, Dict[str, float]]:
+        prev_end = float(prev["start"]) + float(prev["duration"])
+        gap = float(curr["start"]) - prev_end
+        neg_trigger, pos_trigger = self._no_target_boundary_thresholds(curr)
+        q = curr.get("quality", {}) or {}
+        repeat_risk_unresolved = bool(q.get("boundary_audio_repeat_risk_unresolved_after", False))
+        recover_mode = str(q.get("recover_mode", "") or "")
+        recover_boundary_excess = max(0.0, float(q.get("recover_boundary_excess", 0.0) or 0.0))
+        next_penalty_after = max(0.0, float(q.get("boundary_audio_next_penalty_after", 0.0) or 0.0))
+        recover_last_resort_unresolved = bool(
+            recover_mode == "neighbors_last_resort_no_target"
+            and (
+                recover_boundary_excess > max(0.045, float(curr["duration"]) * 0.008)
+                or next_penalty_after > max(0.04, float(curr["duration"]) * 0.008)
+            )
+        )
+        unresolved = bool(
+            (gap < -neg_trigger)
+            or (gap > pos_trigger)
+            or repeat_risk_unresolved
+            or recover_last_resort_unresolved
+        )
+        meta = {
+            "neg_trigger": float(neg_trigger),
+            "pos_trigger": float(pos_trigger),
+            "recover_boundary_excess": float(recover_boundary_excess),
+            "boundary_audio_next_penalty_after": float(next_penalty_after),
+            "repeat_risk_unresolved": 1.0 if repeat_risk_unresolved else 0.0,
+            "recover_last_resort_unresolved": 1.0 if recover_last_resort_unresolved else 0.0,
+        }
+        return unresolved, float(gap), meta
+
+    def _is_tail_sensitive_last_resort_segment(self, seg: dict) -> bool:
+        if not seg:
+            return False
+        q = seg.get("quality", {}) or {}
+        recover_mode = str(q.get("recover_mode", "") or "")
+        if recover_mode not in {"neighbors_last_resort_no_target", "neighbors_forced_no_verify"}:
+            return False
+        if self.target_duration <= 0.0:
+            return True
+        tail_window = max(float(getattr(self, "tail_guard_seconds", 18.0)), 25.0)
+        return float(seg.get("target_start", 0.0)) >= max(0.0, float(self.target_duration - tail_window))
+
+    def _is_tail_shortfall_relax_boundary(self, boundary_index: int, curr: dict, total_segments: int) -> bool:
+        if self.enable_target_video_fallback:
+            return False
+        tol = max(0.0, float(getattr(self, "no_target_tail_shortfall_tolerance_sec", 0.0)))
+        if tol <= 1e-6:
+            return False
+        if boundary_index >= max(1, int(total_segments) - 3):
+            return True
+        if self.target_duration <= 0.0:
+            return False
+        tail_window = max(12.0, float(tol) + 8.0)
+        return float(curr.get("target_start", 0.0)) >= max(0.0, float(self.target_duration - tail_window))
 
     def continuity_bonus(self, source_start: float, target_start: float, duration: float) -> float:
         """连续性奖励（软约束），鼓励时间映射更平滑，不做硬性限制。"""
@@ -266,24 +543,44 @@ class FastHighPrecisionReconstructor:
         result = subprocess.run(cmd, capture_output=True, text=True)
         value = (result.stdout or "").strip().splitlines()
         if not value:
+            # 没有任何音轨流时直接判 0，不能回退到 format duration。
             duration = 0.0
             with self.meta_cache_lock:
-                self.audio_duration_cache[key] = duration
-            return duration
-        raw = value[0].strip()
-        if not raw or raw.upper() == "N/A":
+                self.audio_duration_cache[key] = float(duration)
+            return float(duration)
+        raw = value[0].strip() if value else ""
+        if raw and raw.upper() != "N/A":
+            try:
+                duration = max(0.0, float(raw))
+            except Exception:
+                duration = 0.0
+        else:
             duration = 0.0
-            with self.meta_cache_lock:
-                self.audio_duration_cache[key] = duration
-            return duration
-        try:
-            dur = float(raw)
-            duration = max(0.0, dur)
-        except Exception:
-            duration = 0.0
+
+        # 某些组合（如 mkv + pcm）不会填充 stream.duration，回退到 format.duration。
+        if duration <= 0.0:
+            fmt_cmd = [
+                'ffprobe', '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                str(video_path)
+            ]
+            fmt_result = subprocess.run(fmt_cmd, capture_output=True, text=True)
+            try:
+                duration = max(0.0, float((fmt_result.stdout or "").strip()))
+            except Exception:
+                duration = 0.0
+
         with self.meta_cache_lock:
             self.audio_duration_cache[key] = float(duration)
         return float(duration)
+
+    def _invalidate_media_duration_cache(self, video_path: Path) -> None:
+        """文件被覆盖后，清理本地 duration 缓存，避免读取到旧值。"""
+        key = str(Path(video_path).resolve())
+        with self.meta_cache_lock:
+            self.video_duration_cache.pop(key, None)
+            self.audio_duration_cache.pop(key, None)
 
     def _audio_dbfs_sample(self, video_path: Path, start_sec: float, duration_sec: float = 8.0) -> Optional[float]:
         """抽样解码音频并计算 dBFS；失败时返回 None。"""
@@ -576,11 +873,11 @@ class FastHighPrecisionReconstructor:
         target_start: float,
         duration: float,
         combined_score: float,
-    ) -> Tuple[bool, Dict]:
+        ) -> Tuple[bool, Dict]:
         """
         轻量音频一致性守卫：
         - 默认仅对可疑段触发（低分或明显时间漂移）
-        - 对齐点相似度过低时，再做 ±1/2 秒偏移探测
+        - 先做半秒级偏移探测；对齐点很差时再扩展到配置偏移探测
         """
         meta: Dict[str, object] = {
             "enabled": bool(self.audio_guard_enabled),
@@ -630,36 +927,64 @@ class FastHighPrecisionReconstructor:
         best_shift = 0.0
         best_shift_sim = aligned_sim
 
-        # 仅在对齐相似度偏低时才探测偏移，控制额外开销。
+        # 可疑段先做半秒级探测；对齐极差再扩展到配置偏移，兼顾性能和错位拦截。
+        probe_shifts: List[float] = []
+        if need_check:
+            probe_shifts.extend([-0.5, 0.5])
         if aligned_sim < float(self.audio_guard_min_similarity):
-            for shift in self.audio_guard_shift_candidates:
-                shifted_start = src_clip_start + float(shift)
-                if shifted_start < 0:
-                    continue
-                shifted_fp = self._get_audio_fp_cached(source, shifted_start, clip_dur)
-                if len(shifted_fp) < 10:
-                    continue
-                shifted_sim = float(compare_chromaprint(target_fp, shifted_fp))
-                if shifted_sim > best_shift_sim:
-                    best_shift_sim = shifted_sim
-                    best_shift = float(shift)
+            probe_shifts.extend([float(x) for x in self.audio_guard_shift_candidates])
+
+        seen_probe_shifts: Set[float] = set()
+        for raw_shift in probe_shifts:
+            shift = float(raw_shift)
+            if abs(shift) <= 1e-6:
+                continue
+            shift_key = round(shift, 3)
+            if shift_key in seen_probe_shifts:
+                continue
+            seen_probe_shifts.add(shift_key)
+            shifted_start = src_clip_start + shift
+            if shifted_start < 0:
+                continue
+            shifted_fp = self._get_audio_fp_cached(source, shifted_start, clip_dur)
+            if len(shifted_fp) < 10:
+                continue
+            shifted_sim = float(compare_chromaprint(target_fp, shifted_fp))
+            if shifted_sim > best_shift_sim:
+                best_shift_sim = shifted_sim
+                best_shift = float(shift)
 
         meta.update({
             "available": True,
             "aligned_similarity": float(aligned_sim),
             "best_shift_sec": float(best_shift),
             "best_shift_similarity": float(best_shift_sim),
+            "shift_gain": float(best_shift_sim - aligned_sim),
         })
 
         fail_reason = ""
+        shift_gain = float(best_shift_sim - aligned_sim)
+        long_shift_margin = max(0.10, float(self.audio_guard_shift_margin) * 0.70)
+        half_shift_margin = max(0.08, float(self.audio_guard_shift_margin) * 0.65)
+        shift_bias_aligned_cap = max(float(self.audio_guard_min_similarity) + 0.28, 0.78)
+        half_shift_bias_aligned_cap = max(float(self.audio_guard_min_similarity) + 0.36, 0.82)
         if aligned_sim < float(self.audio_guard_hard_floor):
             fail_reason = "audio_guard_hard_floor"
         elif (
-            aligned_sim < float(self.audio_guard_min_similarity)
+            shift_gain > 1e-6
             and abs(best_shift) >= 1.0
-            and (best_shift_sim - aligned_sim) >= float(self.audio_guard_shift_margin)
+            and shift_gain >= long_shift_margin
+            and aligned_sim <= shift_bias_aligned_cap
         ):
             fail_reason = "audio_guard_shift_bias"
+        elif (
+            shift_gain > 1e-6
+            and abs(best_shift) >= 0.45
+            and abs(best_shift) < 1.0
+            and shift_gain >= half_shift_margin
+            and aligned_sim <= half_shift_bias_aligned_cap
+        ):
+            fail_reason = "audio_guard_shift_bias_halfsec"
         elif (
             aligned_sim < float(self.audio_guard_min_similarity)
             and best_shift == 0.0
@@ -675,6 +1000,118 @@ class FastHighPrecisionReconstructor:
         meta["passed"] = True
         return True, meta
 
+    def try_audio_guard_shift_realign(
+        self,
+        source: Path,
+        source_start: float,
+        target_start: float,
+        duration: float,
+        combined_score: float,
+        audio_meta: Optional[Dict[str, object]],
+    ) -> Tuple[float, Dict[str, object], Optional[Dict[str, object]]]:
+        """
+        音频守卫自动纠偏（轻量）：
+        - 仅当音频守卫已检测并出现稳定偏移收益时触发
+        - 应用偏移后再次进行画面核验 + 音频守卫，双通过才落地
+        """
+        meta: Dict[str, object] = {"applied": False, "checked": False}
+        if source is None or source == self.target_video:
+            meta["reason"] = "target_segment"
+            return float(source_start), meta, None
+        if not bool(getattr(self, "audio_guard_auto_shift_enabled", True)):
+            meta["reason"] = "disabled"
+            return float(source_start), meta, None
+        if not isinstance(audio_meta, dict) or not bool(audio_meta.get("checked", False)):
+            meta["reason"] = "audio_meta_not_checked"
+            return float(source_start), meta, None
+
+        best_shift = float(audio_meta.get("best_shift_sec", 0.0) or 0.0)
+        shift_gain = float(audio_meta.get("shift_gain", 0.0) or 0.0)
+        min_abs = max(0.0, float(getattr(self, "audio_guard_auto_shift_min_abs_sec", 0.45)))
+        min_gain = max(0.0, float(getattr(self, "audio_guard_auto_shift_min_gain", 0.045)))
+        if abs(best_shift) < min_abs:
+            meta["reason"] = "shift_too_small"
+            meta["best_shift_sec"] = float(best_shift)
+            return float(source_start), meta, None
+        if shift_gain < min_gain:
+            meta["reason"] = "gain_too_small"
+            meta["best_shift_sec"] = float(best_shift)
+            meta["shift_gain"] = float(shift_gain)
+            return float(source_start), meta, None
+
+        src_duration = self.get_video_duration(source)
+        if src_duration <= 0.0:
+            meta["reason"] = "invalid_source_duration"
+            return float(source_start), meta, None
+        max_start = max(0.0, float(src_duration - duration))
+        cand_start = max(0.0, min(float(source_start) + float(best_shift), max_start))
+        if abs(cand_start - float(source_start)) <= 1e-6:
+            meta["reason"] = "clamped_no_change"
+            return float(source_start), meta, None
+
+        meta["checked"] = True
+        base_passed, base_avg = self.quick_verify(
+            source=source,
+            source_start=float(source_start),
+            target_start=float(target_start),
+            duration=float(duration),
+        )
+        cand_passed, cand_avg = self.quick_verify(
+            source=source,
+            source_start=float(cand_start),
+            target_start=float(target_start),
+            duration=float(duration),
+        )
+        if not cand_passed:
+            meta["reason"] = "candidate_visual_failed"
+            meta["candidate_start"] = float(cand_start)
+            meta["candidate_verify_avg"] = float(cand_avg)
+            return float(source_start), meta, None
+        max_drop = max(0.0, float(getattr(self, "audio_guard_auto_shift_max_verify_drop", 0.02)))
+        if base_passed and (float(cand_avg) + max_drop) < float(base_avg):
+            meta["reason"] = "candidate_visual_drop_too_large"
+            meta["base_verify_avg"] = float(base_avg)
+            meta["candidate_verify_avg"] = float(cand_avg)
+            return float(source_start), meta, None
+
+        cand_audio_passed, cand_audio_meta = self.quick_verify_audio(
+            source=source,
+            source_start=float(cand_start),
+            target_start=float(target_start),
+            duration=float(duration),
+            combined_score=max(float(combined_score), float(cand_avg)),
+        )
+        if not cand_audio_passed:
+            meta["reason"] = "candidate_audio_guard_failed"
+            meta["candidate_audio_reason"] = str((cand_audio_meta or {}).get("reason", ""))
+            return float(source_start), meta, cand_audio_meta
+
+        base_aligned = float(audio_meta.get("aligned_similarity", 0.0) or 0.0)
+        cand_aligned = float((cand_audio_meta or {}).get("aligned_similarity", 0.0) or 0.0)
+        if bool((cand_audio_meta or {}).get("checked", False)) and bool(audio_meta.get("checked", False)):
+            if cand_aligned + 0.03 < base_aligned:
+                meta["reason"] = "candidate_aligned_similarity_regressed"
+                meta["base_aligned_similarity"] = float(base_aligned)
+                meta["candidate_aligned_similarity"] = float(cand_aligned)
+                return float(source_start), meta, cand_audio_meta
+
+        meta.update(
+            {
+                "applied": True,
+                "reason": "audio_guard_shift_realign_applied",
+                "from_start": float(source_start),
+                "to_start": float(cand_start),
+                "applied_shift_sec": float(cand_start - float(source_start)),
+                "best_shift_sec": float(best_shift),
+                "shift_gain": float(shift_gain),
+                "base_verify_avg": float(base_avg),
+                "candidate_verify_avg": float(cand_avg),
+                "base_aligned_similarity": float(base_aligned),
+                "candidate_aligned_similarity": float(cand_aligned),
+            }
+        )
+        return float(cand_start), meta, cand_audio_meta
+
     def extract_frame_to_pil(self, video_path: Path, time_sec: float) -> Image.Image:
         """提取帧并转换为 PIL Image"""
         frame_path = self.get_cached_frame_path(video_path, time_sec)
@@ -688,11 +1125,167 @@ class FastHighPrecisionReconstructor:
 
     def compute_phash(self, img: Image.Image) -> imagehash.ImageHash:
         """计算感知哈希"""
-        return imagehash.phash(img, hash_size=8)
+        processed = self.preprocess_frame_for_phash(img)
+        return imagehash.phash(processed, hash_size=8)
+
+    def _find_primary_activity_span(self, scores: np.ndarray, min_len: int) -> Optional[Tuple[int, int]]:
+        """从一维活动分数中找主要内容区间。"""
+        values = np.asarray(scores, dtype=np.float32)
+        total = int(values.shape[0])
+        if total <= 0:
+            return None
+
+        p55 = float(np.percentile(values, 55))
+        p90 = float(np.percentile(values, 90))
+        mean_v = float(np.mean(values))
+        threshold = max(p55 + (p90 - p55) * 0.35, mean_v * 0.90, 0.8)
+
+        mask = values >= threshold
+        if not np.any(mask):
+            return None
+
+        segments: List[Tuple[int, int]] = []
+        start = -1
+        for idx, flag in enumerate(mask):
+            if flag and start < 0:
+                start = idx
+            elif (not flag) and start >= 0:
+                segments.append((start, idx))
+                start = -1
+        if start >= 0:
+            segments.append((start, total))
+
+        if not segments:
+            return None
+
+        gap_allow = max(1, int(round(total * 0.02)))
+        merged: List[Tuple[int, int]] = []
+        for seg_start, seg_end in segments:
+            if merged and seg_start - merged[-1][1] <= gap_allow:
+                merged[-1] = (merged[-1][0], seg_end)
+            else:
+                merged.append((seg_start, seg_end))
+
+        center = total * 0.5
+        best = None
+        best_score = -1.0
+        longest = None
+        longest_len = -1
+        for seg_start, seg_end in merged:
+            seg_len = seg_end - seg_start
+            if seg_len > longest_len:
+                longest_len = seg_len
+                longest = (seg_start, seg_end)
+            if seg_len < min_len:
+                continue
+            seg_energy = float(np.sum(values[seg_start:seg_end]))
+            seg_center = (seg_start + seg_end) * 0.5
+            center_penalty = abs(seg_center - center) / max(1.0, center)
+            seg_score = seg_energy * (1.0 - 0.35 * center_penalty)
+            if seg_score > best_score:
+                best_score = seg_score
+                best = (seg_start, seg_end)
+
+        if best is None:
+            if longest is None or longest_len < max(12, int(min_len * 0.70)):
+                return None
+            best = longest
+
+        margin = max(1, int(round(total * 0.02)))
+        left = max(0, best[0] - margin)
+        right = min(total, best[1] + margin)
+        if right - left < min_len:
+            need = min_len - (right - left)
+            left = max(0, left - need // 2)
+            right = min(total, right + need - need // 2)
+        return left, right
+
+    def preprocess_frame_for_phash(self, img: Image.Image) -> Image.Image:
+        """
+        对帧做内容区裁剪，降低黑边/角标/底部文案对 pHash 的干扰。
+        """
+        try:
+            rgb = img.convert("RGB")
+            arr = np.array(rgb)
+            if arr.ndim != 3 or arr.shape[0] < 32 or arr.shape[1] < 32:
+                return rgb
+
+            gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+            grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            edge = cv2.magnitude(grad_x, grad_y)
+
+            row_scores = edge.mean(axis=1) + 0.20 * gray.std(axis=1).astype(np.float32)
+            col_scores = edge.mean(axis=0) + 0.20 * gray.std(axis=0).astype(np.float32)
+
+            h, w = gray.shape
+            row_span = self._find_primary_activity_span(row_scores, min_len=max(24, int(round(h * 0.35))))
+            col_span = self._find_primary_activity_span(col_scores, min_len=max(24, int(round(w * 0.35))))
+
+            top, bottom = (row_span if row_span is not None else (0, h))
+            left, right = (col_span if col_span is not None else (0, w))
+            if bottom - top <= 0 or right - left <= 0:
+                return rgb
+
+            probe_h = max(8, int(round(h * 0.05)))
+            probe_w = max(8, int(round(w * 0.05)))
+            row_core_start = int(round(h * 0.35))
+            row_core_end = int(round(h * 0.65))
+            col_core_start = int(round(w * 0.35))
+            col_core_end = int(round(w * 0.65))
+
+            row_core_slice = row_scores[row_core_start:row_core_end]
+            col_core_slice = col_scores[col_core_start:col_core_end]
+            row_core = float(np.mean(row_core_slice)) if row_core_slice.size >= 8 else float(np.mean(row_scores))
+            col_core = float(np.mean(col_core_slice)) if col_core_slice.size >= 8 else float(np.mean(col_scores))
+            row_core = max(row_core, 1e-6)
+            col_core = max(col_core, 1e-6)
+
+            row_top_edge = float(np.mean(row_scores[:probe_h]))
+            row_bottom_edge = float(np.mean(row_scores[-probe_h:]))
+            col_left_edge = float(np.mean(col_scores[:probe_w]))
+            col_right_edge = float(np.mean(col_scores[-probe_w:]))
+
+            # 仅当边缘活动显著低于画面主体时，才允许对应方向裁剪，避免误裁主体。
+            if top > 0 and row_top_edge > row_core * 0.68:
+                top = 0
+            if bottom < h and row_bottom_edge > row_core * 0.68:
+                bottom = h
+
+            row_trim_ratio = (top + (h - bottom)) / float(max(1, h))
+            if row_trim_ratio >= 0.18:
+                # 已经识别出明显上下黑边时，不再做左右裁剪，避免中心人像被误裁。
+                left, right = 0, w
+            else:
+                if left > 0 and col_left_edge > col_core * 0.62:
+                    left = 0
+                if right < w and col_right_edge > col_core * 0.62:
+                    right = w
+
+            min_h = max(24, int(round(h * 0.30)))
+            min_w = max(24, int(round(w * 0.30)))
+            if bottom - top < min_h:
+                top, bottom = 0, h
+            if right - left < min_w:
+                left, right = 0, w
+
+            if (bottom - top) >= int(h * 0.98) and (right - left) >= int(w * 0.98):
+                return rgb
+
+            cropped = arr[top:bottom, left:right]
+            if cropped.size == 0:
+                return rgb
+            return Image.fromarray(cropped)
+        except Exception:
+            return img.convert("RGB")
 
     def build_frame_index(self, sample_interval: float = 1.0):
         """预建帧索引：提取所有源视频的帧 pHash"""
-        index_file = self.cache_dir / "frame_index_v6.pkl"
+        interval = max(0.1, float(sample_interval))
+        interval_tag = f"{interval:.3f}".rstrip("0").rstrip(".").replace(".", "p")
+        preprocess_tag = f"ppv{int(getattr(self, 'phash_preprocess_version', 1))}"
+        index_file = self.cache_dir / f"frame_index_v6_si{interval_tag}_{preprocess_tag}.pkl"
+        legacy_index_file = self.cache_dir / "frame_index_v6.pkl"
 
         if index_file.exists():
             print(f"\n📂 加载已有帧索引: {index_file}")
@@ -701,13 +1294,24 @@ class FastHighPrecisionReconstructor:
             total_frames = sum(len(v) for v in self.frame_index.values())
             print(f"   ✅ 已索引 {len(self.frame_index)} 个视频，共 {total_frames} 帧")
             return
+        if (
+            abs(interval - 1.0) < 1e-9
+            and int(getattr(self, "phash_preprocess_version", 1)) <= 1
+            and legacy_index_file.exists()
+        ):
+            print(f"\n📂 加载已有帧索引: {legacy_index_file} (legacy)")
+            with open(legacy_index_file, 'rb') as f:
+                self.frame_index = pickle.load(f)
+            total_frames = sum(len(v) for v in self.frame_index.values())
+            print(f"   ✅ 已索引 {len(self.frame_index)} 个视频，共 {total_frames} 帧")
+            return
 
-        print(f"\n🔨 构建帧索引 (采样间隔: {sample_interval}s)...")
+        print(f"\n🔨 构建帧索引 (采样间隔: {interval}s)...")
         for i, video_path in enumerate(self.source_videos):
             print(f"   [{i+1}/{len(self.source_videos)}] {video_path.name}")
             duration = self.get_video_duration(video_path)
             frames = []
-            for t in np.arange(0, duration, sample_interval):
+            for t in np.arange(0, duration, interval):
                 img = self.extract_frame_to_pil(video_path, t)
                 if img:
                     frames.append((t, self.compute_phash(img)))
@@ -727,16 +1331,25 @@ class FastHighPrecisionReconstructor:
             return []
         target_phash = self.compute_phash(target_img)
 
-        candidates = []
-        for video_path, frames in self.frame_index.items():
-            for time_sec, phash in frames:
-                distance = target_phash - phash
-                if distance <= 18:
-                    similarity = 1.0 - (distance / 64.0)
-                    candidates.append((video_path, time_sec, similarity))
+        def collect(include_secondary: bool) -> List[Tuple[Path, float, float]]:
+            allowed = {self._source_key(p) for p in self._candidate_source_videos(include_secondary=include_secondary)}
+            found: List[Tuple[Path, float, float]] = []
+            for video_path, frames in self.frame_index.items():
+                video_path = Path(video_path)
+                if self._source_key(video_path) not in allowed:
+                    continue
+                for time_sec, phash in frames:
+                    distance = target_phash - phash
+                    if distance <= 18:
+                        similarity = 1.0 - (distance / 64.0)
+                        found.append((video_path, time_sec, similarity))
+            found.sort(key=lambda x: x[2], reverse=True)
+            return found[:top_k]
 
-        candidates.sort(key=lambda x: x[2], reverse=True)
-        return candidates[:top_k]
+        candidates = collect(include_secondary=False)
+        if (not candidates) and self.secondary_source_videos:
+            candidates = collect(include_secondary=True)
+        return candidates
 
     def precompute_fingerprints(self):
         """预计算所有音频指纹"""
@@ -827,15 +1440,21 @@ class FastHighPrecisionReconstructor:
             return self.find_best_match_by_visual(target_start, duration, seg_index)
 
         audio_candidates = []
-        for source in self.source_videos:
-            source_duration = self.get_video_duration(source)
-            for start_sec in range(0, int(source_duration - duration), 1):
-                source_fp = extract_chromaprint(source, start_sec, duration)
-                if not source_fp or len(source_fp) < 10:
-                    continue
-                score = compare_chromaprint(target_fp, source_fp)
-                if score > 0.40:
-                    audio_candidates.append((source, start_sec, score))
+
+        def collect_audio_candidates(sources: List[Path]) -> None:
+            for source in sources:
+                source_duration = self.get_video_duration(source)
+                for start_sec in range(0, int(source_duration - duration), 1):
+                    source_fp = extract_chromaprint(source, start_sec, duration)
+                    if not source_fp or len(source_fp) < 10:
+                        continue
+                    score = compare_chromaprint(target_fp, source_fp)
+                    if score > 0.40:
+                        audio_candidates.append((source, start_sec, score))
+
+        collect_audio_candidates(self._candidate_source_videos(include_secondary=False))
+        if (not audio_candidates) and self.secondary_source_videos:
+            collect_audio_candidates(self._candidate_source_videos(include_secondary=True))
 
         if not audio_candidates:
             return self.find_best_match_by_visual(target_start, duration, seg_index)
@@ -950,38 +1569,45 @@ class FastHighPrecisionReconstructor:
         if not target_frames:
             return None, 0, 0
         
-        # 遍历所有源视频
-        for source in self.source_videos:
-            source_duration = self.get_video_duration(source)
-            
-            # 扩大搜索范围：在目标时间点附近搜索（±60秒）
-            search_start = max(0, int(target_start - 60))
-            search_end = min(int(source_duration - duration), int(target_start + 60))
-            
-            # 滑动搜索（步长2秒，更精细）
-            for start_sec in range(search_start, search_end, 2):
-                total_sim = 0
-                valid_frames = 0
+        source_passes: List[List[Path]] = [self._candidate_source_videos(include_secondary=False)]
+        if self.secondary_source_videos:
+            source_passes.append(list(self.secondary_source_videos))
 
-                for offset, target_frame in target_frames:
-                    source_frame = self.get_cached_frame_path(source, start_sec + offset)
-                    if source_frame and source_frame.exists():
-                        sim = self.calculate_frame_similarity(target_frame, source_frame)
-                        total_sim += sim
-                        valid_frames += 1
+        # 遍历所有源视频（优先主源，必要时再回退次级救援源）
+        for source_group in source_passes:
+            for source in source_group:
+                source_duration = self.get_video_duration(source)
                 
-                if valid_frames > 0:
-                    avg_sim = total_sim / valid_frames
-                    if avg_sim > best_score:
-                        best_score = avg_sim
-                        best_start = start_sec
-                        best_source = source
+                # 扩大搜索范围：在目标时间点附近搜索（±60秒）
+                search_start = max(0, int(target_start - 60))
+                search_end = min(int(source_duration - duration), int(target_start + 60))
                 
-                # 提前退出条件
+                # 滑动搜索（步长2秒，更精细）
+                for start_sec in range(search_start, search_end, 2):
+                    total_sim = 0
+                    valid_frames = 0
+
+                    for offset, target_frame in target_frames:
+                        source_frame = self.get_cached_frame_path(source, start_sec + offset)
+                        if source_frame and source_frame.exists():
+                            sim = self.calculate_frame_similarity(target_frame, source_frame)
+                            total_sim += sim
+                            valid_frames += 1
+                    
+                    if valid_frames > 0:
+                        avg_sim = total_sim / valid_frames
+                        if avg_sim > best_score:
+                            best_score = avg_sim
+                            best_start = start_sec
+                            best_source = source
+                    
+                    # 提前退出条件
+                    if best_score > 0.90:
+                        break
+                
                 if best_score > 0.90:
                     break
-            
-            if best_score > 0.90:
+            if best_source is not None and best_score >= 0.75:
                 break
         
         # 只有相似度足够高才返回
@@ -1301,7 +1927,132 @@ class FastHighPrecisionReconstructor:
         return features
     
     def process_segment(self, task: SegmentTask) -> SegmentResult:
-        """处理单个段 - 音频+画面结合匹配，失败时用目标视频兜底"""
+        """处理单个段 - 音频+画面结合匹配"""
+
+        def source_tail_risky(src: Path, src_start: float) -> Tuple[bool, float]:
+            """
+            判定候选是否命中源片尾高风险区间。
+            返回 (是否高风险, 片尾剩余秒数)。
+            """
+            if not bool(getattr(self, "source_tail_safety_enabled", True)):
+                return False, 999.0
+            if src == self.target_video:
+                return False, 999.0
+            margin = max(0.0, float(getattr(self, "source_tail_safety_margin", 0.0)))
+            if margin <= 1e-6:
+                return False, 999.0
+            if self.target_duration > 0:
+                ignore_tail = max(0.0, float(getattr(self, "source_tail_safety_target_tail_ignore_sec", 0.0)))
+                if float(task.target_start) >= max(0.0, float(self.target_duration - ignore_tail)):
+                    return False, 999.0
+            src_duration = self.get_video_duration(src)
+            if src_duration <= 0.0:
+                return False, 999.0
+            tail_left = float(src_duration - (float(src_start) + float(task.duration)))
+            return bool(tail_left < margin), float(tail_left)
+
+        def try_rescue(
+            reason: str,
+            combined_hint: float,
+            avoid_tail_risky: bool = False,
+        ) -> Optional[Tuple[Path, float, Dict[str, object]]]:
+            """
+            禁用目标兜底时的候选重救：
+            从 pHash 候选里挑“画面核验 + 音频守卫 +（尾段时）尾段守卫”均通过的最佳段。
+            """
+            candidates = self.find_match_by_phash(
+                task.target_start,
+                task.duration,
+                seg_index=task.index,
+                top_k=40,
+            )
+            if not candidates:
+                return None
+
+            best_item: Optional[Tuple[Path, float, Dict[str, object]]] = None
+            best_rank = -1.0
+            seen: Set[Tuple[str, float]] = set()
+            for cand_source, cand_start, phash_sim in candidates:
+                if cand_source == self.target_video:
+                    continue
+                sig = (str(cand_source), round(float(cand_start), 3))
+                if sig in seen:
+                    continue
+                seen.add(sig)
+
+                refined_start, refined_score = self.refine_start_by_visual(
+                    source=cand_source,
+                    initial_start=float(cand_start),
+                    target_start=float(task.target_start),
+                    duration=float(task.duration),
+                )
+                verify_passed, verify_avg = self.quick_verify(
+                    cand_source,
+                    float(refined_start),
+                    float(task.target_start),
+                    float(task.duration),
+                )
+                if not verify_passed:
+                    continue
+
+                tail_risky, tail_left = source_tail_risky(cand_source, float(refined_start))
+                if avoid_tail_risky and tail_risky:
+                    continue
+
+                tail_avg = verify_avg
+                if self.target_duration > 0 and task.target_start >= (self.target_duration - self.tail_guard_seconds):
+                    offsets = [
+                        0.0,
+                        task.duration * 0.25,
+                        task.duration * 0.5,
+                        task.duration * 0.75,
+                        max(0.0, task.duration - 0.1),
+                    ]
+                    tail_passed, tail_avg = self.verify_segment_visual(
+                        cand_source,
+                        float(refined_start),
+                        float(task.target_start),
+                        float(task.duration),
+                        offsets=offsets,
+                        min_avg=self.tail_verify_min_avg,
+                        min_floor=self.tail_verify_min_floor,
+                    )
+                    if not tail_passed:
+                        continue
+
+                audio_passed = True
+                audio_meta: Dict[str, object] = {"checked": False}
+                if cand_source != self.target_video:
+                    audio_passed, audio_meta = self.quick_verify_audio(
+                        source=cand_source,
+                        source_start=float(refined_start),
+                        target_start=float(task.target_start),
+                        duration=float(task.duration),
+                        combined_score=max(float(combined_hint), float(verify_avg)),
+                    )
+                if not audio_passed:
+                    continue
+
+                rank = float(verify_avg) * 0.75 + float(phash_sim) * 0.20 + float(refined_score) * 0.05
+                if rank <= best_rank:
+                    continue
+
+                best_rank = rank
+                best_item = (
+                    cand_source,
+                    float(refined_start),
+                    {
+                        "triggered": True,
+                        "reason": reason,
+                        "verify_avg": float(verify_avg),
+                        "tail_avg": float(tail_avg),
+                        "phash_similarity": float(phash_sim),
+                        "start_refine_score": float(refined_score),
+                        "audio_guard": audio_meta,
+                        "tail_left_sec": float(tail_left),
+                    },
+                )
+            return best_item
 
         # 音频+画面结合匹配
         source, source_start, combined_score = self.find_match_combined(
@@ -1347,31 +2098,105 @@ class FastHighPrecisionReconstructor:
             }
             source_start = float(refined_start)
 
-        if not source or combined_score < 0.70:
-            # 兜底：使用目标视频本身对应时间段
-            print(f"   段 {task.index + 1}/{self.total_segments} ⚠️ 匹配失败 (score={combined_score:.2f})，使用目标视频兜底")
-            return SegmentResult(
-                index=task.index,
-                success=True,
-                source=self.target_video,
-                source_start=task.target_start,
-                quality={
-                    **quality,
-                    "combined": 0.0,
-                    "fallback": True,
-                    "fallback_reason": "match_failed_low_score",
-                }
-            )
+        if source and source != self.target_video:
+            tail_risky, tail_left = source_tail_risky(source, float(source_start))
+            quality["source_tail_safety"] = {
+                "checked": True,
+                "risky": bool(tail_risky),
+                "tail_left_sec": float(tail_left),
+            }
+            if tail_risky:
+                rescue = try_rescue("source_tail_risky", float(combined_score), avoid_tail_risky=True)
+                if rescue is not None:
+                    rescue_verify = float((rescue[2] or {}).get("verify_avg", combined_score))
+                    min_gain = max(0.0, float(getattr(self, "source_tail_safety_switch_min_gain", 0.0)))
+                    # 仅当“确实抽不满（tail_left<0）”时，才允许无条件切换；
+                    # 对仍可抽满但靠近片尾的情况，必须满足明显收益，避免提前跳源导致错序。
+                    severe_tail_shortfall = float(tail_left) < -1e-3
+                    allow_switch = severe_tail_shortfall or (rescue_verify >= float(combined_score) + min_gain)
+                    tail_locked = bool(float(tail_left) <= max(0.20, float(task.duration) * 0.10))
+                    hard_escape_floor = max(0.78, float(combined_score) - 0.16)
+                    # 硬切仅用于“当前候选已无法抽满（tail_left<0）”的真实短缺场景。
+                    # 对仅“贴近片尾但仍可抽满”的候选，不再用硬切强行换源，避免引入内容缺失。
+                    hard_escape_tail = bool(
+                        severe_tail_shortfall
+                        and tail_locked
+                        and (rescue_verify >= hard_escape_floor)
+                    )
+                    if (not allow_switch) and hard_escape_tail:
+                        allow_switch = True
+                        quality["source_tail_safety"]["hard_escape_tail_locked"] = True
+                        quality["source_tail_safety"]["hard_escape_floor"] = float(hard_escape_floor)
+                    else:
+                        quality["source_tail_safety"]["hard_escape_tail_locked"] = False
+                    soft_force_margin = max(
+                        0.0,
+                        float(
+                            getattr(
+                                self,
+                                "source_tail_safety_soft_force_margin",
+                                max(0.12, float(getattr(self, "source_tail_safety_margin", 0.0)) * 0.8),
+                            )
+                        ),
+                    )
+                    soft_force_max_drop = max(
+                        0.0,
+                        float(getattr(self, "source_tail_safety_soft_force_max_drop", 0.03)),
+                    )
+                    soft_force_tail = bool(float(tail_left) <= soft_force_margin)
+                    # 软切换：近尾风险很高时，允许小幅收益不足但不显著变差的候选切换。
+                    if (
+                        (not allow_switch)
+                        and soft_force_tail
+                        and (rescue_verify >= float(combined_score) - soft_force_max_drop)
+                    ):
+                        allow_switch = True
+                        quality["source_tail_safety"]["soft_forced"] = True
+                        quality["source_tail_safety"]["soft_force_margin_sec"] = float(soft_force_margin)
+                        quality["source_tail_safety"]["soft_force_max_drop"] = float(soft_force_max_drop)
+                    else:
+                        quality["source_tail_safety"]["soft_forced"] = False
 
-        # 通用防误匹配：段级画面快速核验，失败则回退目标片段
-        if self.strict_visual_verify:
-            passed, verify_avg = self.quick_verify(source, source_start, task.target_start, task.duration)
-            quality["strict_verify"] = {"passed": bool(passed), "avg": float(verify_avg)}
-            if not passed:
-                print(
-                    f"   段 {task.index + 1}/{self.total_segments} ⚠️ 画面核验失败 "
-                    f"(avg={verify_avg:.2f})，回退目标视频"
-                )
+                    # 跨源大跳变额外约束：防止片尾安全切换把段错误切到另一个时间带。
+                    # 这里用“起点跳变量”做近似（同一 target_start 下等价于 mapping jump）。
+                    if allow_switch and (rescue[0] != source):
+                        rescue_start = float(rescue[1])
+                        jump_sec = abs(float(rescue_start) - float(source_start))
+                        jump_limit = max(1.2, float(task.duration) * 0.35)
+                        if jump_sec > jump_limit and (not severe_tail_shortfall) and (not hard_escape_tail):
+                            # 无明确短缺时，跨源大跳变必须有更高收益才允许。
+                            extra_gain = max(0.08, min_gain * 2.0)
+                            if rescue_verify < float(combined_score) + extra_gain:
+                                allow_switch = False
+                                quality["source_tail_safety"]["switched"] = False
+                                quality["source_tail_safety"]["switch_reason"] = "nonlocal_jump_gain_insufficient"
+                                quality["source_tail_safety"]["jump_sec"] = float(jump_sec)
+                                quality["source_tail_safety"]["jump_limit_sec"] = float(jump_limit)
+                        elif jump_sec > jump_limit and hard_escape_tail:
+                            quality["source_tail_safety"]["nonlocal_jump_overridden_by_hard_escape"] = True
+                    if allow_switch:
+                        source, source_start, rescue_meta = rescue
+                        quality["rescue"] = rescue_meta
+                        quality["source_tail_safety"]["switched"] = True
+                        if hard_escape_tail:
+                            quality["source_tail_safety"]["switch_reason"] = "avoid_source_tail_risky_hard_escape"
+                        elif bool(quality["source_tail_safety"].get("soft_forced", False)):
+                            quality["source_tail_safety"]["switch_reason"] = "avoid_source_tail_risky_soft_force"
+                        else:
+                            quality["source_tail_safety"]["switch_reason"] = "avoid_source_tail_risky"
+                        quality["source_tail_safety"]["switched_tail_left_sec"] = float(rescue_meta.get("tail_left_sec", 999.0))
+                        quality["combined"] = max(float(quality.get("combined", 0.0)), float(rescue_meta.get("verify_avg", 0.0)))
+                        combined_score = max(float(combined_score), float(rescue_meta.get("verify_avg", 0.0)))
+                    else:
+                        quality["source_tail_safety"]["switched"] = False
+                        quality["source_tail_safety"]["switch_reason"] = "candidate_gain_insufficient"
+                else:
+                    quality["source_tail_safety"]["switched"] = False
+
+        if not source or combined_score < 0.70:
+            if self.enable_target_video_fallback:
+                # 兜底：使用目标视频本身对应时间段
+                print(f"   段 {task.index + 1}/{self.total_segments} ⚠️ 匹配失败 (score={combined_score:.2f})，使用目标视频兜底")
                 return SegmentResult(
                     index=task.index,
                     success=True,
@@ -1381,9 +2206,89 @@ class FastHighPrecisionReconstructor:
                         **quality,
                         "combined": 0.0,
                         "fallback": True,
-                        "fallback_reason": "strict_visual_verify_failed",
+                        "fallback_reason": "match_failed_low_score",
+                    }
+                )
+            rescue = try_rescue("match_failed_low_score", float(combined_score))
+            if rescue is not None:
+                source, source_start, rescue_meta = rescue
+                quality["rescue"] = rescue_meta
+                quality["combined"] = max(float(quality.get("combined", 0.0)), float(rescue_meta.get("verify_avg", 0.0)))
+                combined_score = max(float(combined_score), float(rescue_meta.get("verify_avg", 0.0)))
+                quality["start_refine"] = {
+                    "before": float(source_start),
+                    "after": float(source_start),
+                    "score": float(rescue_meta.get("start_refine_score", 0.0)),
+                }
+                quality["audio_guard"] = rescue_meta.get("audio_guard", {"checked": False})
+                quality["strict_verify"] = {"passed": True, "avg": float(rescue_meta.get("verify_avg", 0.0))}
+                print(
+                    f"   段 {task.index + 1}/{self.total_segments} 🔄 候选重救成功 "
+                    f"({source.name} @ {source_start:.3f}s, avg={float(rescue_meta.get('verify_avg', 0.0)):.2f})"
+                )
+            else:
+                print(
+                    f"   段 {task.index + 1}/{self.total_segments} ❌ 匹配失败 "
+                    f"(score={combined_score:.2f})，且已禁用目标素材兜底"
+                )
+                return SegmentResult(
+                    index=task.index,
+                    success=False,
+                    quality={
+                        **quality,
+                        "combined": float(combined_score),
+                        "fallback_blocked": True,
+                        "fallback_reason": "match_failed_no_target_fallback",
                     },
                 )
+
+        # 通用防误匹配：段级画面快速核验，失败则回退目标片段
+        if self.strict_visual_verify:
+            passed, verify_avg = self.quick_verify(source, source_start, task.target_start, task.duration)
+            quality["strict_verify"] = {"passed": bool(passed), "avg": float(verify_avg)}
+            if not passed:
+                if self.enable_target_video_fallback:
+                    print(
+                        f"   段 {task.index + 1}/{self.total_segments} ⚠️ 画面核验失败 "
+                        f"(avg={verify_avg:.2f})，回退目标视频"
+                    )
+                    return SegmentResult(
+                        index=task.index,
+                        success=True,
+                        source=self.target_video,
+                        source_start=task.target_start,
+                        quality={
+                            **quality,
+                            "combined": 0.0,
+                            "fallback": True,
+                            "fallback_reason": "strict_visual_verify_failed",
+                        },
+                    )
+                rescue = try_rescue("strict_visual_verify_failed", float(combined_score))
+                if rescue is not None:
+                    source, source_start, rescue_meta = rescue
+                    quality["rescue"] = rescue_meta
+                    quality["strict_verify"] = {"passed": True, "avg": float(rescue_meta.get("verify_avg", verify_avg))}
+                    quality["combined"] = max(float(quality.get("combined", 0.0)), float(rescue_meta.get("verify_avg", 0.0)))
+                    quality["audio_guard"] = rescue_meta.get("audio_guard", {"checked": False})
+                    print(
+                        f"   段 {task.index + 1}/{self.total_segments} 🔄 画面失败后重救成功 "
+                        f"({source.name} @ {source_start:.3f}s, avg={float(rescue_meta.get('verify_avg', 0.0)):.2f})"
+                    )
+                else:
+                    print(
+                        f"   段 {task.index + 1}/{self.total_segments} ❌ 画面核验失败 "
+                        f"(avg={verify_avg:.2f})，且已禁用目标素材兜底"
+                    )
+                    return SegmentResult(
+                        index=task.index,
+                        success=False,
+                        quality={
+                            **quality,
+                            "fallback_blocked": True,
+                            "fallback_reason": "strict_visual_verify_failed_no_target_fallback",
+                        },
+                    )
 
         # 轻量音频守卫：拦截“画面相似但语音错位”的段。
         if source != self.target_video:
@@ -1399,22 +2304,63 @@ class FastHighPrecisionReconstructor:
                 aligned_sim = float(audio_meta.get("aligned_similarity", 0.0))
                 best_shift = float(audio_meta.get("best_shift_sec", 0.0))
                 reason = str(audio_meta.get("reason", "audio_guard_failed"))
-                print(
-                    f"   段 {task.index + 1}/{self.total_segments} ⚠️ 音频守卫失败 "
-                    f"(sim={aligned_sim:.2f}, shift={best_shift:+.1f}s, reason={reason})，回退目标视频"
+                if self.enable_target_video_fallback:
+                    print(
+                        f"   段 {task.index + 1}/{self.total_segments} ⚠️ 音频守卫失败 "
+                        f"(sim={aligned_sim:.2f}, shift={best_shift:+.1f}s, reason={reason})，回退目标视频"
+                    )
+                    return SegmentResult(
+                        index=task.index,
+                        success=True,
+                        source=self.target_video,
+                        source_start=task.target_start,
+                        quality={
+                            **quality,
+                            "combined": 0.0,
+                            "fallback": True,
+                            "fallback_reason": reason,
+                        },
+                    )
+                rescue = try_rescue(reason, float(combined_score))
+                if rescue is not None:
+                    source, source_start, rescue_meta = rescue
+                    quality["rescue"] = rescue_meta
+                    quality["audio_guard"] = rescue_meta.get("audio_guard", {"checked": False})
+                    quality["combined"] = max(float(quality.get("combined", 0.0)), float(rescue_meta.get("verify_avg", 0.0)))
+                    print(
+                        f"   段 {task.index + 1}/{self.total_segments} 🔄 音频失败后重救成功 "
+                        f"({source.name} @ {source_start:.3f}s)"
+                    )
+                else:
+                    print(
+                        f"   段 {task.index + 1}/{self.total_segments} ❌ 音频守卫失败 "
+                        f"(sim={aligned_sim:.2f}, shift={best_shift:+.1f}s, reason={reason})，且已禁用目标素材兜底"
+                    )
+                    return SegmentResult(
+                        index=task.index,
+                        success=False,
+                        quality={
+                            **quality,
+                            "fallback_blocked": True,
+                            "fallback_reason": f"{reason}_no_target_fallback",
+                        },
+                    )
+            else:
+                shifted_start, shift_meta, shifted_audio_meta = self.try_audio_guard_shift_realign(
+                    source=source,
+                    source_start=float(source_start),
+                    target_start=float(task.target_start),
+                    duration=float(task.duration),
+                    combined_score=float(quality.get("combined", combined_score)),
+                    audio_meta=audio_meta,
                 )
-                return SegmentResult(
-                    index=task.index,
-                    success=True,
-                    source=self.target_video,
-                    source_start=task.target_start,
-                    quality={
-                        **quality,
-                        "combined": 0.0,
-                        "fallback": True,
-                        "fallback_reason": reason,
-                    },
-                )
+                quality["audio_guard_shift_fix"] = shift_meta
+                if bool(shift_meta.get("applied", False)):
+                    source_start = float(shifted_start)
+                    if isinstance(shifted_audio_meta, dict):
+                        quality["audio_guard"] = shifted_audio_meta
+                    combined_score = max(float(combined_score), float(shift_meta.get("candidate_verify_avg", 0.0)))
+                    quality["combined"] = max(float(quality.get("combined", 0.0)), float(combined_score))
 
         # 通用尾段守卫：末尾更严格核验，防止尾段误匹配导致“内容回跳”
         if self.target_duration > 0 and task.target_start >= (self.target_duration - self.tail_guard_seconds):
@@ -1430,22 +2376,48 @@ class FastHighPrecisionReconstructor:
             )
             quality["tail_verify"] = {"passed": bool(tail_passed), "avg": float(tail_avg)}
             if not tail_passed:
-                print(
-                    f"   段 {task.index + 1}/{self.total_segments} ⚠️ 尾段守卫失败 "
-                    f"(avg={tail_avg:.2f})，回退目标视频"
-                )
-                return SegmentResult(
-                    index=task.index,
-                    success=True,
-                    source=self.target_video,
-                    source_start=task.target_start,
-                    quality={
-                        **quality,
-                        "combined": 0.0,
-                        "fallback": True,
-                        "fallback_reason": "tail_guard_failed",
-                    },
-                )
+                if self.enable_target_video_fallback:
+                    print(
+                        f"   段 {task.index + 1}/{self.total_segments} ⚠️ 尾段守卫失败 "
+                        f"(avg={tail_avg:.2f})，回退目标视频"
+                    )
+                    return SegmentResult(
+                        index=task.index,
+                        success=True,
+                        source=self.target_video,
+                        source_start=task.target_start,
+                        quality={
+                            **quality,
+                            "combined": 0.0,
+                            "fallback": True,
+                            "fallback_reason": "tail_guard_failed",
+                        },
+                    )
+                rescue = try_rescue("tail_guard_failed", float(combined_score))
+                if rescue is not None:
+                    source, source_start, rescue_meta = rescue
+                    quality["rescue"] = rescue_meta
+                    quality["tail_verify"] = {"passed": True, "avg": float(rescue_meta.get("tail_avg", tail_avg))}
+                    quality["audio_guard"] = rescue_meta.get("audio_guard", {"checked": False})
+                    quality["combined"] = max(float(quality.get("combined", 0.0)), float(rescue_meta.get("verify_avg", 0.0)))
+                    print(
+                        f"   段 {task.index + 1}/{self.total_segments} 🔄 尾段失败后重救成功 "
+                        f"({source.name} @ {source_start:.3f}s)"
+                    )
+                else:
+                    print(
+                        f"   段 {task.index + 1}/{self.total_segments} ❌ 尾段守卫失败 "
+                        f"(avg={tail_avg:.2f})，且已禁用目标素材兜底"
+                    )
+                    return SegmentResult(
+                        index=task.index,
+                        success=False,
+                        quality={
+                            **quality,
+                            "fallback_blocked": True,
+                            "fallback_reason": "tail_guard_failed_no_target_fallback",
+                        },
+                    )
 
         print(f"   段 {task.index + 1}/{self.total_segments} ✅ {source.name} @ {source_start}s (综合: {combined_score:.2f})")
 
@@ -1456,6 +2428,509 @@ class FastHighPrecisionReconstructor:
             source_start=source_start,
             quality=quality
         )
+
+    def recover_segment_from_neighbors(
+        self,
+        index: int,
+        tasks: List[SegmentTask],
+        confirmed_by_index: Dict[int, dict],
+    ) -> Optional[dict]:
+        """
+        在禁用目标兜底时，尝试用邻段时间轴插值恢复缺失段，避免直接输出错序。
+        """
+        if index < 0 or index >= len(tasks):
+            return None
+        task = tasks[index]
+
+        def find_prev() -> Tuple[Optional[dict], Optional[int]]:
+            j = index - 1
+            while j >= 0:
+                seg = confirmed_by_index.get(j)
+                if seg is not None and seg.get("source") is not None and seg.get("source") != self.target_video:
+                    return seg, j
+                j -= 1
+            return None, None
+
+        def find_next() -> Tuple[Optional[dict], Optional[int]]:
+            j = index + 1
+            while j < len(tasks):
+                seg = confirmed_by_index.get(j)
+                if seg is not None and seg.get("source") is not None and seg.get("source") != self.target_video:
+                    return seg, j
+                j += 1
+            return None, None
+
+        prev_seg, _ = find_prev()
+        next_seg, _ = find_next()
+        candidates: List[Tuple[Path, float, str]] = []
+
+        def clamp_start_by_neighbor_bounds(src: Path, raw_start: float) -> Tuple[float, Dict[str, object]]:
+            """
+            将候选起点限制在“同源前后邻段”允许窗口内。
+            若窗口出现反转（说明当前段时窗被挤压，不可完全无重叠放入），
+            则落到窗口中点，把不可避免的重叠尽量均摊到两侧，降低单侧重读感。
+            """
+            src_duration = self.get_video_duration(src)
+            max_start = max(0.0, float(src_duration - float(task.duration)))
+            start = max(0.0, min(float(raw_start), max_start))
+
+            overlap_allow = max(0.35, float(task.duration) * 0.07)
+            lower_bound: Optional[float] = None
+            upper_bound: Optional[float] = None
+            if prev_seg is not None and prev_seg.get("source") == src:
+                lower_bound = float(prev_seg["start"]) + float(prev_seg["duration"]) - overlap_allow
+            if next_seg is not None and next_seg.get("source") == src:
+                upper_bound = float(next_seg["start"]) - float(task.duration) + overlap_allow
+
+            compressed_window = False
+            if lower_bound is not None and upper_bound is not None and lower_bound > (upper_bound + 1e-6):
+                compressed_window = True
+                start = 0.5 * (float(lower_bound) + float(upper_bound))
+            else:
+                if lower_bound is not None:
+                    start = max(float(start), float(lower_bound))
+                if upper_bound is not None:
+                    start = min(float(start), float(upper_bound))
+
+            start = max(0.0, min(float(start), max_start))
+            return float(start), {
+                "lower_bound": float(lower_bound) if lower_bound is not None else None,
+                "upper_bound": float(upper_bound) if upper_bound is not None else None,
+                "compressed_window": bool(compressed_window),
+            }
+
+        def boundary_excess_penalty(src: Path, start: float) -> float:
+            """
+            计算候选在同源邻段边界上的“超限量”。
+            用于候选排序，优先避免把重叠/断缝集中到单侧。
+            """
+            penalty = 0.0
+
+            if prev_seg is not None and prev_seg.get("source") == src:
+                prev_end = float(prev_seg["start"]) + float(prev_seg["duration"])
+                gap_prev = float(start) - prev_end
+                neg_trigger = max(0.12, float(task.duration) * 0.02)
+                pos_trigger = max(0.20, float(task.duration) * 0.04)
+                if gap_prev < -neg_trigger:
+                    penalty += float((-gap_prev) - neg_trigger)
+                elif gap_prev > pos_trigger:
+                    penalty += float(gap_prev - pos_trigger) * 0.65
+
+            if next_seg is not None and next_seg.get("source") == src:
+                curr_end = float(start) + float(task.duration)
+                gap_next = float(next_seg["start"]) - curr_end
+                next_duration = float(next_seg.get("duration", task.duration))
+                neg_trigger = max(0.12, next_duration * 0.02)
+                pos_trigger = max(0.20, next_duration * 0.04)
+                if gap_next < -neg_trigger:
+                    penalty += float((-gap_next) - neg_trigger)
+                elif gap_next > pos_trigger:
+                    penalty += float(gap_next - pos_trigger) * 0.65
+
+            return float(max(0.0, penalty))
+
+        def verify_for_missing_recovery(src: Path, src_start: float) -> Tuple[bool, float, bool]:
+            """
+            缺失段恢复核验：
+            先走严格 quick_verify；若失败，再走仅用于缺失恢复的宽松多点核验。
+            返回: (是否通过, 分数, 是否走了宽松核验)。
+            """
+            strict_passed, strict_avg = self.quick_verify(
+                src,
+                float(src_start),
+                float(task.target_start),
+                float(task.duration),
+            )
+            if strict_passed:
+                return True, float(strict_avg), False
+
+            offsets = [
+                0.0,
+                task.duration * 0.25,
+                task.duration * 0.5,
+                task.duration * 0.75,
+                max(0.0, task.duration - 0.1),
+            ]
+            relaxed_min_avg = max(0.76, float(self.strict_verify_min_sim) - 0.02)
+            relaxed_min_floor = max(0.58, relaxed_min_avg - 0.20)
+            relaxed_passed, relaxed_avg = self.verify_segment_visual(
+                src,
+                float(src_start),
+                float(task.target_start),
+                float(task.duration),
+                offsets=offsets,
+                min_avg=relaxed_min_avg,
+                min_floor=relaxed_min_floor,
+            )
+            return bool(relaxed_passed), float(relaxed_avg), True
+
+        if prev_seg is not None and next_seg is not None and prev_seg["source"] == next_seg["source"]:
+            prev_t = float(prev_seg["target_start"])
+            next_t = float(next_seg["target_start"])
+            if next_t > prev_t + 1e-6:
+                ratio = (float(task.target_start) - prev_t) / (next_t - prev_t)
+                ratio = max(0.0, min(1.0, ratio))
+                interp_start = float(prev_seg["start"]) + (float(next_seg["start"]) - float(prev_seg["start"])) * ratio
+                candidates.append((prev_seg["source"], interp_start, "neighbors_interp"))
+
+        if prev_seg is not None:
+            extrap_prev = float(prev_seg["start"]) + (float(task.target_start) - float(prev_seg["target_start"]))
+            candidates.append((prev_seg["source"], extrap_prev, "prev_extrap"))
+        if next_seg is not None:
+            extrap_next = float(next_seg["start"]) - (float(next_seg["target_start"]) - float(task.target_start))
+            candidates.append((next_seg["source"], extrap_next, "next_extrap"))
+
+        checked: Set[Tuple[str, float]] = set()
+        for source, raw_start, mode in candidates:
+            if source is None or source == self.target_video or raw_start < 0:
+                continue
+            if self._is_secondary_source(Path(source)):
+                continue
+            sig = (str(source), round(float(raw_start), 3))
+            if sig in checked:
+                continue
+            checked.add(sig)
+
+            bounded_start, bound_meta = clamp_start_by_neighbor_bounds(source, float(raw_start))
+
+            refined_start, refine_score = self.refine_start_by_visual(
+                source=source,
+                initial_start=float(bounded_start),
+                target_start=float(task.target_start),
+                duration=float(task.duration),
+            )
+            refined_start, bound_meta = clamp_start_by_neighbor_bounds(source, float(refined_start))
+            verify_passed, verify_avg, relaxed_verify = verify_for_missing_recovery(
+                source,
+                float(refined_start),
+            )
+            if not verify_passed:
+                continue
+
+            audio_passed = True
+            audio_meta: Dict[str, object] = {"checked": False}
+            if source != self.target_video:
+                audio_passed, audio_meta = self.quick_verify_audio(
+                    source=source,
+                    source_start=float(refined_start),
+                    target_start=float(task.target_start),
+                    duration=float(task.duration),
+                    combined_score=float(verify_avg),
+                )
+            if not audio_passed:
+                continue
+
+            tail_meta: Dict[str, object] = {"checked": False}
+            if self.target_duration > 0 and task.target_start >= (self.target_duration - self.tail_guard_seconds):
+                offsets = [
+                    0.0,
+                    task.duration * 0.25,
+                    task.duration * 0.5,
+                    task.duration * 0.75,
+                    max(0.0, task.duration - 0.1),
+                ]
+                tail_passed, tail_avg = self.verify_segment_visual(
+                    source,
+                    float(refined_start),
+                    float(task.target_start),
+                    float(task.duration),
+                    offsets=offsets,
+                    min_avg=self.tail_verify_min_avg,
+                    min_floor=self.tail_verify_min_floor,
+                )
+                tail_meta = {"checked": True, "passed": bool(tail_passed), "avg": float(tail_avg)}
+                if not tail_passed:
+                    continue
+
+            return {
+                "index": int(task.index),
+                "source": source,
+                "start": float(refined_start),
+                "duration": float(task.duration),
+                "target_start": float(task.target_start),
+                "quality": {
+                    "combined": float(verify_avg),
+                    "recovered_from_neighbors": True,
+                    "recover_mode": mode,
+                    "recover_verify_avg": float(verify_avg),
+                    "recover_refine_score": float(refine_score),
+                    "recover_relaxed_verify": bool(relaxed_verify),
+                    "recover_boundary_excess": float(boundary_excess_penalty(source, float(refined_start))),
+                    "recover_neighbor_bounds": bound_meta,
+                    "audio_guard": audio_meta,
+                    "tail_verify": tail_meta,
+                },
+            }
+
+        # 邻段推导未命中时，使用 pHash 全库候选做二次救援，避免直接进入“未核验强制插值”。
+        phash_candidates = self.find_match_by_phash(
+            task.target_start,
+            task.duration,
+            seg_index=task.index,
+            top_k=48,
+        )
+        best_rescue = None
+        seen_phash: Set[Tuple[str, float]] = set()
+        for source, raw_start, phash_sim in phash_candidates:
+            if source is None or source == self.target_video:
+                continue
+            if self._is_secondary_source(Path(source)):
+                continue
+
+            sig = (str(source), round(float(raw_start), 3))
+            if sig in seen_phash:
+                continue
+            seen_phash.add(sig)
+
+            bounded_start, bound_meta = clamp_start_by_neighbor_bounds(source, float(raw_start))
+
+            refined_start, refine_score = self.refine_start_by_visual(
+                source=source,
+                initial_start=float(bounded_start),
+                target_start=float(task.target_start),
+                duration=float(task.duration),
+            )
+            refined_start, bound_meta = clamp_start_by_neighbor_bounds(source, float(refined_start))
+            verify_passed, verify_avg, relaxed_verify = verify_for_missing_recovery(
+                source,
+                float(refined_start),
+            )
+            if not verify_passed:
+                continue
+
+            audio_passed = True
+            audio_meta: Dict[str, object] = {"checked": False}
+            if source != self.target_video:
+                audio_passed, audio_meta = self.quick_verify_audio(
+                    source=source,
+                    source_start=float(refined_start),
+                    target_start=float(task.target_start),
+                    duration=float(task.duration),
+                    combined_score=float(verify_avg),
+                )
+            if not audio_passed:
+                continue
+
+            tail_meta: Dict[str, object] = {"checked": False}
+            if self.target_duration > 0 and task.target_start >= (self.target_duration - self.tail_guard_seconds):
+                offsets = [
+                    0.0,
+                    task.duration * 0.25,
+                    task.duration * 0.5,
+                    task.duration * 0.75,
+                    max(0.0, task.duration - 0.1),
+                ]
+                tail_passed, tail_avg = self.verify_segment_visual(
+                    source,
+                    float(refined_start),
+                    float(task.target_start),
+                    float(task.duration),
+                    offsets=offsets,
+                    min_avg=self.tail_verify_min_avg,
+                    min_floor=self.tail_verify_min_floor,
+                )
+                tail_meta = {"checked": True, "passed": bool(tail_passed), "avg": float(tail_avg)}
+                if not tail_passed:
+                    continue
+
+            neighbor_bonus = 0.0
+            if prev_seg is not None and source == prev_seg.get("source"):
+                neighbor_bonus += 0.01
+            if next_seg is not None and source == next_seg.get("source"):
+                neighbor_bonus += 0.01
+            boundary_excess = boundary_excess_penalty(source, float(refined_start))
+            rank = (
+                float(verify_avg) * 0.78
+                + float(phash_sim) * 0.18
+                + float(refine_score) * 0.04
+                + neighbor_bonus
+                - float(boundary_excess) * 0.28
+            )
+            if best_rescue is None or rank > float(best_rescue["rank"]):
+                best_rescue = {
+                    "source": source,
+                    "start": float(refined_start),
+                    "verify_avg": float(verify_avg),
+                    "refine_score": float(refine_score),
+                    "phash_similarity": float(phash_sim),
+                    "relaxed_verify": bool(relaxed_verify),
+                    "audio_meta": audio_meta,
+                    "tail_meta": tail_meta,
+                    "boundary_excess": float(boundary_excess),
+                    "neighbor_bounds": bound_meta,
+                    "rank": float(rank),
+                }
+
+        if best_rescue is not None:
+            return {
+                "index": int(task.index),
+                "source": best_rescue["source"],
+                "start": float(best_rescue["start"]),
+                "duration": float(task.duration),
+                "target_start": float(task.target_start),
+                "quality": {
+                    "combined": float(best_rescue["verify_avg"]),
+                    "recovered_from_neighbors": True,
+                    "recover_mode": "phash_rescue_no_target_missing",
+                    "recover_verify_avg": float(best_rescue["verify_avg"]),
+                    "recover_refine_score": float(best_rescue["refine_score"]),
+                    "recover_phash_similarity": float(best_rescue["phash_similarity"]),
+                    "recover_relaxed_verify": bool(best_rescue.get("relaxed_verify", False)),
+                    "recover_boundary_excess": float(best_rescue.get("boundary_excess", 0.0)),
+                    "recover_neighbor_bounds": best_rescue.get("neighbor_bounds", {}),
+                    "audio_guard": best_rescue["audio_meta"],
+                    "tail_verify": best_rescue["tail_meta"],
+                },
+            }
+
+        # 强制邻段插值（仅同源双邻段）：
+        # 当严格核验无法通过但时间轴强连续时，优先保顺序，避免整条任务失败。
+        if prev_seg is not None and next_seg is not None and prev_seg["source"] == next_seg["source"]:
+            if self._is_secondary_source(Path(prev_seg["source"])):
+                prev_seg = None
+                next_seg = None
+        if prev_seg is not None and next_seg is not None and prev_seg["source"] == next_seg["source"]:
+            prev_t = float(prev_seg["target_start"])
+            next_t = float(next_seg["target_start"])
+            if next_t > prev_t + 1e-6:
+                # 尾段对“未核验强制插值”更敏感，容易引入重复/回放感，优先拒绝。
+                in_tail_zone = (
+                    self.target_duration > 0.0
+                    and float(task.target_start)
+                    >= max(0.0, float(self.target_duration - max(float(self.tail_guard_seconds), 20.0)))
+                )
+                ratio = (float(task.target_start) - prev_t) / (next_t - prev_t)
+                ratio = max(0.0, min(1.0, ratio))
+                forced_start = float(prev_seg["start"]) + (float(next_seg["start"]) - float(prev_seg["start"])) * ratio
+                from_prev = float(prev_seg["start"]) + (float(task.target_start) - prev_t)
+                from_next = float(next_seg["start"]) - (next_t - float(task.target_start))
+                bridge_gap = abs(from_prev - from_next)
+                bridge_tol = max(0.35, float(task.duration) * 0.08)
+                prev_q = prev_seg.get("quality", {}) or {}
+                next_q = next_seg.get("quality", {}) or {}
+                tail_force_strict_ok = (
+                    bridge_gap <= max(0.25, float(task.duration) * 0.06)
+                    and float(prev_q.get("combined", 0.0)) >= 0.88
+                    and float(next_q.get("combined", 0.0)) >= 0.88
+                )
+                if forced_start >= 0 and bridge_gap <= bridge_tol and (not in_tail_zone or tail_force_strict_ok):
+                    source_duration = self.get_video_duration(prev_seg["source"])
+                    max_start = max(0.0, float(source_duration - float(task.duration)))
+                    forced_start = max(0.0, min(float(forced_start), max_start))
+                    return {
+                        "index": int(task.index),
+                        "source": prev_seg["source"],
+                        "start": float(forced_start),
+                        "duration": float(task.duration),
+                        "target_start": float(task.target_start),
+                        "quality": {
+                            "combined": 0.0,
+                            "recovered_from_neighbors": True,
+                            "recover_mode": "neighbors_forced_no_verify",
+                            "recover_forced": True,
+                            "recover_tail_relaxed_force": bool(in_tail_zone),
+                            "recover_bridge_gap_sec": float(bridge_gap),
+                        },
+                    }
+
+        # 最后兜底（仍不使用目标素材）：
+        # 当前后同源强制插值也不可用时，允许单侧外推并做宽松核验，避免整条任务直接失败。
+        last_resort: List[Tuple[Path, float, str]] = []
+        if prev_seg is not None and prev_seg.get("source") not in (None, self.target_video):
+            if self._is_secondary_source(Path(prev_seg["source"])):
+                prev_seg = None
+        if next_seg is not None and next_seg.get("source") not in (None, self.target_video):
+            if self._is_secondary_source(Path(next_seg["source"])):
+                next_seg = None
+        if prev_seg is not None and prev_seg.get("source") not in (None, self.target_video):
+            est = float(prev_seg["start"]) + (float(task.target_start) - float(prev_seg["target_start"]))
+            last_resort.append((prev_seg["source"], est, "prev_last_resort"))
+        if next_seg is not None and next_seg.get("source") not in (None, self.target_video):
+            est = float(next_seg["start"]) - (float(next_seg["target_start"]) - float(task.target_start))
+            last_resort.append((next_seg["source"], est, "next_last_resort"))
+        if (
+            prev_seg is not None
+            and next_seg is not None
+            and prev_seg.get("source") not in (None, self.target_video)
+            and prev_seg.get("source") == next_seg.get("source")
+        ):
+            prev_map = float(prev_seg["start"]) + (float(task.target_start) - float(prev_seg["target_start"]))
+            next_map = float(next_seg["start"]) - (float(next_seg["target_start"]) - float(task.target_start))
+            balanced = 0.5 * (float(prev_map) + float(next_map))
+            last_resort.append((prev_seg["source"], balanced, "balanced_last_resort"))
+
+        best_force = None
+        seen_force: Set[Tuple[str, float]] = set()
+        for source, est_start, mode in last_resort:
+            src_duration = self.get_video_duration(source)
+            if src_duration <= 0.0:
+                continue
+            max_start = max(0.0, float(src_duration - float(task.duration)))
+            cand_start = max(0.0, min(float(est_start), max_start))
+            cand_start, bound_meta = clamp_start_by_neighbor_bounds(source, float(cand_start))
+            sig = (str(source), round(float(cand_start), 3))
+            if sig in seen_force:
+                continue
+            seen_force.add(sig)
+
+            refined_start, refine_score = self.refine_start_by_visual(
+                source=source,
+                initial_start=float(cand_start),
+                target_start=float(task.target_start),
+                duration=float(task.duration),
+            )
+            refined_start = max(0.0, min(float(refined_start), max_start))
+            refined_start, bound_meta = clamp_start_by_neighbor_bounds(source, float(refined_start))
+            offsets = [
+                0.0,
+                task.duration * 0.25,
+                task.duration * 0.5,
+                task.duration * 0.75,
+                max(0.0, task.duration - 0.1),
+            ]
+            soft_passed, soft_avg = self.verify_segment_visual(
+                source=source,
+                source_start=float(refined_start),
+                target_start=float(task.target_start),
+                duration=float(task.duration),
+                offsets=offsets,
+                min_avg=0.70,
+                min_floor=0.45,
+            )
+            if not soft_passed:
+                continue
+            boundary_excess = boundary_excess_penalty(source, float(refined_start))
+            rank = float(soft_avg) + float(refine_score) * 0.02 - float(boundary_excess) * 0.35
+            if best_force is None or rank > float(best_force["rank"]):
+                best_force = {
+                    "source": source,
+                    "start": float(refined_start),
+                    "mode": mode,
+                    "soft_avg": float(soft_avg),
+                    "boundary_excess": float(boundary_excess),
+                    "neighbor_bounds": bound_meta,
+                    "rank": float(rank),
+                }
+
+        if best_force is not None:
+            return {
+                "index": int(task.index),
+                "source": best_force["source"],
+                "start": float(best_force["start"]),
+                "duration": float(task.duration),
+                "target_start": float(task.target_start),
+                "quality": {
+                    "combined": float(best_force["soft_avg"]),
+                    "recovered_from_neighbors": True,
+                    "recover_mode": "neighbors_last_resort_no_target",
+                    "recover_forced": True,
+                    "recover_last_resort_side": str(best_force["mode"]),
+                    "recover_soft_verify_avg": float(best_force["soft_avg"]),
+                    "recover_boundary_excess": float(best_force.get("boundary_excess", 0.0)),
+                    "recover_neighbor_bounds": best_force.get("neighbor_bounds", {}),
+                },
+            }
+        return None
     
     def reconstruct_fast(self, output_path: str) -> bool:
         """极速重构"""
@@ -1469,7 +2944,7 @@ class FastHighPrecisionReconstructor:
         overall_perf = time.perf_counter()
 
         # 预建 pHash 帧索引（首次运行后缓存，后续秒速加载）
-        self.build_frame_index(sample_interval=1.0)
+        self.build_frame_index(sample_interval=float(self.frame_index_sample_interval))
 
         target_duration = self.get_video_duration(self.target_video)
         self.target_duration = target_duration
@@ -1512,7 +2987,7 @@ class FastHighPrecisionReconstructor:
                     print(f"   段 {task.index+1} 错误: {e}")
                     results[task.index] = SegmentResult(index=task.index, success=False)
         
-        # 整理结果：优先保全所有段，任何缺失段都用目标视频对应时间兜底
+        # 整理结果：默认保全所有段；若禁用目标兜底则缺失段直接记失败
         confirmed_by_index = {}
         for r in results:
             if r and r.success:
@@ -1526,23 +3001,46 @@ class FastHighPrecisionReconstructor:
                 }
 
         missing_count = 0
+        recovered_missing = 0
         confirmed_segments = []
         for task in tasks:
             seg = confirmed_by_index.get(task.index)
             if seg is None:
                 missing_count += 1
-                seg = {
-                    'index': task.index,
-                    'source': self.target_video,
-                    'start': task.target_start,
-                    'duration': task.duration,
-                    'target_start': task.target_start,
-                    'quality': {'combined': 0.0, 'fallback': True, 'reason': 'missing_result'}
-                }
+                if self.enable_target_video_fallback:
+                    seg = {
+                        'index': task.index,
+                        'source': self.target_video,
+                        'start': task.target_start,
+                        'duration': task.duration,
+                        'target_start': task.target_start,
+                        'quality': {'combined': 0.0, 'fallback': True, 'reason': 'missing_result'}
+                    }
+                else:
+                    recovered = self.recover_segment_from_neighbors(task.index, tasks, confirmed_by_index)
+                    if recovered is None:
+                        continue
+                    seg = recovered
+                    confirmed_by_index[task.index] = recovered
+                    recovered_missing += 1
             confirmed_segments.append(seg)
 
         if missing_count > 0:
-            print(f"   ⚠️ 自动补齐缺失段: {missing_count} 段")
+            if self.enable_target_video_fallback:
+                print(f"   ⚠️ 自动补齐缺失段: {missing_count} 段")
+            else:
+                if recovered_missing > 0:
+                    unresolved = max(0, missing_count - recovered_missing)
+                    print(f"   🔧 邻段恢复成功: {recovered_missing} 段，未恢复: {unresolved} 段")
+                    missing_count = unresolved
+                if missing_count <= 0:
+                    pass
+                else:
+                    print(f"❌ 存在缺失段 {missing_count} 段，且已禁用目标素材兜底，终止输出")
+                    return False
+
+        if (not self.enable_target_video_fallback) and recovered_missing > 0:
+            print(f"   🧩 邻段插值恢复: {recovered_missing} 段")
 
         self.match_elapsed_sec = time.perf_counter() - match_perf
 
@@ -1564,6 +3062,280 @@ class FastHighPrecisionReconstructor:
         bridge_recovered = self.recover_isolated_fallback_bridges(confirmed_segments)
         if bridge_recovered > 0:
             print(f"   🧩 孤立兜底桥接恢复: 恢复 {bridge_recovered} 个段到同源时间轴")
+        no_target_isolated_repaired = 0
+        no_target_micro_gap_snapped = 0
+        no_target_boundary_unresolved = 0
+        no_target_boundary_hard_clamped = 0
+        no_target_boundary_audio_detected = 0
+        no_target_boundary_audio_repaired = 0
+        if not self.enable_target_video_fallback:
+            self.last_boundary_repair_stats = {}
+            no_target_isolated_repaired = self.repair_isolated_outliers_without_target_fallback(confirmed_segments)
+            if no_target_isolated_repaired > 0:
+                print(f"   🧪 禁兜底孤立段修复: 恢复 {no_target_isolated_repaired} 个异常跳点")
+            no_target_micro_gap_snapped, no_target_boundary_unresolved = self.snap_small_adjacent_gaps_without_target_fallback(confirmed_segments)
+            boundary_stats = self.last_boundary_repair_stats if isinstance(self.last_boundary_repair_stats, dict) else {}
+            no_target_boundary_hard_clamped = int(boundary_stats.get("hard_clamped", 0))
+            no_target_boundary_audio_detected = int(boundary_stats.get("audio_issue_detected", 0))
+            no_target_boundary_audio_repaired = int(boundary_stats.get("audio_repaired", 0))
+            if no_target_micro_gap_snapped > 0:
+                print(f"   🎚️ 禁兜底边界微调: 对齐 {no_target_micro_gap_snapped} 个相邻段边界")
+            if no_target_boundary_hard_clamped > 0:
+                print(f"   📏 边界硬约束回调: {no_target_boundary_hard_clamped} 处")
+            if no_target_boundary_audio_detected > 0:
+                print(
+                    f"   🔎 边界音频探针: 发现 {no_target_boundary_audio_detected} 处, "
+                    f"局部修复 {no_target_boundary_audio_repaired} 处"
+                )
+            if no_target_boundary_unresolved > 0:
+                print(f"   ⚠️ 禁兜底边界未完全收敛: {no_target_boundary_unresolved} 处")
+
+            # 后置再做一轮孤立跨源段清理：
+            # 前面的边界/回推修复可能改变邻段来源，导致新出现“单段错源”。
+            # 二次修复后再快速收敛一次边界，可显著降低局部内容错位与句尾断裂。
+            post_no_target_isolated_repaired = self.repair_isolated_outliers_without_target_fallback(confirmed_segments)
+            if post_no_target_isolated_repaired > 0:
+                no_target_isolated_repaired += int(post_no_target_isolated_repaired)
+                print(
+                    f"   🧪 禁兜底孤立段二次修复: 恢复 {post_no_target_isolated_repaired} 个后置异常跳点"
+                )
+                post_micro_gap_snapped, post_boundary_unresolved = self.snap_small_adjacent_gaps_without_target_fallback(
+                    confirmed_segments
+                )
+                if post_micro_gap_snapped > 0:
+                    no_target_micro_gap_snapped += int(post_micro_gap_snapped)
+                    print(f"   🎚️ 禁兜底边界二次微调: 对齐 {post_micro_gap_snapped} 个相邻段边界")
+                no_target_boundary_unresolved = int(post_boundary_unresolved)
+                post_boundary_stats = self.last_boundary_repair_stats if isinstance(self.last_boundary_repair_stats, dict) else {}
+                no_target_boundary_hard_clamped += int(post_boundary_stats.get("hard_clamped", 0))
+                no_target_boundary_audio_detected += int(post_boundary_stats.get("audio_issue_detected", 0))
+                no_target_boundary_audio_repaired += int(post_boundary_stats.get("audio_repaired", 0))
+
+            # 终态兜底：避免“修完又被后续步骤改回”的孤立错源段残留到最终输出。
+            final_no_target_isolated_repaired = self.repair_isolated_outliers_without_target_fallback(confirmed_segments)
+            if final_no_target_isolated_repaired > 0:
+                no_target_isolated_repaired += int(final_no_target_isolated_repaired)
+                print(
+                    f"   🧪 禁兜底孤立段终态修复: 恢复 {final_no_target_isolated_repaired} 个终态异常跳点"
+                )
+                final_micro_gap_snapped, final_boundary_unresolved = self.snap_small_adjacent_gaps_without_target_fallback(
+                    confirmed_segments
+                )
+                if final_micro_gap_snapped > 0:
+                    no_target_micro_gap_snapped += int(final_micro_gap_snapped)
+                    print(f"   🎚️ 禁兜底边界终态微调: 对齐 {final_micro_gap_snapped} 个相邻段边界")
+                no_target_boundary_unresolved = int(final_boundary_unresolved)
+                final_boundary_stats = self.last_boundary_repair_stats if isinstance(self.last_boundary_repair_stats, dict) else {}
+                no_target_boundary_hard_clamped += int(final_boundary_stats.get("hard_clamped", 0))
+                no_target_boundary_audio_detected += int(final_boundary_stats.get("audio_issue_detected", 0))
+                no_target_boundary_audio_repaired += int(final_boundary_stats.get("audio_repaired", 0))
+
+            neighbor_source_repaired = self._repair_isolated_source_switches_with_neighbor_source_no_target(confirmed_segments)
+            if neighbor_source_repaired > 0:
+                no_target_isolated_repaired += int(neighbor_source_repaired)
+                print(
+                    f"   🧪 邻居同源优先修复: 收敛 {neighbor_source_repaired} 个孤立错源段"
+                )
+                # 邻居同源修复后只做“轻量边界收口”，避免再次触发跨源重匹配把错源段拉回去。
+                post_neighbor_small_overlap = self._suppress_small_negative_overlaps_no_target(
+                    confirmed_segments,
+                    max_passes=1,
+                )
+                post_neighbor_hard = self._enforce_boundary_hard_constraints_no_target(
+                    confirmed_segments,
+                    max_passes=2,
+                )
+                post_neighbor_backprop = self._backprop_resolve_locked_tail_overlaps_no_target(confirmed_segments)
+                post_neighbor_audio_repaired, post_neighbor_audio_issues = self._repair_boundary_audio_locally_no_target(
+                    confirmed_segments,
+                    max_passes=1,
+                )
+                post_neighbor_hard_after_audio = 0
+                post_neighbor_backprop_after_audio = 0
+                if post_neighbor_audio_issues > 0:
+                    post_neighbor_hard_after_audio = self._enforce_boundary_hard_constraints_no_target(
+                        confirmed_segments,
+                        max_passes=1,
+                    )
+                    post_neighbor_backprop_after_audio = self._backprop_resolve_locked_tail_overlaps_no_target(
+                        confirmed_segments
+                    )
+
+                post_neighbor_adjusted = int(
+                    post_neighbor_small_overlap
+                    + post_neighbor_hard
+                    + post_neighbor_backprop
+                    + post_neighbor_audio_repaired
+                    + post_neighbor_hard_after_audio
+                    + post_neighbor_backprop_after_audio
+                )
+                if post_neighbor_adjusted > 0:
+                    no_target_micro_gap_snapped += int(post_neighbor_adjusted)
+                    print(
+                        f"   🎚️ 邻居同源修复后边界收口: 对齐 {post_neighbor_adjusted} 个相邻段边界(轻量)"
+                    )
+                no_target_boundary_hard_clamped += int(post_neighbor_hard + post_neighbor_hard_after_audio)
+                no_target_boundary_audio_detected += int(post_neighbor_audio_issues)
+                no_target_boundary_audio_repaired += int(post_neighbor_audio_repaired)
+                no_target_boundary_unresolved = self._count_no_target_boundary_unresolved(confirmed_segments)
+
+            # 终态全局 rematch 收尾：
+            # 邻居修复与边界收口可能在尾部重新引入未收敛边界，
+            # 这里再执行一次定点重匹配，避免重复内容落入最终输出。
+            final_global_rematch_attempts = max(
+                0,
+                int(getattr(self, "no_target_boundary_rematch_max_attempts", 0)),
+            )
+            if no_target_boundary_unresolved > 0 and final_global_rematch_attempts > 0:
+                final_global_rematched = self._rematch_unresolved_boundaries_without_target_fallback(
+                    confirmed_segments,
+                    max_attempts=max(4, final_global_rematch_attempts * 2),
+                )
+                if final_global_rematched > 0:
+                    no_target_micro_gap_snapped += int(final_global_rematched)
+                    print(f"   🎯 终态全局重匹配: 收敛 {final_global_rematched} 个未收敛边界候选")
+                    final_global_hard = self._enforce_boundary_hard_constraints_no_target(
+                        confirmed_segments,
+                        max_passes=2,
+                    )
+                    if final_global_hard > 0:
+                        no_target_micro_gap_snapped += int(final_global_hard)
+                        no_target_boundary_hard_clamped += int(final_global_hard)
+                    final_global_audio_repaired, final_global_audio_issues = self._repair_boundary_audio_locally_no_target(
+                        confirmed_segments,
+                        max_passes=1,
+                    )
+                    if final_global_audio_repaired > 0:
+                        no_target_micro_gap_snapped += int(final_global_audio_repaired)
+                    no_target_boundary_audio_detected += int(final_global_audio_issues)
+                    no_target_boundary_audio_repaired += int(final_global_audio_repaired)
+                    no_target_boundary_unresolved = self._count_no_target_boundary_unresolved(confirmed_segments)
+
+            secondary_replaced = self._replace_secondary_source_segments_no_target(confirmed_segments, max_passes=2)
+            if secondary_replaced > 0:
+                no_target_isolated_repaired += int(secondary_replaced)
+                print(f"   🧹 次级源终态替换: 收回 {secondary_replaced} 个残留次级源段")
+                secondary_hard = self._enforce_boundary_hard_constraints_no_target(
+                    confirmed_segments,
+                    max_passes=1,
+                )
+                if secondary_hard > 0:
+                    no_target_micro_gap_snapped += int(secondary_hard)
+                    no_target_boundary_hard_clamped += int(secondary_hard)
+                no_target_boundary_unresolved = self._count_no_target_boundary_unresolved(confirmed_segments)
+
+            last_resort_stabilized = self._stabilize_last_resort_segments_no_target(
+                confirmed_segments,
+                max_passes=2,
+            )
+            if last_resort_stabilized > 0:
+                no_target_micro_gap_snapped += int(last_resort_stabilized)
+                print(f"   🎯 末段连续性收口: 调整 {last_resort_stabilized} 个高风险尾段")
+                stabilize_hard = self._enforce_boundary_hard_constraints_no_target(
+                    confirmed_segments,
+                    max_passes=1,
+                )
+                stabilize_audio_repaired, stabilize_audio_issues = self._repair_boundary_audio_locally_no_target(
+                    confirmed_segments,
+                    max_passes=1,
+                )
+                if stabilize_hard > 0:
+                    no_target_micro_gap_snapped += int(stabilize_hard)
+                    no_target_boundary_hard_clamped += int(stabilize_hard)
+                if stabilize_audio_repaired > 0:
+                    no_target_micro_gap_snapped += int(stabilize_audio_repaired)
+                no_target_boundary_audio_detected += int(stabilize_audio_issues)
+                no_target_boundary_audio_repaired += int(stabilize_audio_repaired)
+                no_target_boundary_unresolved = self._count_no_target_boundary_unresolved(confirmed_segments)
+
+            final_neighbor_source_repaired = self._repair_isolated_source_switches_with_neighbor_source_no_target(
+                confirmed_segments,
+                max_passes=2,
+            )
+            if final_neighbor_source_repaired > 0:
+                no_target_isolated_repaired += int(final_neighbor_source_repaired)
+                print(f"   🧩 终态孤立错源回收: 收回 {final_neighbor_source_repaired} 个错位段")
+                final_neighbor_hard = self._enforce_boundary_hard_constraints_no_target(
+                    confirmed_segments,
+                    max_passes=1,
+                )
+                final_neighbor_audio_repaired, final_neighbor_audio_issues = self._repair_boundary_audio_locally_no_target(
+                    confirmed_segments,
+                    max_passes=1,
+                )
+                if final_neighbor_hard > 0:
+                    no_target_micro_gap_snapped += int(final_neighbor_hard)
+                    no_target_boundary_hard_clamped += int(final_neighbor_hard)
+                if final_neighbor_audio_repaired > 0:
+                    no_target_micro_gap_snapped += int(final_neighbor_audio_repaired)
+                no_target_boundary_audio_detected += int(final_neighbor_audio_issues)
+                no_target_boundary_audio_repaired += int(final_neighbor_audio_repaired)
+                no_target_boundary_unresolved = self._count_no_target_boundary_unresolved(confirmed_segments)
+
+            bridge_run_realigned = self._realign_bridge_affected_same_source_runs_by_audio_no_target(
+                confirmed_segments,
+                max_passes=2,
+            )
+            if bridge_run_realigned > 0:
+                no_target_micro_gap_snapped += int(bridge_run_realigned)
+                print(f"   🎵 同源链前拉修复: 调整 {bridge_run_realigned} 个段，修复句首缺音/节奏拖晚")
+                bridge_run_hard = self._enforce_boundary_hard_constraints_no_target(
+                    confirmed_segments,
+                    max_passes=1,
+                )
+                bridge_run_audio_repaired, bridge_run_audio_issues = self._repair_boundary_audio_locally_no_target(
+                    confirmed_segments,
+                    max_passes=1,
+                )
+                if bridge_run_hard > 0:
+                    no_target_micro_gap_snapped += int(bridge_run_hard)
+                    no_target_boundary_hard_clamped += int(bridge_run_hard)
+                if bridge_run_audio_repaired > 0:
+                    no_target_micro_gap_snapped += int(bridge_run_audio_repaired)
+                no_target_boundary_audio_detected += int(bridge_run_audio_issues)
+                no_target_boundary_audio_repaired += int(bridge_run_audio_repaired)
+                no_target_boundary_unresolved = self._count_no_target_boundary_unresolved(confirmed_segments)
+
+            cross_source_shortfall_bridged = self._prepare_cross_source_shortfall_bridges_no_target(
+                confirmed_segments
+            )
+            if cross_source_shortfall_bridged > 0:
+                no_target_micro_gap_snapped += int(cross_source_shortfall_bridged)
+                print(f"   🌉 跨源短缺拼桥: 修复 {cross_source_shortfall_bridged} 处尾接片头断裂")
+
+            prev_tail_carryover_repaired = self._prepare_cross_source_prev_tail_carryovers_no_target(
+                confirmed_segments
+            )
+            if prev_tail_carryover_repaired > 0:
+                no_target_micro_gap_snapped += int(prev_tail_carryover_repaired)
+                print(f"   🧵 前源尾巴接入: 修复 {prev_tail_carryover_repaired} 处跨源丢内容边界")
+                carryover_rebalanced = self._rebalance_neighbor_recovered_segments_no_target(
+                    confirmed_segments
+                )
+                if carryover_rebalanced > 0:
+                    no_target_micro_gap_snapped += int(carryover_rebalanced)
+                    print(f"   🎯 前源接入后重平衡: 调整 {carryover_rebalanced} 个末段恢复边界")
+                carryover_overlap_clamped = self._clamp_carryover_shifted_overlap_boundaries_no_target(
+                    confirmed_segments
+                )
+                if carryover_overlap_clamped > 0:
+                    no_target_micro_gap_snapped += int(carryover_overlap_clamped)
+                    print(f"   📎 前源接入后重叠收口: 调整 {carryover_overlap_clamped} 个边界")
+                carryover_prev_trimmed = self._trim_prev_for_carryover_shifted_overlaps_no_target(
+                    confirmed_segments
+                )
+                if carryover_prev_trimmed > 0:
+                    no_target_micro_gap_snapped += int(carryover_prev_trimmed)
+                    print(f"   ✂️ 前源接入后裁前段尾巴: 调整 {carryover_prev_trimmed} 个边界")
+                carryover_audio_repaired, carryover_audio_issues = self._repair_boundary_audio_locally_no_target(
+                    confirmed_segments,
+                    max_passes=1,
+                )
+                if carryover_audio_repaired > 0:
+                    no_target_micro_gap_snapped += int(carryover_audio_repaired)
+                no_target_boundary_audio_detected += int(carryover_audio_issues)
+                no_target_boundary_audio_repaired += int(carryover_audio_repaired)
+                no_target_boundary_unresolved = self._count_no_target_boundary_unresolved(confirmed_segments)
 
         self.timeline_guard_elapsed_sec = time.perf_counter() - guard_perf
         self.guard_stats = {
@@ -1574,6 +3346,12 @@ class FastHighPrecisionReconstructor:
             "step_guard_fallback": int(step_guard_fallback),
             "alignment_bias_fallback": int(alignment_bias_fallback),
             "bridge_recovered": int(bridge_recovered),
+            "no_target_isolated_repaired": int(no_target_isolated_repaired),
+            "no_target_micro_gap_snapped": int(no_target_micro_gap_snapped),
+            "no_target_boundary_unresolved": int(no_target_boundary_unresolved),
+            "no_target_boundary_hard_clamped": int(no_target_boundary_hard_clamped),
+            "no_target_boundary_audio_detected": int(no_target_boundary_audio_detected),
+            "no_target_boundary_audio_repaired": int(no_target_boundary_audio_repaired),
         }
 
         print(f"\n✅ 可用段: {len(confirmed_segments)}/{len(tasks)} 段 (完整保留)")
@@ -1665,6 +3443,83 @@ class FastHighPrecisionReconstructor:
 
         render_metrics = self.last_render_metrics if isinstance(self.last_render_metrics, dict) else {}
 
+        boundary_details = []
+        same_source_boundaries = 0
+        negative_overlap_boundaries = 0
+        positive_gap_boundaries = 0
+        boundary_hard_clamped_count = 0
+        boundary_audio_issue_count = 0
+        boundary_audio_repaired_count = 0
+        for i in range(1, len(segments)):
+            prev = segments[i - 1]
+            curr = segments[i]
+            same_source = bool(prev.get("source") == curr.get("source"))
+            gap_sec = None
+            if same_source:
+                same_source_boundaries += 1
+                gap_sec = float(curr["start"]) - (float(prev["start"]) + float(prev["duration"]))
+                if gap_sec < 0.0:
+                    negative_overlap_boundaries += 1
+                elif gap_sec > 0.0:
+                    positive_gap_boundaries += 1
+
+            q = curr.get("quality", {}) or {}
+            hard_clamped = bool(q.get("boundary_hard_clamped_no_target", False))
+            audio_issue = bool(q.get("boundary_audio_issue_detected_no_target", False))
+            audio_repaired = bool(q.get("boundary_audio_repaired_no_target", False))
+            if hard_clamped:
+                boundary_hard_clamped_count += 1
+            if audio_issue:
+                boundary_audio_issue_count += 1
+            if audio_repaired:
+                boundary_audio_repaired_count += 1
+
+            boundary_details.append(
+                {
+                    "boundary_index": int(i),
+                    "target_second": float(curr["target_start"]),
+                    "prev_segment_index": int(prev["index"]),
+                    "curr_segment_index": int(curr["index"]),
+                    "same_source": bool(same_source),
+                    "source": str(curr["source"]) if same_source else "",
+                    "gap_sec": gap_sec,
+                    "hard_clamped": hard_clamped,
+                    "audio_issue_detected": audio_issue,
+                    "audio_repaired": audio_repaired,
+                    "before_gap_sec": q.get(
+                        "boundary_audio_repair_before_gap",
+                        q.get("boundary_hard_before_gap", q.get("boundary_audio_issue_gap_before")),
+                    ),
+                    "after_gap_sec": q.get(
+                        "boundary_audio_repair_after_gap",
+                        q.get("boundary_hard_after_gap"),
+                    ),
+                    "repair_from_start": q.get(
+                        "boundary_audio_repair_from",
+                        q.get("boundary_hard_from"),
+                    ),
+                    "repair_to_start": q.get(
+                        "boundary_audio_repair_to",
+                        q.get("boundary_hard_to"),
+                    ),
+                    "audio_similarity_before": q.get("boundary_audio_similarity_before"),
+                    "audio_similarity_anchor": q.get("boundary_audio_similarity_anchor"),
+                    "audio_similarity_after": q.get("boundary_audio_similarity_after"),
+                    "silence_mismatch_before": q.get("boundary_audio_silence_mismatch_before"),
+                    "silence_mismatch_after": q.get("boundary_audio_silence_mismatch_after"),
+                }
+            )
+
+        boundary_summary = {
+            "total_boundaries": max(0, len(segments) - 1),
+            "same_source_boundaries": int(same_source_boundaries),
+            "negative_overlap_boundaries": int(negative_overlap_boundaries),
+            "positive_gap_boundaries": int(positive_gap_boundaries),
+            "hard_clamped_boundaries": int(boundary_hard_clamped_count),
+            "audio_issue_boundaries": int(boundary_audio_issue_count),
+            "audio_repaired_boundaries": int(boundary_audio_repaired_count),
+        }
+
         report = {
             "target_video": str(self.target_video),
             "output_video": str(output_path_obj),
@@ -1686,10 +3541,14 @@ class FastHighPrecisionReconstructor:
             "guard_stats": to_jsonable(self.guard_stats),
             "render_metrics": to_jsonable(render_metrics),
             "low_segments": low_segments,
+            "boundary_summary": to_jsonable(boundary_summary),
+            "boundary_details": to_jsonable(boundary_details),
             "segments": segment_details,
         }
 
         report_path = Path(output_path).with_suffix(".quality_report.json")
+        # 先删除旧报告，再写同名新文件，确保文件创建时间反映本次运行。
+        report_path.unlink(missing_ok=True)
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
         print(f"   📋 质量报告: {report_path}")
@@ -1710,6 +3569,13 @@ class FastHighPrecisionReconstructor:
 
         def fallback_segment(seg: dict, reason: str, metric: float):
             nonlocal fallback_switched
+            if not self.enable_target_video_fallback:
+                q = seg.get("quality", {}) or {}
+                q["fallback_blocked"] = True
+                q["fallback_reason"] = f"{reason}_no_target_fallback"
+                q["timeline_guard_metric"] = float(metric)
+                seg["quality"] = q
+                return
             seg["source"] = self.target_video
             seg["start"] = seg["target_start"]
             q = seg.get("quality", {}) or {}
@@ -1868,6 +3734,12 @@ class FastHighPrecisionReconstructor:
 
         def fallback_segment(seg: dict, reason: str):
             nonlocal switched
+            if not self.enable_target_video_fallback:
+                q = seg.get("quality", {}) or {}
+                q["fallback_blocked"] = True
+                q["fallback_reason"] = f"{reason}_no_target_fallback"
+                seg["quality"] = q
+                return
             if seg["source"] == self.target_video:
                 return
             seg["source"] = self.target_video
@@ -1956,6 +3828,13 @@ class FastHighPrecisionReconstructor:
 
         def fallback_segment(seg: dict, reason: str, metric: float):
             nonlocal switched
+            if not self.enable_target_video_fallback:
+                q = seg.get("quality", {}) or {}
+                q["fallback_blocked"] = True
+                q["fallback_reason"] = f"{reason}_no_target_fallback"
+                q["timeline_bias_metric"] = float(metric)
+                seg["quality"] = q
+                return
             if seg["source"] == self.target_video:
                 return
             seg["source"] = self.target_video
@@ -2037,6 +3916,13 @@ class FastHighPrecisionReconstructor:
 
         def fallback_segment(seg: dict, reason: str, metric: float):
             nonlocal switched
+            if not self.enable_target_video_fallback:
+                q = seg.get("quality", {}) or {}
+                q["fallback_blocked"] = True
+                q["fallback_reason"] = f"{reason}_no_target_fallback"
+                q["timeline_step_metric"] = float(metric)
+                seg["quality"] = q
+                return
             if seg["source"] == self.target_video:
                 return
             seg["source"] = self.target_video
@@ -2160,6 +4046,8 @@ class FastHighPrecisionReconstructor:
         - 通过后恢复为同源段，降低“中间 5 秒像卡住/跳源”的观感风险
         """
         recovered = 0
+        if not self.enable_target_video_fallback:
+            return recovered
         if len(segments) < 3:
             return recovered
 
@@ -2265,6 +4153,4610 @@ class FastHighPrecisionReconstructor:
 
         return recovered
 
+    def repair_isolated_outliers_without_target_fallback(self, segments: List[dict]) -> int:
+        """
+        禁用目标兜底时的孤立异常段修复：
+        - 前后同源且非目标时，修复中间“跨源跳点”或“单段时间轴异常”。
+        - 通过前后插值推导候选起点，并做 visual/audio 复核后再落盘。
+        """
+        repaired = 0
+        if self.enable_target_video_fallback:
+            return repaired
+        if len(segments) < 3:
+            return repaired
+
+        for i in range(1, len(segments) - 1):
+            prev = segments[i - 1]
+            curr = segments[i]
+            nxt = segments[i + 1]
+
+            if prev["source"] == self.target_video or nxt["source"] == self.target_video:
+                continue
+            if prev["source"] != nxt["source"]:
+                continue
+
+            prev_q = prev.get("quality", {}) or {}
+            next_q = nxt.get("quality", {}) or {}
+            if bool(prev_q.get("fallback", False)) or bool(next_q.get("fallback", False)):
+                continue
+
+            prev_t = float(prev["target_start"])
+            curr_t = float(curr["target_start"])
+            next_t = float(nxt["target_start"])
+            if next_t <= prev_t + 1e-6:
+                continue
+
+            bridge_source = prev["source"]
+            if self._is_secondary_source(Path(bridge_source)):
+                continue
+            duration = float(curr["duration"])
+            source_duration = self.get_video_duration(bridge_source)
+            if source_duration <= 0.0:
+                continue
+            max_start = max(0.0, float(source_duration - duration))
+
+            prev_start = float(prev["start"])
+            next_start = float(nxt["start"])
+            ratio = (curr_t - prev_t) / (next_t - prev_t)
+            ratio = max(0.0, min(1.0, ratio))
+            expected = prev_start + (next_start - prev_start) * ratio
+            curr_start = float(curr["start"])
+
+            outlier_tolerance = max(0.35, duration * 0.10)
+            should_repair = (
+                curr["source"] != bridge_source
+                or abs(curr_start - expected) > outlier_tolerance
+            )
+            if not should_repair:
+                continue
+
+            quality_floor = max(0.72, float(self.strict_verify_min_sim) - 0.06)
+            if float(prev_q.get("combined", 1.0)) < quality_floor:
+                continue
+            if float(next_q.get("combined", 1.0)) < quality_floor:
+                continue
+
+            candidates = [
+                expected,
+                prev_start + (curr_t - prev_t),
+                next_start - (next_t - curr_t),
+            ]
+            if curr["source"] == bridge_source:
+                candidates.append(curr_start)
+
+            best_choice = None
+            seen_starts: Set[float] = set()
+            for raw_start in candidates:
+                start = max(0.0, min(float(raw_start), max_start))
+                key = round(start, 3)
+                if key in seen_starts:
+                    continue
+                seen_starts.add(key)
+
+                refined_start, refine_score = self.refine_start_by_visual(
+                    source=bridge_source,
+                    initial_start=start,
+                    target_start=curr_t,
+                    duration=duration,
+                )
+                refined_start = max(0.0, min(float(refined_start), max_start))
+
+                # 尾部容量守卫（禁兜底）：
+                # 若把当前段并入 bridge_source 后，后续同源链到源尾的可用时长明显不足，
+                # 将不可避免引入连续压缩重叠（重复词/节奏错位），直接放弃该候选。
+                run_end = i
+                scan = i + 1
+                while scan < len(segments) and segments[scan]["source"] == bridge_source:
+                    run_end = scan
+                    scan += 1
+                if run_end > i:
+                    run_target_end = float(segments[run_end]["target_start"]) + float(segments[run_end]["duration"])
+                    required_span = max(0.0, float(run_target_end - curr_t))
+                    available_span = max(0.0, float(source_duration - refined_start))
+                    tail_margin = max(0.35, required_span * 0.03)
+                    if available_span + tail_margin < required_span:
+                        continue
+
+                verify_passed, verify_avg = self.quick_verify(
+                    source=bridge_source,
+                    source_start=refined_start,
+                    target_start=curr_t,
+                    duration=duration,
+                )
+                if not verify_passed:
+                    continue
+
+                audio_passed, audio_meta = self.quick_verify_audio(
+                    source=bridge_source,
+                    source_start=refined_start,
+                    target_start=curr_t,
+                    duration=duration,
+                    combined_score=float(verify_avg),
+                )
+                if not audio_passed:
+                    continue
+
+                rank_score = float(verify_avg) + 0.01 * float(refine_score)
+                if best_choice is None or rank_score > best_choice["rank"]:
+                    best_choice = {
+                        "start": float(refined_start),
+                        "verify_avg": float(verify_avg),
+                        "refine_score": float(refine_score),
+                        "audio_meta": audio_meta,
+                        "rank": float(rank_score),
+                    }
+
+            if best_choice is None:
+                continue
+
+            old_source = str(curr["source"])
+            curr["source"] = bridge_source
+            curr["start"] = float(best_choice["start"])
+            curr_q = curr.get("quality", {}) or {}
+            curr_q["combined"] = max(float(curr_q.get("combined", 0.0)), float(best_choice["verify_avg"]))
+            curr_q["repair_isolated_outlier_no_target"] = True
+            curr_q["repair_mode"] = "isolated_bridge_no_target"
+            curr_q["repair_from_source"] = old_source
+            curr_q["repair_verify_avg"] = float(best_choice["verify_avg"])
+            curr_q["repair_refine_score"] = float(best_choice["refine_score"])
+            curr_q["audio_guard"] = best_choice["audio_meta"]
+            curr_q.pop("fallback_blocked", None)
+            if str(curr_q.get("fallback_reason", "")).endswith("_no_target_fallback"):
+                curr_q["fallback_reason"] = "repaired_no_target_bridge"
+            curr["quality"] = curr_q
+            repaired += 1
+
+        return repaired
+
+    def _repair_isolated_source_switches_with_neighbor_source_no_target(
+        self,
+        segments: List[dict],
+        max_passes: int = 2,
+    ) -> int:
+        """
+        邻居同源优先修复（禁兜底）：
+        - 仅处理 prev/next 同源、current 异源的孤立切源段；
+        - 强制评估“邻居同源候选”，若 visual/audio 复核不劣于当前段则切回同源；
+        - 用于修复“中间 5 秒错源”导致的内容错位/台词截断。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if len(segments) < 3:
+            return 0
+
+        repaired = 0
+        for _ in range(max(1, int(max_passes))):
+            changed = False
+            for i in range(1, len(segments) - 1):
+                prev = segments[i - 1]
+                curr = segments[i]
+                nxt = segments[i + 1]
+
+                if prev["source"] == self.target_video or nxt["source"] == self.target_video:
+                    continue
+                if prev["source"] != nxt["source"]:
+                    continue
+                bridge_source = prev["source"]
+                if self._is_secondary_source(Path(bridge_source)):
+                    continue
+                if curr["source"] == bridge_source:
+                    continue
+
+                duration = float(curr["duration"])
+                source_duration = self.get_video_duration(bridge_source)
+                if source_duration <= 0.0:
+                    continue
+                max_start = max(0.0, float(source_duration - duration))
+
+                prev_t = float(prev["target_start"])
+                curr_t = float(curr["target_start"])
+                next_t = float(nxt["target_start"])
+                if next_t <= prev_t + 1e-6:
+                    continue
+                ratio = max(0.0, min(1.0, (curr_t - prev_t) / (next_t - prev_t)))
+
+                expected = float(prev["start"]) + (float(nxt["start"]) - float(prev["start"])) * ratio
+                raw_candidates = [
+                    expected,
+                    float(prev["start"]) + (curr_t - prev_t),
+                    float(nxt["start"]) - (next_t - curr_t),
+                    expected - 0.25,
+                    expected + 0.25,
+                ]
+                candidates: List[float] = []
+                seen: Set[float] = set()
+                for raw in raw_candidates:
+                    cand = max(0.0, min(float(raw), max_start))
+                    key = round(cand, 3)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(float(cand))
+
+                curr_q = curr.get("quality", {}) or {}
+                baseline_avg = float(curr_q.get("combined", 0.0))
+                best_choice: Optional[Dict[str, object]] = None
+                best_rank_score: Optional[float] = None
+                prev_duration = float(prev["duration"])
+                min_prev_duration = max(1.5, min(3.0, prev_duration * 0.60))
+                prev_trim_cap = max(0.0, float(prev_duration - min_prev_duration))
+
+                for cand_start in candidates:
+                    refined_start, refine_score = self.refine_start_by_visual(
+                        source=bridge_source,
+                        initial_start=float(cand_start),
+                        target_start=float(curr_t),
+                        duration=float(duration),
+                    )
+                    refined_start = max(0.0, min(float(refined_start), max_start))
+                    # 邻居同源修复时，约束视觉细调偏移，避免被重复画面“拉飞”到错误时间带。
+                    max_refine_dev = max(0.6, float(duration) * 0.18)
+                    if abs(float(refined_start) - float(cand_start)) > max_refine_dev:
+                        refined_start = float(cand_start)
+                    probe_starts: List[Tuple[float, float]] = [(float(cand_start), 0.0)]
+                    if abs(float(refined_start) - float(cand_start)) > 1e-6:
+                        probe_starts.append((float(refined_start), float(refine_score)))
+
+                    seen_probe: Set[float] = set()
+                    for probe_start, probe_refine_score in probe_starts:
+                        probe_key = round(float(probe_start), 3)
+                        if probe_key in seen_probe:
+                            continue
+                        seen_probe.add(probe_key)
+
+                        passed, avg = self.quick_verify(
+                            source=bridge_source,
+                            source_start=float(probe_start),
+                            target_start=float(curr_t),
+                            duration=float(duration),
+                        )
+                        if not passed:
+                            continue
+
+                        audio_passed, audio_meta = self.quick_verify_audio(
+                            source=bridge_source,
+                            source_start=float(probe_start),
+                            target_start=float(curr_t),
+                            duration=float(duration),
+                            combined_score=float(avg),
+                        )
+                        if not audio_passed:
+                            continue
+
+                        distance_penalty = abs(float(probe_start) - float(expected))
+                        prev_end = float(prev["start"]) + float(prev["duration"])
+                        next_start = float(nxt["start"])
+                        prev_gap = float(probe_start - prev_end)
+                        next_gap = float(next_start - (float(probe_start) + float(duration)))
+                        continuity_penalty = abs(float(prev_gap)) + abs(float(next_gap))
+                        allow_prev_trim = False
+                        prev_trim_sec = 0.0
+                        # 这类修复的目标是“纠正孤立错源”，不是为了收边界把正确内容换坏。
+                        # 若邻居同源候选本身连续性代价过大，直接拒绝，避免重演 100s 段被换坏的问题。
+                        max_distance_penalty = max(0.35, float(duration) * 0.08)
+                        max_continuity_penalty = max(0.55, float(duration) * 0.12)
+                        if float(distance_penalty) > float(max_distance_penalty):
+                            continue
+                        if float(continuity_penalty) > float(max_continuity_penalty):
+                            overlap = max(0.0, -float(prev_gap))
+                            next_neg_tol = max(0.12, float(duration) * 0.02)
+                            if (
+                                overlap > 1e-6
+                                and overlap <= (float(prev_trim_cap) + 1e-6)
+                                and overlap <= max(0.45, float(duration) * 0.24)
+                                and float(next_gap) >= (-float(next_neg_tol) - 1e-6)
+                                and float(distance_penalty) <= max(float(max_distance_penalty), 0.65)
+                            ):
+                                allow_prev_trim = True
+                                prev_trim_sec = float(overlap)
+                                continuity_penalty = abs(float(next_gap))
+                            else:
+                                continue
+                        rank_score = (
+                            float(avg)
+                            - float(distance_penalty) * 0.04
+                            - float(continuity_penalty) * 0.12
+                        )
+                        if best_rank_score is None or rank_score > best_rank_score:
+                            best_rank_score = float(rank_score)
+                            best_choice = {
+                                "start": float(probe_start),
+                                "verify_avg": float(avg),
+                                "refine_score": float(probe_refine_score),
+                                "audio_meta": audio_meta,
+                                "distance_penalty": float(distance_penalty),
+                                "continuity_penalty": float(continuity_penalty),
+                                "prev_gap": float(prev_gap),
+                                "next_gap": float(next_gap),
+                                "allow_prev_trim": bool(allow_prev_trim),
+                                "prev_trim_sec": float(prev_trim_sec),
+                            }
+
+                if best_choice is None:
+                    continue
+
+                # 连续性优先：允许轻微分数下降换取同源连贯，但不能明显劣化。
+                if float(best_choice["verify_avg"]) + 1e-6 < (baseline_avg - 0.03):
+                    continue
+
+                old_source = str(curr["source"])
+                old_start = float(curr["start"])
+                prev_trim_sec = float(best_choice.get("prev_trim_sec", 0.0) or 0.0)
+                if prev_trim_sec > 1e-6:
+                    prev["duration"] = max(0.0, float(prev["duration"]) - float(prev_trim_sec))
+                    prev_q = prev.get("quality", {}) or {}
+                    prev_q["neighbor_source_prev_trim_no_target"] = True
+                    prev_q["neighbor_source_prev_trim_sec"] = float(prev_trim_sec)
+                    prev_q["neighbor_source_prev_trim_boundary_index"] = int(i)
+                    prev_q["neighbor_source_prev_trim_to_source"] = str(bridge_source)
+                    prev["quality"] = prev_q
+                curr["source"] = bridge_source
+                curr["start"] = float(best_choice["start"])
+                q = curr.get("quality", {}) or {}
+                q["combined"] = max(float(q.get("combined", 0.0)), float(best_choice["verify_avg"]))
+                q["repair_isolated_neighbor_source_no_target"] = True
+                q["repair_mode"] = "isolated_neighbor_source_no_target"
+                q["repair_from_source"] = old_source
+                q["repair_from_start"] = float(old_start)
+                q["repair_verify_avg"] = float(best_choice["verify_avg"])
+                q["repair_refine_score"] = float(best_choice["refine_score"])
+                q["repair_expected_distance"] = float(best_choice["distance_penalty"])
+                q["repair_neighbor_continuity_penalty"] = float(best_choice.get("continuity_penalty", 0.0))
+                q["repair_neighbor_prev_gap"] = float(best_choice.get("prev_gap", 0.0))
+                q["repair_neighbor_next_gap"] = float(best_choice.get("next_gap", 0.0))
+                q["repair_neighbor_prev_trim_sec"] = float(prev_trim_sec)
+                q["audio_guard"] = best_choice["audio_meta"]
+                curr["quality"] = q
+                repaired += 1
+                changed = True
+
+            if not changed:
+                break
+
+        return int(repaired)
+
+    def _replace_secondary_source_segments_no_target(
+        self,
+        segments: List[dict],
+        max_passes: int = 2,
+    ) -> int:
+        """
+        终态主源替换（禁兜底）：
+        - 若项目同时存在结构化主源与短数字次级源，尽量不让次级源残留到最终输出；
+        - 仅对最终仍落在次级源的段生效，优先用邻段连续性与主源 pHash 候选回收。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if not self.secondary_source_videos:
+            return 0
+        if len(segments) == 0:
+            return 0
+
+        replaced = 0
+        for _ in range(max(1, int(max_passes))):
+            changed = False
+            for i, seg in enumerate(segments):
+                source = seg.get("source")
+                if source in (None, self.target_video):
+                    continue
+                if not self._is_secondary_source(Path(source)):
+                    continue
+
+                duration = float(seg["duration"])
+                target_start = float(seg["target_start"])
+                old_combined = float((seg.get("quality", {}) or {}).get("combined", 0.0))
+                old_source = str(source)
+                old_start = float(seg["start"])
+                candidates: List[Tuple[Path, float, str]] = []
+
+                prev = segments[i - 1] if i > 0 else None
+                nxt = segments[i + 1] if (i + 1) < len(segments) else None
+                if prev is not None and prev.get("source") not in (None, self.target_video):
+                    prev_src = Path(prev["source"])
+                    if not self._is_secondary_source(prev_src):
+                        est = float(prev["start"]) + (target_start - float(prev["target_start"]))
+                        candidates.append((prev_src, float(est), "neighbor_prev"))
+                if nxt is not None and nxt.get("source") not in (None, self.target_video):
+                    next_src = Path(nxt["source"])
+                    if not self._is_secondary_source(next_src):
+                        est = float(nxt["start"]) - (float(nxt["target_start"]) - target_start)
+                        candidates.append((next_src, float(est), "neighbor_next"))
+                if (
+                    prev is not None
+                    and nxt is not None
+                    and prev.get("source") not in (None, self.target_video)
+                    and prev.get("source") == nxt.get("source")
+                ):
+                    bridge_src = Path(prev["source"])
+                    if not self._is_secondary_source(bridge_src):
+                        prev_t = float(prev["target_start"])
+                        next_t = float(nxt["target_start"])
+                        if next_t > prev_t + 1e-6:
+                            ratio = max(0.0, min(1.0, (target_start - prev_t) / (next_t - prev_t)))
+                            interp = float(prev["start"]) + (float(nxt["start"]) - float(prev["start"])) * ratio
+                            candidates.append((bridge_src, float(interp), "neighbor_interp"))
+
+                phash_candidates = self.find_match_by_phash(
+                    target_start=target_start,
+                    duration=duration,
+                    seg_index=int(seg["index"]),
+                    top_k=64,
+                )
+                for cand_source, cand_start, _phash in phash_candidates:
+                    cand_path = Path(cand_source)
+                    if cand_path == self.target_video or self._is_secondary_source(cand_path):
+                        continue
+                    candidates.append((cand_path, float(cand_start), "primary_phash"))
+
+                best_choice: Optional[Dict[str, object]] = None
+                seen: Set[Tuple[str, float]] = set()
+                for cand_source, raw_start, mode in candidates:
+                    sig = (str(cand_source), round(float(raw_start), 3))
+                    if sig in seen:
+                        continue
+                    seen.add(sig)
+
+                    src_duration = self.get_video_duration(cand_source)
+                    if src_duration <= 0.0:
+                        continue
+                    max_start = max(0.0, float(src_duration - duration))
+                    cand_start = max(0.0, min(float(raw_start), max_start))
+                    refined_start, refine_score = self.refine_start_by_visual(
+                        source=cand_source,
+                        initial_start=float(cand_start),
+                        target_start=target_start,
+                        duration=duration,
+                    )
+                    refined_start = max(0.0, min(float(refined_start), max_start))
+
+                    verify_passed, verify_avg = self.quick_verify(
+                        source=cand_source,
+                        source_start=float(refined_start),
+                        target_start=target_start,
+                        duration=duration,
+                    )
+                    if not verify_passed:
+                        continue
+                    audio_passed, audio_meta = self.quick_verify_audio(
+                        source=cand_source,
+                        source_start=float(refined_start),
+                        target_start=target_start,
+                        duration=duration,
+                        combined_score=float(verify_avg),
+                    )
+                    if not audio_passed:
+                        continue
+
+                    continuity_penalty = 0.0
+                    same_source_bonus = 0.0
+                    if prev is not None and prev.get("source") == cand_source:
+                        prev_end = float(prev["start"]) + float(prev["duration"])
+                        continuity_penalty += abs(float(refined_start) - prev_end)
+                        same_source_bonus += 0.03
+                    if nxt is not None and nxt.get("source") == cand_source:
+                        next_gap = float(nxt["start"]) - (float(refined_start) + duration)
+                        continuity_penalty += abs(float(next_gap))
+                        same_source_bonus += 0.03
+
+                    rank = float(verify_avg) + same_source_bonus - float(continuity_penalty) * 0.12
+                    if best_choice is None or rank > float(best_choice["rank"]):
+                        best_choice = {
+                            "source": cand_source,
+                            "start": float(refined_start),
+                            "verify_avg": float(verify_avg),
+                            "refine_score": float(refine_score),
+                            "rank": float(rank),
+                            "mode": str(mode),
+                            "audio_meta": dict(audio_meta or {}),
+                        }
+
+                if best_choice is None:
+                    continue
+                if float(best_choice["verify_avg"]) + 1e-6 < max(0.86, old_combined - 0.05):
+                    continue
+
+                seg["source"] = best_choice["source"]
+                seg["start"] = float(best_choice["start"])
+                q = seg.get("quality", {}) or {}
+                q["combined"] = max(float(q.get("combined", 0.0)), float(best_choice["verify_avg"]))
+                q["secondary_source_replaced_no_target"] = True
+                q["secondary_source_replaced_from"] = str(old_source)
+                q["secondary_source_replaced_from_start"] = float(old_start)
+                q["secondary_source_replaced_mode"] = str(best_choice["mode"])
+                q["secondary_source_replaced_verify_avg"] = float(best_choice["verify_avg"])
+                q["secondary_source_replaced_refine_score"] = float(best_choice["refine_score"])
+                q["audio_guard"] = best_choice["audio_meta"]
+                seg["quality"] = q
+                replaced += 1
+                changed = True
+
+            if not changed:
+                break
+
+        return int(replaced)
+
+    def _realign_bridge_affected_same_source_runs_by_audio_no_target(
+        self,
+        segments: List[dict],
+        max_passes: int = 1,
+    ) -> int:
+        """
+        桥接后同源链前拉（禁兜底）：
+        - 针对“跨源桥接后，下一同源 run 整体拖晚”的场景；
+        - 当当前段存在稳定的前拉收益时，允许整条同源 run 同步前拉；
+        - 用裁掉前一段尾巴的方式消化重叠，优先恢复句首音频，而不是把后文继续压快。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if len(segments) < 3:
+            return 0
+
+        adjusted = 0
+        for _ in range(max(1, int(max_passes))):
+            changed = False
+            for i in range(1, len(segments)):
+                prev = segments[i - 1]
+                curr = segments[i]
+                if prev["source"] == self.target_video or curr["source"] == self.target_video:
+                    continue
+                if prev["source"] != curr["source"]:
+                    continue
+
+                curr_q = curr.get("quality", {}) or {}
+                if (i + 1) >= len(segments) or segments[i + 1]["source"] != curr["source"]:
+                    continue
+
+                duration = float(curr["duration"])
+                base_start = float(curr["start"])
+                target_start = float(curr["target_start"])
+                base_avg = float(curr_q.get("combined", 0.0))
+                base_audio_passed, base_audio_meta = self.quick_verify_audio(
+                    source=curr["source"],
+                    source_start=float(base_start),
+                    target_start=float(target_start),
+                    duration=float(duration),
+                    combined_score=max(float(base_avg), 0.0),
+                )
+                if not isinstance(base_audio_meta, dict):
+                    continue
+                base_aligned = float(base_audio_meta.get("aligned_similarity", 0.0) or 0.0)
+                base_shift = float(base_audio_meta.get("best_shift_sec", 0.0) or 0.0)
+                base_gain = float(base_audio_meta.get("shift_gain", 0.0) or 0.0)
+                if not (
+                    (base_shift <= -0.45 and base_gain >= 0.03)
+                    or (not base_audio_passed and str(base_audio_meta.get("reason", "")).startswith("audio_guard_shift_bias"))
+                ):
+                    continue
+
+                prev_duration = float(prev["duration"])
+                prev_q = prev.get("quality", {}) or {}
+                min_prev_duration = max(1.5, min(3.0, prev_duration * 0.60))
+                # 片头段/救援段本身就更容易丢词尾，避免为了前拉当前 run 把前一段裁得过深。
+                prev_is_sensitive_head = bool(float(prev.get("start", 0.0)) <= 0.8)
+                prev_is_sensitive_rescue = bool(
+                    prev_q.get("rescue")
+                    or prev_q.get("cross_source_shortfall_bridge_from_prev")
+                    or prev_q.get("cross_source_prev_tail_carryover_no_target")
+                )
+                if prev_is_sensitive_head or prev_is_sensitive_rescue:
+                    min_prev_duration = max(float(min_prev_duration), float(prev_duration) - 0.45)
+                prev_trim_cap = max(0.0, float(prev_duration - min_prev_duration))
+                if prev_trim_cap <= 1e-6:
+                    continue
+
+                run_end = i
+                while (run_end + 1) < len(segments) and segments[run_end + 1]["source"] == curr["source"]:
+                    run_end += 1
+
+                raw_candidates: List[float] = [
+                    float(base_start + base_shift),
+                    float(base_start - 0.25),
+                    float(base_start - 0.35),
+                    float(base_start - 0.45),
+                    float(base_start - 0.55),
+                    float(base_start - 0.65),
+                    float(base_start - 0.75),
+                    float(base_start - 0.85),
+                    float(base_start - 0.95),
+                    float(base_start - 1.05),
+                    float(base_start - 1.15),
+                ]
+
+                best_choice: Optional[Dict[str, object]] = None
+                best_score: Optional[float] = None
+                seen_candidates: Set[float] = set()
+                for raw_start in raw_candidates:
+                    cand_seed = max(0.0, min(float(raw_start), float(base_start - 0.12)))
+                    key = round(cand_seed, 3)
+                    if key in seen_candidates:
+                        continue
+                    seen_candidates.add(key)
+
+                    refined_start, refine_score = self.refine_start_by_visual(
+                        source=curr["source"],
+                        initial_start=float(cand_seed),
+                        target_start=float(target_start),
+                        duration=float(duration),
+                    )
+                    cand_start = max(0.0, min(float(refined_start), float(base_start - 0.12)))
+                    delta = float(base_start - cand_start)
+                    if delta <= 0.12 or delta > 1.25:
+                        continue
+
+                    prev_end = float(prev["start"]) + float(prev_duration)
+                    overlap = max(0.0, float(prev_end - cand_start))
+                    if overlap > (float(prev_trim_cap) + 1e-6):
+                        continue
+
+                    probe_current_passed, probe_current_avg = self.quick_verify(
+                        source=curr["source"],
+                        source_start=float(cand_start),
+                        target_start=float(target_start),
+                        duration=float(duration),
+                    )
+                    if not probe_current_passed:
+                        continue
+                    probe_current_audio_passed, probe_current_audio_meta = self.quick_verify_audio(
+                        source=curr["source"],
+                        source_start=float(cand_start),
+                        target_start=float(target_start),
+                        duration=float(duration),
+                        combined_score=float(probe_current_avg),
+                    )
+                    if not probe_current_audio_passed:
+                        continue
+                    curr_aligned = float((probe_current_audio_meta or {}).get("aligned_similarity", 0.0) or 0.0)
+                    curr_best_shift = float((probe_current_audio_meta or {}).get("best_shift_sec", 0.0) or 0.0)
+                    curr_shift_gain = float((probe_current_audio_meta or {}).get("shift_gain", 0.0) or 0.0)
+                    if abs(curr_best_shift) >= 0.45 and curr_shift_gain >= 0.08:
+                        continue
+                    if curr_aligned + 0.06 < base_aligned:
+                        continue
+
+                    run_score = float(curr_aligned) + float(probe_current_avg) * 0.05
+                    shifted_starts: Dict[int, float] = {i: float(cand_start)}
+                    run_audio_meta: Dict[int, Dict[str, object]] = {i: probe_current_audio_meta}
+                    run_avg_meta: Dict[int, float] = {i: float(probe_current_avg)}
+                    run_ok = True
+                    for k in range(i + 1, run_end + 1):
+                        seg = segments[k]
+                        shifted_start = float(seg["start"] - delta)
+                        if shifted_start < 0.0:
+                            run_ok = False
+                            break
+                        passed, avg = self.quick_verify(
+                            source=seg["source"],
+                            source_start=float(shifted_start),
+                            target_start=float(seg["target_start"]),
+                            duration=float(seg["duration"]),
+                        )
+                        audio_passed, audio_meta = self.quick_verify_audio(
+                            source=seg["source"],
+                            source_start=float(shifted_start),
+                            target_start=float(seg["target_start"]),
+                            duration=float(seg["duration"]),
+                            combined_score=float(avg),
+                        )
+                        if not audio_passed:
+                            run_ok = False
+                            break
+                        relaxed_tail_ok = bool(
+                            (not passed)
+                            and float(avg) >= 0.90
+                            and float((audio_meta or {}).get("aligned_similarity", 0.0) or 0.0) >= 0.66
+                        )
+                        if (not passed) and (not relaxed_tail_ok):
+                            run_ok = False
+                            break
+                        aligned = float((audio_meta or {}).get("aligned_similarity", 0.0) or 0.0)
+                        best_shift = float((audio_meta or {}).get("best_shift_sec", 0.0) or 0.0)
+                        shift_gain = float((audio_meta or {}).get("shift_gain", 0.0) or 0.0)
+                        if abs(best_shift) >= 0.45 and shift_gain >= 0.10:
+                            run_ok = False
+                            break
+                        shifted_starts[k] = float(shifted_start)
+                        run_audio_meta[k] = audio_meta
+                        run_avg_meta[k] = float(avg)
+                        run_score += float(aligned) + float(avg) * 0.03
+
+                    if not run_ok:
+                        continue
+
+                    score = (
+                        float(run_score)
+                        + float(curr_aligned - base_aligned) * 0.8
+                        - float(overlap) * 0.05
+                        - abs(float(curr_best_shift)) * 0.02
+                        + float(refine_score) * 0.001
+                    )
+                    if best_score is None or score > best_score:
+                        best_score = float(score)
+                        best_choice = {
+                            "delta": float(delta),
+                            "prev_trim_sec": float(overlap),
+                            "shifted_starts": shifted_starts,
+                            "run_audio_meta": run_audio_meta,
+                            "run_avg_meta": run_avg_meta,
+                            "current_aligned": float(curr_aligned),
+                            "base_aligned": float(base_aligned),
+                            "refine_score": float(refine_score),
+                        }
+
+                if best_choice is None:
+                    continue
+
+                prev_trim_sec = float(best_choice.get("prev_trim_sec", 0.0) or 0.0)
+                if prev_trim_sec > 1e-6:
+                    prev["duration"] = max(0.0, float(prev["duration"]) - float(prev_trim_sec))
+                    prev_q = prev.get("quality", {}) or {}
+                    prev_q["bridge_run_prev_trim_no_target"] = True
+                    prev_q["bridge_run_prev_trim_sec"] = float(prev_trim_sec)
+                    prev_q["bridge_run_prev_trim_boundary_index"] = int(i)
+                    prev["quality"] = prev_q
+
+                for k in range(i, run_end + 1):
+                    seg = segments[k]
+                    old_start = float(seg["start"])
+                    seg["start"] = float(best_choice["shifted_starts"][k])
+                    q = seg.get("quality", {}) or {}
+                    q["bridge_run_audio_realign_no_target"] = True
+                    q["bridge_run_audio_realign_from"] = float(old_start)
+                    q["bridge_run_audio_realign_to"] = float(seg["start"])
+                    q["bridge_run_audio_realign_delta"] = float(best_choice["delta"])
+                    q["bridge_run_audio_realign_anchor_index"] = int(i)
+                    if k == i:
+                        q["bridge_run_audio_realign_prev_trim_sec"] = float(prev_trim_sec)
+                        q["bridge_run_audio_realign_base_aligned"] = float(best_choice["base_aligned"])
+                        q["bridge_run_audio_realign_current_aligned"] = float(best_choice["current_aligned"])
+                        q["bridge_run_audio_realign_refine_score"] = float(best_choice["refine_score"])
+                    q["audio_guard"] = best_choice["run_audio_meta"].get(k, q.get("audio_guard", {}))
+                    seg["quality"] = q
+                    adjusted += 1
+
+                changed = True
+
+            if not changed:
+                break
+
+        return int(adjusted)
+
+    def _stabilize_last_resort_segments_no_target(
+        self,
+        segments: List[dict],
+        max_passes: int = 2,
+    ) -> int:
+        """
+        终态连续性收口（禁兜底）：
+        - 仅处理 recover_mode=neighbors_last_resort_no_target 且边界惩罚仍偏高的段；
+        - 用同源邻段推导候选起点，优先消除词尾双读与尾段轻微倒放感。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if len(segments) < 2:
+            return 0
+
+        adjusted = 0
+        for _ in range(max(1, int(max_passes))):
+            changed = False
+            for i, seg in enumerate(segments):
+                q = seg.get("quality", {}) or {}
+                if str(q.get("recover_mode", "") or "") != "neighbors_last_resort_no_target":
+                    continue
+                source = seg.get("source")
+                if source in (None, self.target_video):
+                    continue
+
+                unresolved_now = False
+                if i > 0 and segments[i - 1].get("source") == source:
+                    unresolved_now, _gap, _meta = self._no_target_boundary_unresolved_meta(segments[i - 1], seg)
+                if (not unresolved_now) and (i + 1) < len(segments) and segments[i + 1].get("source") == source:
+                    unresolved_now, _gap, _meta = self._no_target_boundary_unresolved_meta(seg, segments[i + 1])
+                if not unresolved_now:
+                    continue
+
+                duration = float(seg["duration"])
+                src_duration = self.get_video_duration(Path(source))
+                if src_duration <= 0.0:
+                    continue
+                max_start = max(0.0, float(src_duration - duration))
+                candidates: List[float] = [float(seg["start"])]
+
+                prev = segments[i - 1] if i > 0 else None
+                nxt = segments[i + 1] if (i + 1) < len(segments) else None
+                if prev is not None and prev.get("source") == source:
+                    prev_end = float(prev["start"]) + float(prev["duration"])
+                    candidates.extend([prev_end, prev_end + 0.05, prev_end + 0.10])
+                if nxt is not None and nxt.get("source") == source:
+                    next_start = float(nxt["start"]) - duration
+                    candidates.extend([next_start, next_start - 0.05, next_start - 0.10])
+                if prev is not None and nxt is not None and prev.get("source") == source and nxt.get("source") == source:
+                    candidates.append(0.5 * ((float(prev["start"]) + float(prev["duration"])) + (float(nxt["start"]) - duration)))
+
+                best_choice: Optional[Dict[str, float]] = None
+                seen_starts: Set[float] = set()
+                base_combined = float(q.get("combined", 0.0))
+                for raw_start in candidates:
+                    start = max(0.0, min(float(raw_start), max_start))
+                    key = round(float(start), 3)
+                    if key in seen_starts:
+                        continue
+                    seen_starts.add(key)
+
+                    passed, avg = self.verify_segment_visual(
+                        source=Path(source),
+                        source_start=float(start),
+                        target_start=float(seg["target_start"]),
+                        duration=duration,
+                        offsets=[
+                            0.0,
+                            duration * 0.25,
+                            duration * 0.5,
+                            duration * 0.75,
+                            max(0.0, duration - 0.1),
+                        ],
+                        min_avg=0.70,
+                        min_floor=0.45,
+                    )
+                    if not passed:
+                        continue
+                    audio_passed, audio_meta = self.quick_verify_audio(
+                        source=Path(source),
+                        source_start=float(start),
+                        target_start=float(seg["target_start"]),
+                        duration=duration,
+                        combined_score=float(avg),
+                    )
+                    if not audio_passed:
+                        continue
+
+                    penalty = 0.0
+                    if prev is not None and prev.get("source") == source:
+                        penalty += abs(float(start) - (float(prev["start"]) + float(prev["duration"])))
+                    if nxt is not None and nxt.get("source") == source:
+                        penalty += abs(float(nxt["start"]) - (float(start) + duration))
+                    rank = float(avg) - float(penalty) * 0.16
+                    if best_choice is None or rank > float(best_choice["rank"]):
+                        best_choice = {
+                            "start": float(start),
+                            "avg": float(avg),
+                            "rank": float(rank),
+                            "penalty": float(penalty),
+                            "audio_meta": dict(audio_meta or {}),
+                        }
+
+                if best_choice is None:
+                    continue
+                if float(best_choice["avg"]) + 1e-6 < max(0.80, base_combined - 0.06):
+                    continue
+                if abs(float(best_choice["start"]) - float(seg["start"])) < 0.04:
+                    continue
+
+                old_start = float(seg["start"])
+                seg["start"] = float(best_choice["start"])
+                q["last_resort_stabilized_no_target"] = True
+                q["last_resort_stabilized_from"] = float(old_start)
+                q["last_resort_stabilized_to"] = float(best_choice["start"])
+                q["last_resort_stabilized_verify_avg"] = float(best_choice["avg"])
+                q["last_resort_stabilized_penalty"] = float(best_choice["penalty"])
+                q["audio_guard"] = best_choice["audio_meta"]
+                seg["quality"] = q
+                adjusted += 1
+                changed = True
+
+            if not changed:
+                break
+
+        return int(adjusted)
+
+    def _count_no_target_boundary_unresolved(self, segments: List[dict]) -> int:
+        """统计禁兜底模式下同源相邻段未收敛边界数量。"""
+        unresolved = 0
+        for i in range(1, len(segments)):
+            prev = segments[i - 1]
+            curr = segments[i]
+            if prev["source"] == self.target_video or curr["source"] == self.target_video:
+                continue
+            if prev["source"] != curr["source"]:
+                continue
+            is_unresolved, _gap, _meta = self._no_target_boundary_unresolved_meta(prev, curr)
+            if is_unresolved:
+                unresolved += 1
+        return int(unresolved)
+
+    def _collect_no_target_unresolved_pairs(self, segments: List[dict]) -> List[Tuple[int, int, float]]:
+        """
+        收集禁兜底模式下未收敛同源边界。
+        返回 (prev_index, curr_index, gap)；按 |gap| 从大到小排序。
+        """
+        pairs: List[Tuple[int, int, float]] = []
+        for i in range(1, len(segments)):
+            prev = segments[i - 1]
+            curr = segments[i]
+            if prev["source"] == self.target_video or curr["source"] == self.target_video:
+                continue
+            if prev["source"] != curr["source"]:
+                continue
+            is_unresolved, gap, _meta = self._no_target_boundary_unresolved_meta(prev, curr)
+            if is_unresolved:
+                pairs.append((i - 1, i, float(gap)))
+        pairs.sort(key=lambda x: abs(float(x[2])), reverse=True)
+        return pairs
+
+    def _rematch_unresolved_boundaries_without_target_fallback(self, segments: List[dict], max_attempts: int) -> int:
+        """
+        对禁兜底模式未收敛边界做定点重匹配：
+        - 支持对同一边界左右两侧分别尝试；
+        - 对“右段贴源尾导致无法后移”的边界，优先重匹配右侧段；
+        - 在 pHash 候选不足时追加一次宽范围视觉候选，减少“明明可换源却没被尝试”。
+        - 仅做少量尝试，避免显著拉长整体耗时
+        返回：成功替换段数量。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if not bool(getattr(self, "no_target_boundary_rematch_enabled", True)):
+            return 0
+
+        unresolved_pairs = self._collect_no_target_unresolved_pairs(segments)
+        if not unresolved_pairs:
+            return 0
+
+        def boundary_penalty(left_idx: int, right_idx: int) -> float:
+            if left_idx < 0 or right_idx >= len(segments):
+                return 0.0
+            left = segments[left_idx]
+            right = segments[right_idx]
+            if left["source"] == self.target_video or right["source"] == self.target_video:
+                return 0.0
+            if left["source"] != right["source"]:
+                return 0.0
+            is_unresolved, gap, meta = self._no_target_boundary_unresolved_meta(left, right)
+            neg_trigger = float(meta.get("neg_trigger", max(0.12, float(right["duration"]) * 0.02)))
+            pos_trigger = float(meta.get("pos_trigger", max(0.20, float(right["duration"]) * 0.04)))
+            if gap < -neg_trigger:
+                return float((-gap) - neg_trigger)
+            if gap > pos_trigger:
+                return float(gap - pos_trigger)
+            if is_unresolved:
+                return max(
+                    0.05,
+                    float(meta.get("recover_boundary_excess", 0.0)),
+                    float(meta.get("boundary_audio_next_penalty_after", 0.0)),
+                )
+            return 0.0
+
+        def local_penalty(center_idx: int) -> float:
+            return boundary_penalty(center_idx - 1, center_idx) + boundary_penalty(center_idx, center_idx + 1)
+
+        def total_boundary_excess() -> float:
+            total = 0.0
+            for left_i, right_i, _gap in self._collect_no_target_unresolved_pairs(segments):
+                total += boundary_penalty(left_i, right_i)
+            return float(total)
+
+        def is_tail_locked(seg_idx: int) -> bool:
+            if seg_idx < 0 or seg_idx >= len(segments):
+                return False
+            seg = segments[seg_idx]
+            src = seg.get("source")
+            if src in (None, self.target_video):
+                return False
+            src_duration = self.get_video_duration(src)
+            if src_duration <= 0.0:
+                return False
+            seg_duration = max(0.0, float(seg.get("duration", 0.0)))
+            max_start = max(0.0, float(src_duration - seg_duration))
+            lock_tol = max(0.06, seg_duration * 0.015)
+            return float(seg.get("start", 0.0)) >= (max_start - lock_tol)
+
+        def is_run_terminal(seg_idx: int) -> bool:
+            if seg_idx < 0 or seg_idx >= len(segments):
+                return False
+            src = segments[seg_idx].get("source")
+            if src in (None, self.target_video):
+                return True
+            next_idx = seg_idx + 1
+            if next_idx >= len(segments):
+                return True
+            return segments[next_idx].get("source") != src
+
+        applied = 0
+        attempts = 0
+        attempted_signatures: Set[Tuple[int, int, int]] = set()
+        for prev_i, curr_i, pair_gap in unresolved_pairs:
+            if attempts >= max_attempts:
+                break
+
+            prev = segments[prev_i]
+            curr = segments[curr_i]
+            prev_q = prev.get("quality", {}) or {}
+            curr_q = curr.get("quality", {}) or {}
+            prev_combined = float(prev_q.get("combined", 0.0))
+            curr_combined = float(curr_q.get("combined", 0.0))
+            pair_severity = abs(float(pair_gap))
+            pair_overlap = float(pair_gap) < 0.0
+            pair_tail_locked_curr = is_tail_locked(curr_i)
+
+            # 同一边界支持左右两侧尝试；负重叠场景优先尝试右段（更符合“去重复”目标）。
+            candidate_indices: List[int] = []
+            if pair_overlap:
+                candidate_indices.append(curr_i)
+            candidate_indices.append(curr_i if curr_combined <= prev_combined else prev_i)
+            candidate_indices.append(prev_i)
+            candidate_indices.append(curr_i)
+            if pair_tail_locked_curr:
+                candidate_indices.insert(0, curr_i)
+            ordered_indices: List[int] = []
+            seen_idx: Set[int] = set()
+            for idx in candidate_indices:
+                if idx in seen_idx:
+                    continue
+                seen_idx.add(idx)
+                ordered_indices.append(idx)
+
+            pair_applied = False
+            for cand_i in ordered_indices:
+                if attempts >= max_attempts:
+                    break
+                attempt_sig = (int(prev_i), int(curr_i), int(cand_i))
+                if attempt_sig in attempted_signatures:
+                    continue
+                attempted_signatures.add(attempt_sig)
+                attempts += 1
+
+                seg = segments[cand_i]
+                old_q = dict(seg.get("quality", {}) or {})
+                old_combined = float(old_q.get("combined", 0.0))
+                old_source = seg["source"]
+                old_start = float(seg["start"])
+                before_unresolved = self._count_no_target_boundary_unresolved(segments)
+                before_excess = total_boundary_excess()
+                before_pen = local_penalty(cand_i)
+
+                candidates_to_try: List[Dict[str, object]] = []
+                neighbor_sources: Set[str] = set()
+                for nei_i in (cand_i - 1, cand_i + 1):
+                    if nei_i < 0 or nei_i >= len(segments):
+                        continue
+                    nei_src = segments[nei_i]["source"]
+                    if nei_src == self.target_video:
+                        continue
+                    neighbor_sources.add(str(nei_src))
+
+                # 方案A：沿用现有 process_segment 结果（原策略）
+                task = SegmentTask(
+                    index=int(seg["index"]),
+                    target_start=float(seg["target_start"]),
+                    duration=float(seg["duration"]),
+                )
+                try:
+                    result = self.process_segment(task)
+                except Exception:
+                    result = None
+                if (
+                    result is not None
+                    and result.success
+                    and not self._is_secondary_source(Path(result.source))
+                ):
+                    candidates_to_try.append(
+                        {
+                            "source": result.source,
+                            "start": float(result.source_start),
+                            "quality": dict(result.quality or {}),
+                            "mode": "process_segment",
+                        }
+                    )
+
+                # 方案B：边界感知候选重搜（优先减少局部重叠/断缝）
+                phash_cands = self.find_match_by_phash(
+                    target_start=float(seg["target_start"]),
+                    duration=float(seg["duration"]),
+                    seg_index=int(seg["index"]),
+                    top_k=120,
+                )
+                # 附加邻段外推候选（帮助跨源切换时快速贴合）
+                for nei_i in (cand_i - 1, cand_i + 1):
+                    if nei_i < 0 or nei_i >= len(segments):
+                        continue
+                    nei = segments[nei_i]
+                    est = float(nei["start"]) + (float(seg["target_start"]) - float(nei["target_start"]))
+                    phash_cands.append((nei["source"], float(est), 0.0))
+
+                seen_boundary_cands: Set[Tuple[str, float]] = set()
+                for src, raw_start, phash_sim in phash_cands:
+                    src = Path(src)
+                    if src == self.target_video:
+                        continue
+                    if self._is_secondary_source(src):
+                        continue
+                    sig = (str(src), round(float(raw_start), 3))
+                    if sig in seen_boundary_cands:
+                        continue
+                    seen_boundary_cands.add(sig)
+
+                    src_dur = self.get_video_duration(src)
+                    if src_dur <= 0.0:
+                        continue
+                    max_start = max(0.0, float(src_dur - float(seg["duration"])))
+                    cand_start = max(0.0, min(float(raw_start), max_start))
+
+                    refined_start, refine_score = self.refine_start_by_visual(
+                        source=src,
+                        initial_start=float(cand_start),
+                        target_start=float(seg["target_start"]),
+                        duration=float(seg["duration"]),
+                    )
+                    refined_start = max(0.0, min(float(refined_start), max_start))
+
+                    verify_passed, verify_avg = self.quick_verify(
+                        source=src,
+                        source_start=float(refined_start),
+                        target_start=float(seg["target_start"]),
+                        duration=float(seg["duration"]),
+                    )
+                    allow_desperation = bool(
+                        pair_severity >= 1.60
+                        and (cand_i == curr_i or pair_tail_locked_curr)
+                    )
+                    relaxed_verify = False
+                    desperation_nonlocal = False
+                    if not verify_passed:
+                        # 仅用于“边界未收敛重匹配”的受控宽松核验，避免因严格阈值导致长时间重叠无法消除。
+                        relaxed_min_avg = max(0.76, float(self.strict_verify_min_sim) - 0.02)
+                        relaxed_min_floor = max(0.58, float(self.strict_verify_min_sim) - 0.20)
+                        if pair_severity >= 1.20 and (cand_i == curr_i or pair_tail_locked_curr):
+                            relaxed_min_avg = min(relaxed_min_avg, 0.70)
+                            relaxed_min_floor = min(relaxed_min_floor, 0.45)
+                        if pair_severity >= 2.50 and (cand_i == curr_i or pair_tail_locked_curr):
+                            relaxed_min_avg = min(relaxed_min_avg, 0.64)
+                            relaxed_min_floor = min(relaxed_min_floor, 0.36)
+                        offsets = [
+                            0.0,
+                            float(seg["duration"]) * 0.25,
+                            float(seg["duration"]) * 0.5,
+                            float(seg["duration"]) * 0.75,
+                            max(0.0, float(seg["duration"]) - 0.1),
+                        ]
+                        relaxed_passed, relaxed_avg = self.verify_segment_visual(
+                            source=src,
+                            source_start=float(refined_start),
+                            target_start=float(seg["target_start"]),
+                            duration=float(seg["duration"]),
+                            offsets=offsets,
+                            min_avg=float(relaxed_min_avg),
+                            min_floor=float(relaxed_min_floor),
+                        )
+                        if not relaxed_passed:
+                            if not allow_desperation:
+                                continue
+                            # 极端重叠兜底：允许次优画面但音频可用的跨源候选先去重，
+                            # 防止末段长期保留 2~5 秒重复内容。
+                            _, loose_avg = self.verify_segment_visual(
+                                source=src,
+                                source_start=float(refined_start),
+                                target_start=float(seg["target_start"]),
+                                duration=float(seg["duration"]),
+                                offsets=offsets,
+                                min_avg=0.0,
+                                min_floor=0.0,
+                            )
+                            if float(loose_avg) < 0.82:
+                                continue
+                            verify_avg = float(loose_avg)
+                            relaxed_verify = True
+                            desperation_nonlocal = True
+                        else:
+                            verify_avg = float(relaxed_avg)
+                            relaxed_verify = True
+
+                    audio_passed, audio_meta = self.quick_verify_audio(
+                        source=src,
+                        source_start=float(refined_start),
+                        target_start=float(seg["target_start"]),
+                        duration=float(seg["duration"]),
+                        combined_score=float(verify_avg),
+                    )
+                    if not audio_passed:
+                        continue
+
+                    candidates_to_try.append(
+                        {
+                            "source": src,
+                            "start": float(refined_start),
+                            "quality": {
+                                "combined": float(verify_avg),
+                                "boundary_unresolved_rematch_no_target": True,
+                                "boundary_unresolved_rematch_mode": (
+                                    "boundary_aware_candidate_desperate"
+                                    if desperation_nonlocal
+                                    else "boundary_aware_candidate"
+                                ),
+                                "boundary_unresolved_rematch_phash_similarity": float(phash_sim),
+                                "boundary_unresolved_rematch_refine_score": float(refine_score),
+                                "boundary_unresolved_rematch_relaxed_verify": bool(relaxed_verify),
+                                "boundary_unresolved_rematch_desperate_nonlocal": bool(desperation_nonlocal),
+                                "audio_guard": audio_meta,
+                            },
+                            "mode": (
+                                "boundary_aware_candidate_desperate"
+                                if desperation_nonlocal
+                                else "boundary_aware_candidate"
+                            ),
+                        }
+                    )
+
+                # 方案C：当边界重叠较大或右段贴尾时，补一次宽范围视觉候选。
+                need_broad_visual = (
+                    pair_severity >= 0.55
+                    or pair_tail_locked_curr
+                    or len(phash_cands) < 6
+                )
+                if need_broad_visual:
+                    fb_source, fb_start, fb_score = self.find_best_match_by_visual(
+                        target_start=float(seg["target_start"]),
+                        duration=float(seg["duration"]),
+                        seg_index=int(seg["index"]),
+                    )
+                    if (
+                        fb_source is not None
+                        and fb_source != self.target_video
+                        and (not self._is_secondary_source(Path(fb_source)))
+                    ):
+                        fb_source = Path(fb_source)
+                        fb_dur = self.get_video_duration(fb_source)
+                        if fb_dur > 0.0:
+                            fb_max_start = max(0.0, float(fb_dur - float(seg["duration"])))
+                            fb_start = max(0.0, min(float(fb_start), fb_max_start))
+                            refined_start, refine_score = self.refine_start_by_visual(
+                                source=fb_source,
+                                initial_start=float(fb_start),
+                                target_start=float(seg["target_start"]),
+                                duration=float(seg["duration"]),
+                            )
+                            refined_start = max(0.0, min(float(refined_start), fb_max_start))
+
+                            verify_passed, verify_avg = self.quick_verify(
+                                source=fb_source,
+                                source_start=float(refined_start),
+                                target_start=float(seg["target_start"]),
+                                duration=float(seg["duration"]),
+                            )
+                            if verify_passed:
+                                audio_passed, audio_meta = self.quick_verify_audio(
+                                    source=fb_source,
+                                    source_start=float(refined_start),
+                                    target_start=float(seg["target_start"]),
+                                    duration=float(seg["duration"]),
+                                    combined_score=float(verify_avg),
+                                )
+                                if audio_passed:
+                                    candidates_to_try.append(
+                                        {
+                                            "source": fb_source,
+                                            "start": float(refined_start),
+                                            "quality": {
+                                                "combined": float(verify_avg),
+                                                "boundary_unresolved_rematch_no_target": True,
+                                                "boundary_unresolved_rematch_mode": "boundary_visual_fallback",
+                                                "boundary_unresolved_rematch_visual_search_score": float(fb_score),
+                                                "boundary_unresolved_rematch_refine_score": float(refine_score),
+                                                "audio_guard": audio_meta,
+                                            },
+                                            "mode": "boundary_visual_fallback",
+                                        }
+                                    )
+
+                # 评估候选，选择“局部边界惩罚最小、总体惩罚下降、且分数可接受”的最佳方案
+                best_choice: Optional[Dict[str, object]] = None
+                best_key: Optional[Tuple[float, float, float]] = None
+                for cand in candidates_to_try:
+                    new_source = cand.get("source")
+                    new_start = float(cand.get("start", 0.0))
+                    if new_source is None:
+                        continue
+                    if str(new_source) == str(old_source) and abs(new_start - old_start) <= 0.06:
+                        continue
+
+                    seg["source"] = new_source
+                    seg["start"] = new_start
+                    after_pen = local_penalty(cand_i)
+                    after_excess = total_boundary_excess()
+                    after_unresolved = self._count_no_target_boundary_unresolved(segments)
+                    seg["source"] = old_source
+                    seg["start"] = old_start
+
+                    improved_local = (after_pen + 1e-6) < before_pen
+                    improved_total = (after_excess + 1e-6) < before_excess
+                    if not (improved_local or improved_total):
+                        continue
+                    allow_unresolved_increase = 0
+                    if pair_severity >= 1.20 and (cand_i == curr_i or pair_tail_locked_curr):
+                        # 严重重叠边界允许“临时+1 未收敛”以换取本边界先消除重复，
+                        # 后续硬约束/音频修复会再做收口。
+                        allow_unresolved_increase = 1
+                    if after_unresolved > (before_unresolved + allow_unresolved_increase):
+                        continue
+
+                    new_q = cand.get("quality", {}) or {}
+                    new_combined = float(new_q.get("combined", old_combined))
+                    matches_neighbor_source = (str(new_source) in neighbor_sources) if neighbor_sources else True
+                    if not matches_neighbor_source:
+                        # 边界修复可跨源，但对跨源候选分段设置动态门限：
+                        # 仅在“run 末端/贴尾且重叠严重”场景放宽，避免中段跨源误跳。
+                        nonlocal_min = 0.88
+                        curr_terminal = is_run_terminal(curr_i)
+                        if pair_severity >= 0.55 and curr_terminal:
+                            nonlocal_min = 0.86
+                        if (
+                            pair_severity >= 1.10
+                            and curr_terminal
+                            and (cand_i == curr_i or pair_tail_locked_curr)
+                        ):
+                            nonlocal_min = 0.80
+                        if (
+                            pair_severity >= 1.90
+                            and curr_terminal
+                            and (cand_i == curr_i or pair_tail_locked_curr)
+                        ):
+                            nonlocal_min = 0.76
+                        nonlocal_min = max(0.76, min(0.92, nonlocal_min))
+                        if new_combined + 1e-6 < nonlocal_min:
+                            continue
+                        new_q["boundary_unresolved_rematch_nonlocal_source"] = True
+                        new_q["boundary_unresolved_rematch_nonlocal_min_required"] = float(nonlocal_min)
+
+                    mode_name = str(cand.get("mode", ""))
+                    max_drop = 0.12 if improved_local else 0.08
+                    if pair_severity >= 1.60 and (cand_i == curr_i or pair_tail_locked_curr):
+                        max_drop = max(max_drop, 0.18)
+                    if pair_severity >= 2.50 and (cand_i == curr_i or pair_tail_locked_curr):
+                        max_drop = max(max_drop, 0.24)
+                    if mode_name == "boundary_aware_candidate_desperate":
+                        max_drop = max(max_drop, 0.28 if pair_severity >= 2.50 else 0.22)
+                    if new_combined + max_drop < old_combined:
+                        continue
+
+                    # 排序优先级：局部惩罚更小 > 全局惩罚更小 > 分数更高
+                    nonlocal_penalty = 0.0
+                    if not matches_neighbor_source:
+                        nonlocal_penalty = 0.35
+                        if pair_severity >= 1.20:
+                            nonlocal_penalty = 0.12
+                        if pair_severity >= 2.50:
+                            nonlocal_penalty = 0.0
+                    mode_penalty = 0.03 if mode_name == "boundary_visual_fallback" else 0.0
+                    key = (float(after_pen) + nonlocal_penalty + mode_penalty, float(after_excess), -float(new_combined))
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best_choice = {
+                            "source": new_source,
+                            "start": float(new_start),
+                            "quality": dict(new_q),
+                            "after_pen": float(after_pen),
+                            "after_excess": float(after_excess),
+                            "after_unresolved": int(after_unresolved),
+                            "combined": float(new_combined),
+                            "mode": mode_name,
+                        }
+
+                if best_choice is None:
+                    continue
+
+                seg["source"] = best_choice["source"]
+                seg["start"] = float(best_choice["start"])
+                q = dict(old_q)
+                q.update(dict(best_choice.get("quality", {}) or {}))
+                q["boundary_unresolved_rematch_no_target"] = True
+                q["boundary_unresolved_rematch_pair_prev_index"] = int(prev_i)
+                q["boundary_unresolved_rematch_pair_curr_index"] = int(curr_i)
+                q["boundary_unresolved_rematch_pair_gap"] = float(pair_gap)
+                q["boundary_unresolved_rematch_candidate_index"] = int(cand_i)
+                q["boundary_unresolved_rematch_tail_locked_curr"] = bool(pair_tail_locked_curr)
+                q["boundary_unresolved_rematch_from_source"] = str(old_source)
+                q["boundary_unresolved_rematch_from_start"] = float(old_start)
+                q["boundary_unresolved_rematch_before_pen"] = float(before_pen)
+                q["boundary_unresolved_rematch_after_pen"] = float(best_choice["after_pen"])
+                q["boundary_unresolved_rematch_before_excess"] = float(before_excess)
+                q["boundary_unresolved_rematch_after_excess"] = float(best_choice["after_excess"])
+                q["boundary_unresolved_rematch_mode"] = str(best_choice.get("mode", ""))
+                seg["quality"] = q
+                applied += 1
+                pair_applied = True
+                break
+
+            if pair_applied:
+                continue
+
+        return int(applied)
+
+    def _backprop_resolve_locked_tail_overlaps_no_target(self, segments: List[dict]) -> int:
+        """
+        反向回推修复（禁兜底）：
+        - 处理同源相邻段未收敛的负重叠边界；
+        - 将重叠量向前分摊到同源 run，优先消除重复词/局部倒放感；
+        - 仅对置信度可接受或强制邻段恢复段生效，避免低置信大幅漂移。
+        返回：成功回推修复的边界数。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if not bool(getattr(self, "no_target_backprop_overlap_fix", True)):
+            return 0
+        if len(segments) < 2:
+            return 0
+
+        fixed_boundaries = 0
+        max_shift_cap = max(0.0, float(getattr(self, "no_target_backprop_max_shift", 0.0)))
+        min_quality = max(0.0, float(getattr(self, "no_target_backprop_min_quality", 0.0)))
+        neg_floor = max(0.0, float(getattr(self, "no_target_backprop_neg_trigger_floor", 0.08)))
+
+        for i in range(1, len(segments)):
+            prev = segments[i - 1]
+            curr = segments[i]
+            if prev["source"] == self.target_video or curr["source"] == self.target_video:
+                continue
+            if prev["source"] != curr["source"]:
+                continue
+
+            prev_end = float(prev["start"]) + float(prev["duration"])
+            curr_start = float(curr["start"])
+            gap = curr_start - prev_end
+            neg_trigger = max(float(neg_floor), float(curr["duration"]) * 0.02)
+            if gap >= -neg_trigger:
+                continue
+
+            source_duration = self.get_video_duration(curr["source"])
+            if source_duration <= 0.0:
+                continue
+            overlap = -gap
+            if overlap <= 1e-6:
+                continue
+            rollback: Dict[int, float] = {}
+
+            def save_old(idx: int) -> None:
+                if idx not in rollback:
+                    rollback[idx] = float(segments[idx]["start"])
+
+            def shift_left_with_chain(idx: int, amount: float) -> float:
+                if amount <= 1e-6:
+                    return 0.0
+                if idx < 0:
+                    return 0.0
+                seg = segments[idx]
+                if seg["source"] != curr["source"] or seg["source"] == self.target_video:
+                    return 0.0
+
+                seg_start_now = float(seg["start"])
+                min_start_now = 0.0
+                has_prev_same = (
+                    idx > 0
+                    and segments[idx - 1]["source"] == seg["source"]
+                    and segments[idx - 1]["source"] != self.target_video
+                )
+                if has_prev_same:
+                    min_start_now = float(segments[idx - 1]["start"]) + float(segments[idx - 1]["duration"])
+                movable_now = max(0.0, seg_start_now - min_start_now)
+
+                need_extra = max(0.0, float(amount) - movable_now)
+                if need_extra > 1e-6 and has_prev_same:
+                    shift_left_with_chain(idx - 1, need_extra)
+                    seg_start_now = float(seg["start"])
+                    min_start_now = float(segments[idx - 1]["start"]) + float(segments[idx - 1]["duration"])
+                    movable_now = max(0.0, seg_start_now - min_start_now)
+
+                applied = min(float(amount), movable_now)
+                if applied > 1e-6:
+                    save_old(idx)
+                    seg["start"] = seg_start_now - applied
+                return float(applied)
+
+            curr_max_start = max(0.0, float(source_duration - float(curr["duration"])))
+            if (i + 1) < len(segments):
+                nxt = segments[i + 1]
+                if nxt["source"] == curr["source"] and nxt["source"] != self.target_video:
+                    # 关键保护：若后续仍是同源段，不要把当前段前推到“挤压下一段”的位置，
+                    # 否则会把重复集中到 run 尾部，形成用户可感知的末尾回放感。
+                    next_gap_allow = max(float(neg_floor), float(nxt["duration"]) * 0.02)
+                    next_bound = float(nxt["start"]) - float(curr["duration"]) + float(next_gap_allow)
+                    curr_max_start = min(curr_max_start, max(0.0, float(next_bound)))
+            moved_curr = 0.0
+            curr_headroom = max(0.0, curr_max_start - float(curr["start"]))
+            if curr_headroom > 1e-6:
+                moved_curr = min(float(overlap), curr_headroom)
+                if moved_curr > 1e-6:
+                    save_old(i)
+                    curr["start"] = float(curr["start"]) + moved_curr
+
+            remaining = max(0.0, float(overlap) - moved_curr)
+            if max_shift_cap > 1e-6:
+                remaining = min(remaining, max_shift_cap)
+            shifted_prev = 0.0
+            if remaining > 1e-6:
+                shifted_prev = shift_left_with_chain(i - 1, remaining)
+
+            total_shift = moved_curr + shifted_prev
+            if total_shift <= 1e-6:
+                for idx, old_start in rollback.items():
+                    segments[idx]["start"] = old_start
+                continue
+
+            # 质量守卫：仅允许高置信段或“邻段强制恢复”段参与大幅回推。
+            quality_ok = True
+            for idx, old_start in rollback.items():
+                seg = segments[idx]
+                q = seg.get("quality", {}) or {}
+                combined = float(q.get("combined", 0.0))
+                recover_mode = str(q.get("recover_mode", "") or "")
+                if (combined + 1e-6) < min_quality and recover_mode != "neighbors_forced_no_verify":
+                    quality_ok = False
+                    break
+
+                large_shift = abs(float(seg["start"]) - float(old_start)) > max(0.9, float(seg["duration"]) * 0.22)
+                verify_needed = large_shift and combined < max(0.86, min_quality + 0.08)
+                if verify_needed:
+                    passed, verify_avg = self.quick_verify(
+                        source=seg["source"],
+                        source_start=float(seg["start"]),
+                        target_start=float(seg["target_start"]),
+                        duration=float(seg["duration"]),
+                    )
+                    if not passed and recover_mode != "neighbors_forced_no_verify":
+                        quality_ok = False
+                        break
+                    q["micro_gap_backprop_verify_passed"] = bool(passed)
+                    q["micro_gap_backprop_verify_avg"] = float(verify_avg)
+                    seg["quality"] = q
+
+            if not quality_ok:
+                for idx, old_start in rollback.items():
+                    segments[idx]["start"] = old_start
+                continue
+
+            # 安全阀：禁止回推修复引入明显同源负重叠（会直接表现为重读/回放感）。
+            overlap_safe = True
+            for idx in sorted(rollback.keys()):
+                if idx <= 0:
+                    continue
+                left = segments[idx - 1]
+                right = segments[idx]
+                if right["source"] == self.target_video or left["source"] != right["source"]:
+                    continue
+                local_gap = float(right["start"]) - (float(left["start"]) + float(left["duration"]))
+                local_neg_trigger = max(float(neg_floor), float(right["duration"]) * 0.02)
+                if local_gap < -max(0.35, local_neg_trigger * 2.0):
+                    overlap_safe = False
+                    break
+            if not overlap_safe:
+                for idx, old_start in rollback.items():
+                    segments[idx]["start"] = old_start
+                continue
+
+            new_prev_end = float(segments[i - 1]["start"]) + float(segments[i - 1]["duration"])
+            new_gap = float(segments[i]["start"]) - new_prev_end
+            before_excess = max(0.0, (-float(gap)) - float(neg_trigger))
+            after_excess = max(0.0, (-float(new_gap)) - float(neg_trigger))
+            if (after_excess + 1e-5) >= before_excess:
+                for idx, old_start in rollback.items():
+                    segments[idx]["start"] = old_start
+                continue
+
+            for idx, old_start in rollback.items():
+                seg = segments[idx]
+                q = seg.get("quality", {}) or {}
+                shift_applied = float(old_start - float(seg["start"]))
+                q["micro_gap_backprop_shift_no_target"] = True
+                q["micro_gap_backprop_shift_sec"] = float(q.get("micro_gap_backprop_shift_sec", 0.0)) + shift_applied
+                q["micro_gap_backprop_anchor_index"] = int(i)
+                if idx == i:
+                    q["micro_gap_backprop_forward_to_max"] = True
+                seg["quality"] = q
+
+            fixed_boundaries += 1
+
+        return int(fixed_boundaries)
+
+    def _nudge_cross_source_head_boundaries_no_target(self, segments: List[dict]) -> int:
+        """
+        跨源边界头部微调（禁兜底）：
+        - 命中条件：前段接近源片尾，后段接近源片头，且两段不同源
+        - 通过小步前移后段起点，降低跨源接缝处“重复词/黑一下”的主观感受
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if not bool(getattr(self, "cross_source_head_nudge_enabled", True)):
+            return 0
+        if len(segments) < 2:
+            return 0
+
+        adjusted = 0
+        prev_tail_window = max(0.0, float(getattr(self, "cross_source_head_nudge_prev_tail_window", 0.0)))
+        curr_head_window = max(0.0, float(getattr(self, "cross_source_head_nudge_curr_head_window", 0.0)))
+        max_offset = max(0.0, float(getattr(self, "cross_source_head_nudge_max_offset", 0.0)))
+        score_bias = float(getattr(self, "cross_source_head_nudge_score_bias", 0.0))
+        max_verify_drop = max(0.0, float(getattr(self, "cross_source_head_nudge_max_verify_drop", 0.0)))
+        forward_cap = max(0.0, float(getattr(self, "cross_source_head_nudge_forward_cap", 0.35)))
+        forward_gain_trigger = max(
+            0.0,
+            float(getattr(self, "cross_source_head_nudge_forward_gain_trigger", 0.06)),
+        )
+        allow_backward = bool(getattr(self, "cross_source_head_nudge_allow_backward", True))
+        backward_cap = max(0.0, float(getattr(self, "cross_source_head_nudge_backward_cap", 0.8)))
+        backward_gain_trigger = max(
+            0.0,
+            float(getattr(self, "cross_source_head_nudge_backward_gain_trigger", 0.015)),
+        )
+        boundary_audio_weight = max(
+            0.0,
+            float(getattr(self, "cross_source_head_nudge_boundary_audio_weight", 0.06)),
+        )
+        if max_offset <= 1e-6:
+            return 0
+
+        max_forward_offset = min(float(max_offset), float(forward_cap)) if forward_cap > 1e-6 else float(max_offset)
+        base_positive_offsets = [0.0, 0.1, 0.2, 0.3, 0.4, 0.6, 0.8, 1.0]
+        positive_offsets = [x for x in base_positive_offsets if x <= (max_forward_offset + 1e-6)]
+        if max_forward_offset > 1e-6:
+            rounded_cap = round(float(max_forward_offset), 3)
+            if all(abs(float(x) - float(rounded_cap)) > 1e-6 for x in positive_offsets):
+                positive_offsets.append(float(rounded_cap))
+        positive_offsets = sorted(set(float(x) for x in positive_offsets))
+
+        for i in range(1, len(segments)):
+            prev = segments[i - 1]
+            curr = segments[i]
+            if prev["source"] == self.target_video or curr["source"] == self.target_video:
+                continue
+            if prev["source"] == curr["source"]:
+                continue
+
+            curr_start = float(curr["start"])
+            if curr_start > curr_head_window + 1e-6:
+                continue
+
+            prev_source_duration = self.get_video_duration(prev["source"])
+            if prev_source_duration <= 0.0:
+                continue
+            prev_tail_left = float(prev_source_duration - (float(prev["start"]) + float(prev["duration"])))
+            if prev_tail_left > prev_tail_window + 1e-6:
+                continue
+
+            curr_source_duration = self.get_video_duration(curr["source"])
+            if curr_source_duration <= 0.0:
+                continue
+            max_start = max(0.0, float(curr_source_duration - float(curr["duration"])))
+            curr_q = curr.get("quality", {}) or {}
+            rescue_meta = curr_q.get("rescue", {}) if isinstance(curr_q.get("rescue", {}), dict) else {}
+            rescue_triggered = bool(rescue_meta.get("triggered", False))
+            max_backward_offset = 0.0
+            if allow_backward:
+                max_backward_offset = min(float(curr_start), float(backward_cap), float(max_offset))
+                if rescue_triggered:
+                    # 片头已被音频守卫/重救回拉到句首附近时，不再允许跨源微调把它反向拽回更早位置。
+                    max_backward_offset = 0.0
+
+            offset_candidates = [float(x) for x in positive_offsets]
+            if allow_backward and max_backward_offset > 1e-6:
+                negative_base = [-0.8, -0.6, -0.4, -0.3, -0.2, -0.1, -0.05]
+                for off in negative_base:
+                    if abs(float(off)) <= (max_backward_offset + 1e-6):
+                        offset_candidates.append(float(off))
+                rounded_back_cap = round(float(max_backward_offset), 3)
+                if all(abs(float(x) + float(rounded_back_cap)) > 1e-6 for x in offset_candidates):
+                    offset_candidates.append(-float(rounded_back_cap))
+            offset_candidates = sorted(set(float(x) for x in offset_candidates))
+            if 0.0 not in offset_candidates:
+                offset_candidates.insert(0, 0.0)
+
+            base_passed, base_avg = self.quick_verify(
+                source=curr["source"],
+                source_start=float(curr_start),
+                target_start=float(curr["target_start"]),
+                duration=float(curr["duration"]),
+            )
+            if not base_passed:
+                continue
+            base_audio_passed, base_audio_meta = self.quick_verify_audio(
+                source=curr["source"],
+                source_start=float(curr_start),
+                target_start=float(curr["target_start"]),
+                duration=float(curr["duration"]),
+                combined_score=float(base_avg),
+            )
+            base_aligned = float(base_audio_meta.get("aligned_similarity", 0.0) or 0.0)
+            base_shift_gain = float(base_audio_meta.get("shift_gain", 0.0) or 0.0)
+            boundary_audio_window = max(
+                0.30,
+                float(getattr(self, "boundary_audio_probe_window_sec", 0.45)),
+            )
+            base_boundary_sim = self._boundary_audio_similarity(
+                source=curr["source"],
+                target_boundary_sec=float(curr["target_start"]),
+                source_boundary_sec=float(curr_start),
+                window_sec=float(boundary_audio_window),
+            )
+            base_score = (
+                float(base_avg)
+                + float(base_aligned) * 0.03
+                + float(base_boundary_sim) * float(boundary_audio_weight)
+                - float(base_shift_gain) * 0.06
+            )
+            if not base_audio_passed:
+                # 当前片头候选已被音频守卫判失败时，仍允许继续搜索偏移候选，
+                # 避免“卡在错误片头起点”而无法回拉到正确句首。
+                base_score -= 0.25
+
+            best = {
+                "start": float(curr_start),
+                "avg": float(base_avg),
+                "offset": 0.0,
+                "score": float(base_score),
+                "audio_meta": base_audio_meta,
+                "boundary_sim": float(base_boundary_sim),
+                "base_audio_failed": bool(not base_audio_passed),
+            }
+
+            for off in offset_candidates:
+                if off <= 1e-6:
+                    if off >= -1e-6:
+                        continue
+                cand = max(0.0, min(float(curr_start + off), max_start))
+                if abs(cand - curr_start) <= 1e-6:
+                    continue
+                # 约束：不能把当前段前移到与“下一同源段”形成明显负重叠
+                if (i + 1) < len(segments):
+                    nxt = segments[i + 1]
+                    if nxt["source"] == curr["source"] and nxt["source"] != self.target_video:
+                        next_gap = float(nxt["start"]) - (float(cand) + float(curr["duration"]))
+                        neg_trigger = max(0.12, float(nxt["duration"]) * 0.02)
+                        if next_gap < -neg_trigger:
+                            continue
+                passed, avg = self.quick_verify(
+                    source=curr["source"],
+                    source_start=float(cand),
+                    target_start=float(curr["target_start"]),
+                    duration=float(curr["duration"]),
+                )
+                if not passed:
+                    continue
+                if float(avg) + max_verify_drop < float(base_avg):
+                    continue
+                audio_passed, audio_meta = self.quick_verify_audio(
+                    source=curr["source"],
+                    source_start=float(cand),
+                    target_start=float(curr["target_start"]),
+                    duration=float(curr["duration"]),
+                    combined_score=float(avg),
+                )
+                if not audio_passed:
+                    continue
+                realigned_start, shift_meta, shifted_audio_meta = self.try_audio_guard_shift_realign(
+                    source=curr["source"],
+                    source_start=float(cand),
+                    target_start=float(curr["target_start"]),
+                    duration=float(curr["duration"]),
+                    combined_score=float(avg),
+                    audio_meta=audio_meta,
+                )
+                if bool(shift_meta.get("applied", False)):
+                    cand = float(realigned_start)
+                    avg = max(float(avg), float(shift_meta.get("candidate_verify_avg", avg)))
+                    if isinstance(shifted_audio_meta, dict):
+                        audio_meta = shifted_audio_meta
+                else:
+                    shift_meta = dict(shift_meta or {})
+                aligned = float(audio_meta.get("aligned_similarity", 0.0) or 0.0)
+                shift_gain = float(audio_meta.get("shift_gain", 0.0) or 0.0)
+                boundary_sim = self._boundary_audio_similarity(
+                    source=curr["source"],
+                    target_boundary_sec=float(curr["target_start"]),
+                    source_boundary_sec=float(cand),
+                    window_sec=float(boundary_audio_window),
+                )
+                forward_bias = float(max(0.0, float(off))) * score_bias
+                score = (
+                    float(avg)
+                    + float(forward_bias)
+                    + float(aligned) * 0.03
+                    + float(boundary_sim) * float(boundary_audio_weight)
+                    - float(shift_gain) * 0.06
+                )
+                if float(off) > 1e-6:
+                    required_gain = float(forward_gain_trigger)
+                elif float(off) < -1e-6:
+                    required_gain = float(backward_gain_trigger)
+                else:
+                    required_gain = 0.0
+                if bool(best.get("base_audio_failed", False)):
+                    # 基线音频失败时，放宽收益门槛，只要有净提升就允许替换。
+                    required_gain = 0.0
+                if score > float(best["score"]) + float(required_gain) + 1e-6:
+                    best = {
+                        "start": float(cand),
+                        "avg": float(avg),
+                        "offset": float(off),
+                        "score": float(score),
+                        "audio_meta": audio_meta,
+                        "audio_shift_meta": shift_meta,
+                        "boundary_sim": float(boundary_sim),
+                        "base_audio_failed": bool(best.get("base_audio_failed", False)),
+                    }
+
+            if abs(float(best["start"]) - curr_start) <= 1e-6:
+                continue
+
+            curr["start"] = float(best["start"])
+            q = curr.get("quality", {}) or {}
+            q["cross_source_head_nudged_no_target"] = True
+            q["cross_source_head_nudge_offset_sec"] = float(best["offset"])
+            q["cross_source_head_nudge_verify_avg"] = float(best["avg"])
+            q["cross_source_head_nudge_prev_tail_left"] = float(prev_tail_left)
+            q["cross_source_head_nudge_direction"] = (
+                "backward" if float(best["offset"]) < -1e-6 else "forward"
+            )
+            q["cross_source_head_nudge_boundary_audio_sim"] = float(best.get("boundary_sim", 0.0))
+            q["cross_source_head_nudge_audio_guard"] = best["audio_meta"]
+            q["cross_source_head_nudge_audio_shift_fix"] = best.get("audio_shift_meta", {})
+            curr["quality"] = q
+            adjusted += 1
+
+        return int(adjusted)
+
+    def _rebalance_neighbor_recovered_segments_no_target(self, segments: List[dict]) -> int:
+        """
+        邻段恢复后置重平衡（禁兜底）：
+        - 仅处理 recover_mode=neighbors_last_resort_no_target 的段；
+        - 以最终邻段为准重新计算边界窗口，避免“上游段后续改源后”把重叠集中压到单侧；
+        - 若窗口反转（不可避免重叠），取中点均摊，降低局部重读感。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if len(segments) < 3:
+            return 0
+
+        adjusted = 0
+        for i in range(1, len(segments) - 1):
+            seg = segments[i]
+            q = seg.get("quality", {}) or {}
+            recover_mode = str(q.get("recover_mode", "") or "")
+            if recover_mode != "neighbors_last_resort_no_target":
+                continue
+            source = seg.get("source")
+            if source in (None, self.target_video):
+                continue
+
+            prev = segments[i - 1]
+            nxt = segments[i + 1]
+            if prev.get("source") != source or nxt.get("source") != source:
+                continue
+            if prev.get("source") == self.target_video or nxt.get("source") == self.target_video:
+                continue
+
+            prev_end = float(prev["start"]) + float(prev["duration"])
+            next_start = float(nxt["start"])
+            seg_duration = float(seg["duration"])
+            overlap_allow = max(0.35, seg_duration * 0.07)
+            # 前源尾巴接入后，neighbors_last_resort 段已经被整体前移过一次；
+            # 此时再保留 0.35s 级别的重叠窗口，很容易把重复内容重新带回成片。
+            if bool(q.get("cross_source_prev_tail_carryover_shifted_no_target", False)):
+                overlap_allow = min(overlap_allow, max(0.08, seg_duration * 0.02))
+            lower_bound = prev_end - overlap_allow
+            upper_bound = next_start - seg_duration + overlap_allow
+            compressed_window = bool(lower_bound > (upper_bound + 1e-6))
+
+            if compressed_window:
+                cand_start = 0.5 * (lower_bound + upper_bound)
+            else:
+                cand_start = min(max(float(seg["start"]), lower_bound), upper_bound)
+
+            src_duration = self.get_video_duration(source)
+            if src_duration <= 0.0:
+                continue
+            max_start = max(0.0, float(src_duration - seg_duration))
+            cand_start = max(0.0, min(float(cand_start), max_start))
+            old_start = float(seg["start"])
+            if abs(cand_start - old_start) < 0.04:
+                continue
+            prev_gap_before = float(old_start - prev_end)
+            next_gap_before = float(next_start - (old_start + seg_duration))
+            severe_overlap = bool((prev_gap_before < -1.0) or (next_gap_before < -1.0))
+            low_confidence_recover = bool(float(q.get("combined", 0.0)) <= 0.90)
+            force_continuity = bool(low_confidence_recover and (compressed_window or severe_overlap))
+
+            offsets = [
+                0.0,
+                seg_duration * 0.25,
+                seg_duration * 0.5,
+                seg_duration * 0.75,
+                max(0.0, seg_duration - 0.1),
+            ]
+            passed, avg = self.verify_segment_visual(
+                source=source,
+                source_start=float(cand_start),
+                target_start=float(seg["target_start"]),
+                duration=seg_duration,
+                offsets=offsets,
+                min_avg=0.70,
+                min_floor=0.45,
+            )
+            forced_no_verify = False
+            audio_meta: Dict[str, object] = {"checked": False}
+            shift_meta: Dict[str, object] = {"applied": False, "checked": False}
+            if not passed:
+                if not force_continuity:
+                    continue
+                forced_no_verify = True
+                avg = float(q.get("combined", 0.0))
+                audio_meta = {
+                    "checked": False,
+                    "forced_no_verify": True,
+                    "reason": "recover_rebalance_visual_failed_force_continuity",
+                }
+                shift_meta = {"applied": False, "checked": False, "reason": "forced_no_verify"}
+            else:
+                audio_passed, audio_meta = self.quick_verify_audio(
+                    source=source,
+                    source_start=float(cand_start),
+                    target_start=float(seg["target_start"]),
+                    duration=seg_duration,
+                    combined_score=float(avg),
+                )
+                if not audio_passed:
+                    if not force_continuity:
+                        continue
+                    forced_no_verify = True
+                    audio_meta = {
+                        "checked": False,
+                        "forced_no_verify": True,
+                        "reason": "recover_rebalance_audio_failed_force_continuity",
+                    }
+                    shift_meta = {"applied": False, "checked": False, "reason": "forced_no_verify"}
+                else:
+                    realigned_start, shift_meta, shifted_audio_meta = self.try_audio_guard_shift_realign(
+                        source=source,
+                        source_start=float(cand_start),
+                        target_start=float(seg["target_start"]),
+                        duration=seg_duration,
+                        combined_score=float(avg),
+                        audio_meta=audio_meta,
+                    )
+                    if bool(shift_meta.get("applied", False)):
+                        cand_start = float(realigned_start)
+                        avg = max(float(avg), float(shift_meta.get("candidate_verify_avg", avg)))
+                        if isinstance(shifted_audio_meta, dict):
+                            audio_meta = shifted_audio_meta
+                    else:
+                        shift_meta = dict(shift_meta or {})
+
+            seg["start"] = float(cand_start)
+            q["recover_rebalanced_no_target"] = True
+            q["recover_rebalanced_from"] = float(old_start)
+            q["recover_rebalanced_to"] = float(cand_start)
+            q["recover_rebalanced_verify_avg"] = float(avg)
+            q["recover_rebalanced_bounds"] = {
+                "lower_bound": float(lower_bound),
+                "upper_bound": float(upper_bound),
+                "compressed_window": bool(compressed_window),
+            }
+            q["recover_rebalanced_prev_gap_before"] = float(prev_gap_before)
+            q["recover_rebalanced_next_gap_before"] = float(next_gap_before)
+            q["recover_rebalanced_forced_no_verify"] = bool(forced_no_verify)
+            q["audio_guard"] = audio_meta
+            q["recover_rebalanced_audio_shift_fix"] = shift_meta
+            seg["quality"] = q
+            adjusted += 1
+
+        return int(adjusted)
+
+    def _repair_same_source_step_lag_runs_no_target(self, segments: List[dict]) -> int:
+        """
+        禁兜底同源步长滞后链修复：
+        - 识别同源 run 中连续“source 步长明显小于 target 步长”的链；
+        - 逐段向前校正起点，优先消除重复词/局部倒放观感；
+        - 以“逼近期望步长”为主目标，并通过 visual/audio 复核。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if len(segments) < 3:
+            return 0
+
+        fixed = 0
+        i = 0
+        while i < len(segments):
+            src = segments[i]["source"]
+            if src == self.target_video:
+                i += 1
+                continue
+            j = i + 1
+            while j < len(segments) and segments[j]["source"] == src:
+                j += 1
+            if (j - i) < 3:
+                i = j
+                continue
+            if any(self._is_tail_sensitive_last_resort_segment(segments[k]) for k in range(i, j)):
+                i = j
+                continue
+
+            durations = [float(segments[k]["duration"]) for k in range(i, j)]
+            base_duration = float(np.median(durations)) if durations else 5.0
+            lag_trigger = max(0.55, base_duration * 0.12)
+            lag_boundary_count = 0
+            for k in range(i + 1, j):
+                prev = segments[k - 1]
+                curr = segments[k]
+                target_step = float(curr["target_start"]) - float(prev["target_start"])
+                if target_step <= 0.0:
+                    continue
+                source_step = float(curr["start"]) - float(prev["start"])
+                if (target_step - source_step) > lag_trigger:
+                    lag_boundary_count += 1
+            if lag_boundary_count < 2:
+                i = j
+                continue
+
+            for k in range(i + 1, j):
+                prev = segments[k - 1]
+                curr = segments[k]
+                target_step = float(curr["target_start"]) - float(prev["target_start"])
+                if target_step <= 1e-6:
+                    continue
+
+                expected_start = float(prev["start"]) + float(target_step)
+                curr_start = float(curr["start"])
+                needed_shift = expected_start - curr_start
+                if needed_shift <= 0.06:
+                    continue
+
+                src_duration = self.get_video_duration(curr["source"])
+                if src_duration <= 0.0:
+                    continue
+                max_start = max(0.0, float(src_duration - float(curr["duration"])))
+                max_single_shift = max(0.8, float(curr["duration"]) * 0.56)
+                needed_shift = min(float(needed_shift), float(max_single_shift))
+                if needed_shift <= 0.06:
+                    continue
+
+                candidate_starts_raw = [
+                    curr_start + needed_shift,
+                    curr_start + min(needed_shift * 0.80, max_single_shift),
+                    curr_start + min(needed_shift * 0.60, max_single_shift),
+                ]
+                candidate_starts: List[float] = []
+                seen: Set[float] = set()
+                for c in candidate_starts_raw:
+                    cand = max(0.0, min(float(c), max_start))
+                    key = round(cand, 3)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if cand <= curr_start + 0.04:
+                        continue
+                    candidate_starts.append(float(cand))
+                if not candidate_starts:
+                    continue
+
+                best_choice: Optional[Dict[str, object]] = None
+                best_key: Optional[Tuple[float, float]] = None
+                original_start = float(curr["start"])
+                for cand_start in candidate_starts:
+                    offsets = [
+                        0.0,
+                        float(curr["duration"]) * 0.25,
+                        float(curr["duration"]) * 0.5,
+                        float(curr["duration"]) * 0.75,
+                        max(0.0, float(curr["duration"]) - 0.1),
+                    ]
+                    passed, avg = self.verify_segment_visual(
+                        source=curr["source"],
+                        source_start=float(cand_start),
+                        target_start=float(curr["target_start"]),
+                        duration=float(curr["duration"]),
+                        offsets=offsets,
+                        min_avg=max(0.66, float(self.strict_verify_min_sim) - 0.12),
+                        min_floor=max(0.42, float(self.strict_verify_min_sim) - 0.28),
+                    )
+                    if not passed:
+                        continue
+                    audio_passed, audio_meta = self.quick_verify_audio(
+                        source=curr["source"],
+                        source_start=float(cand_start),
+                        target_start=float(curr["target_start"]),
+                        duration=float(curr["duration"]),
+                        combined_score=float(avg),
+                    )
+                    if not audio_passed:
+                        continue
+                    realigned_start, shift_meta, shifted_audio_meta = self.try_audio_guard_shift_realign(
+                        source=curr["source"],
+                        source_start=float(cand_start),
+                        target_start=float(curr["target_start"]),
+                        duration=float(curr["duration"]),
+                        combined_score=float(avg),
+                        audio_meta=audio_meta,
+                    )
+                    if bool(shift_meta.get("applied", False)):
+                        cand_start = float(realigned_start)
+                        avg = max(float(avg), float(shift_meta.get("candidate_verify_avg", avg)))
+                        if isinstance(shifted_audio_meta, dict):
+                            audio_meta = shifted_audio_meta
+                    else:
+                        shift_meta = dict(shift_meta or {})
+
+                    residual = abs(float(expected_start) - float(cand_start))
+                    key = (float(residual), -float(avg))
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best_choice = {
+                            "start": float(cand_start),
+                            "avg": float(avg),
+                            "residual": float(residual),
+                            "audio_meta": audio_meta,
+                            "audio_shift_meta": shift_meta,
+                        }
+
+                if best_choice is None:
+                    continue
+
+                curr["start"] = float(best_choice["start"])
+                q = curr.get("quality", {}) or {}
+                q["step_lag_repaired_no_target"] = True
+                q["step_lag_repair_from"] = float(original_start)
+                q["step_lag_repair_to"] = float(best_choice["start"])
+                q["step_lag_repair_needed_shift"] = float(needed_shift)
+                q["step_lag_repair_expected_start"] = float(expected_start)
+                q["step_lag_repair_expected_residual"] = float(best_choice["residual"])
+                q["step_lag_repair_verify_avg"] = float(best_choice["avg"])
+                q["audio_guard"] = best_choice["audio_meta"]
+                q["step_lag_repair_audio_shift_fix"] = best_choice.get("audio_shift_meta", {})
+                curr["quality"] = q
+                fixed += 1
+
+            i = j
+
+        return int(fixed)
+
+    def _cleanup_unresolved_boundaries_post_lag_no_target(self, segments: List[dict], max_passes: int = 2) -> int:
+        """
+        滞后回正后的边界清理（禁兜底）：
+        - 对仍未收敛的同源边界，优先将右段贴近 prev_end；
+        - 仅接受 visual/audio 复核通过且边界超限不变差的候选。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if len(segments) < 2:
+            return 0
+
+        adjusted = 0
+        for _ in range(max(1, int(max_passes))):
+            changed = False
+            for i in range(1, len(segments)):
+                prev = segments[i - 1]
+                curr = segments[i]
+                nxt = segments[i + 1] if (i + 1) < len(segments) else None
+                if prev["source"] == self.target_video or curr["source"] == self.target_video:
+                    continue
+                if prev["source"] != curr["source"]:
+                    continue
+                if self._is_tail_sensitive_last_resort_segment(prev) or self._is_tail_sensitive_last_resort_segment(curr):
+                    continue
+                if (
+                    nxt is not None
+                    and nxt.get("source") == curr["source"]
+                    and self._is_tail_sensitive_last_resort_segment(nxt)
+                ):
+                    continue
+
+                prev_end = float(prev["start"]) + float(prev["duration"])
+                curr_start = float(curr["start"])
+                gap = float(curr_start - prev_end)
+                neg_trigger = max(0.12, float(curr["duration"]) * 0.02)
+                pos_trigger = max(0.20, float(curr["duration"]) * 0.04)
+                if (gap >= -neg_trigger) and (gap <= pos_trigger):
+                    continue
+
+                current_excess = 0.0
+                if gap < -neg_trigger:
+                    current_excess = float((-gap) - neg_trigger)
+                elif gap > pos_trigger:
+                    current_excess = float(gap - pos_trigger)
+
+                source_duration = self.get_video_duration(curr["source"])
+                if source_duration <= 0.0:
+                    continue
+                max_start = max(0.0, float(source_duration - float(curr["duration"])))
+                anchor = max(0.0, min(float(prev_end), max_start))
+
+                raw_candidates = [
+                    anchor,
+                    anchor - 0.20,
+                    anchor + 0.20,
+                    anchor - 0.50,
+                    anchor + 0.50,
+                ]
+                candidates: List[float] = []
+                seen: Set[float] = set()
+                for raw in raw_candidates:
+                    cand = max(0.0, min(float(raw), max_start))
+                    key = round(cand, 3)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(float(cand))
+
+                best_choice: Optional[Dict[str, object]] = None
+                best_key: Optional[Tuple[float, float, float]] = None
+                for cand_start in candidates:
+                    after_gap = float(cand_start - prev_end)
+                    after_excess = 0.0
+                    if after_gap < -neg_trigger:
+                        after_excess = float((-after_gap) - neg_trigger)
+                    elif after_gap > pos_trigger:
+                        after_excess = float(after_gap - pos_trigger)
+                    if after_excess > (current_excess + 1e-6):
+                        continue
+
+                    offsets = [
+                        0.0,
+                        float(curr["duration"]) * 0.25,
+                        float(curr["duration"]) * 0.5,
+                        float(curr["duration"]) * 0.75,
+                        max(0.0, float(curr["duration"]) - 0.1),
+                    ]
+                    passed, avg = self.verify_segment_visual(
+                        source=curr["source"],
+                        source_start=float(cand_start),
+                        target_start=float(curr["target_start"]),
+                        duration=float(curr["duration"]),
+                        offsets=offsets,
+                        min_avg=max(0.68, float(self.strict_verify_min_sim) - 0.10),
+                        min_floor=max(0.45, float(self.strict_verify_min_sim) - 0.25),
+                    )
+                    if not passed:
+                        continue
+                    audio_passed, audio_meta = self.quick_verify_audio(
+                        source=curr["source"],
+                        source_start=float(cand_start),
+                        target_start=float(curr["target_start"]),
+                        duration=float(curr["duration"]),
+                        combined_score=float(avg),
+                    )
+                    if not audio_passed:
+                        continue
+                    realigned_start, shift_meta, shifted_audio_meta = self.try_audio_guard_shift_realign(
+                        source=curr["source"],
+                        source_start=float(cand_start),
+                        target_start=float(curr["target_start"]),
+                        duration=float(curr["duration"]),
+                        combined_score=float(avg),
+                        audio_meta=audio_meta,
+                    )
+                    if bool(shift_meta.get("applied", False)):
+                        cand_start = float(realigned_start)
+                        avg = max(float(avg), float(shift_meta.get("candidate_verify_avg", avg)))
+                        if isinstance(shifted_audio_meta, dict):
+                            audio_meta = shifted_audio_meta
+                    else:
+                        shift_meta = dict(shift_meta or {})
+
+                    after_gap = float(cand_start - prev_end)
+                    after_excess = 0.0
+                    if after_gap < -neg_trigger:
+                        after_excess = float((-after_gap) - neg_trigger)
+                    elif after_gap > pos_trigger:
+                        after_excess = float(after_gap - pos_trigger)
+                    if after_excess > (current_excess + 1e-6):
+                        continue
+
+                    key = (float(after_excess), abs(float(cand_start - anchor)), -float(avg))
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best_choice = {
+                            "start": float(cand_start),
+                            "avg": float(avg),
+                            "after_gap": float(after_gap),
+                            "after_excess": float(after_excess),
+                            "audio_meta": audio_meta,
+                            "audio_shift_meta": shift_meta,
+                        }
+
+                if best_choice is None:
+                    continue
+                if abs(float(best_choice["start"]) - curr_start) <= 1e-6:
+                    continue
+
+                curr["start"] = float(best_choice["start"])
+                q = curr.get("quality", {}) or {}
+                q["post_lag_boundary_cleanup_no_target"] = True
+                q["post_lag_boundary_cleanup_from"] = float(curr_start)
+                q["post_lag_boundary_cleanup_to"] = float(best_choice["start"])
+                q["post_lag_boundary_cleanup_before_gap"] = float(gap)
+                q["post_lag_boundary_cleanup_after_gap"] = float(best_choice["after_gap"])
+                q["post_lag_boundary_cleanup_after_excess"] = float(best_choice["after_excess"])
+                q["post_lag_boundary_cleanup_verify_avg"] = float(best_choice["avg"])
+                q["audio_guard"] = best_choice["audio_meta"]
+                q["post_lag_boundary_cleanup_audio_shift_fix"] = best_choice.get("audio_shift_meta", {})
+                curr["quality"] = q
+                adjusted += 1
+                changed = True
+
+            if not changed:
+                break
+
+        return int(adjusted)
+
+    def _resolve_severe_same_source_overlaps_no_target(self, segments: List[dict], max_passes: int = 2) -> int:
+        """
+        禁兜底同源严重负重叠 run 前推修复：
+        - 当同源边界出现明显负重叠（例如 1~3 秒）时，将该边界右侧整段 run 同步前推；
+        - 优先消除“重复词/倒放感”，避免把重叠反复在局部边界间转移；
+        - 对低置信或邻段强制恢复段允许连续性优先强制落地。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if not bool(getattr(self, "no_target_severe_overlap_run_fix", True)):
+            return 0
+        if len(segments) < 2:
+            return 0
+
+        adjusted = 0
+        severe_floor = max(0.35, float(getattr(self, "no_target_severe_overlap_trigger", 0.85)))
+        safe_tol = max(0.0, float(getattr(self, "no_target_severe_overlap_safe_tol", 0.02)))
+        force_combined_max = min(
+            1.0,
+            max(0.0, float(getattr(self, "no_target_severe_overlap_force_combined_max", 0.92))),
+        )
+
+        for _ in range(max(1, int(max_passes))):
+            changed = False
+            i = 1
+            while i < len(segments):
+                prev = segments[i - 1]
+                curr = segments[i]
+                nxt = segments[i + 1] if (i + 1) < len(segments) else None
+                if prev["source"] == self.target_video or curr["source"] == self.target_video:
+                    i += 1
+                    continue
+                if prev["source"] != curr["source"]:
+                    i += 1
+                    continue
+                if self._is_tail_sensitive_last_resort_segment(prev) or self._is_tail_sensitive_last_resort_segment(curr):
+                    i += 1
+                    continue
+                if (
+                    nxt is not None
+                    and nxt.get("source") == curr["source"]
+                    and self._is_tail_sensitive_last_resort_segment(nxt)
+                ):
+                    i += 1
+                    continue
+
+                prev_end = float(prev["start"]) + float(prev["duration"])
+                curr_start = float(curr["start"])
+                gap = float(curr_start - prev_end)
+                severe_trigger = max(float(severe_floor), float(curr["duration"]) * 0.16)
+                if gap >= -severe_trigger:
+                    i += 1
+                    continue
+
+                src = curr["source"]
+                src_duration = self.get_video_duration(src)
+                if src_duration <= 0.0:
+                    i += 1
+                    continue
+
+                run_end = i
+                while (
+                    (run_end + 1) < len(segments)
+                    and segments[run_end + 1]["source"] == src
+                    and segments[run_end + 1]["source"] != self.target_video
+                ):
+                    run_end += 1
+
+                required_shift = max(0.0, (float(prev_end) - float(curr_start)) + float(safe_tol))
+                tail_end = float(segments[run_end]["start"]) + float(segments[run_end]["duration"])
+                run_headroom = max(0.0, float(src_duration) - float(tail_end))
+                applied_shift = min(float(required_shift), float(run_headroom))
+                if applied_shift <= 1e-6:
+                    i = run_end + 1
+                    continue
+
+                curr_q = curr.get("quality", {}) or {}
+                curr_combined = float(curr_q.get("combined", 0.0))
+                curr_recover_mode = str(curr_q.get("recover_mode", "") or "")
+                force_continuity = bool(
+                    (abs(float(gap)) >= max(1.20, float(severe_trigger) * 1.5))
+                    or (curr_combined <= force_combined_max)
+                    or (curr_recover_mode in {"neighbors_last_resort_no_target", "neighbors_forced_no_verify"})
+                )
+
+                rollback: Dict[int, float] = {}
+                for k in range(i, run_end + 1):
+                    rollback[k] = float(segments[k]["start"])
+                    segments[k]["start"] = float(segments[k]["start"]) + float(applied_shift)
+
+                new_gap = float(segments[i]["start"]) - float(prev_end)
+                improved = bool((abs(float(new_gap)) + 1e-6) < abs(float(gap)))
+                safe_after = bool(float(new_gap) >= (-float(safe_tol) - 1e-6))
+                if (not improved) or (not safe_after):
+                    for k, old_start in rollback.items():
+                        segments[k]["start"] = old_start
+                    i = run_end + 1
+                    continue
+
+                verify_avg = float(curr_combined)
+                audio_meta: Dict[str, object] = {"checked": False}
+                if not force_continuity:
+                    passed, verify_avg = self.quick_verify(
+                        source=src,
+                        source_start=float(segments[i]["start"]),
+                        target_start=float(curr["target_start"]),
+                        duration=float(curr["duration"]),
+                    )
+                    if not passed:
+                        for k, old_start in rollback.items():
+                            segments[k]["start"] = old_start
+                        i = run_end + 1
+                        continue
+                    audio_passed, audio_meta = self.quick_verify_audio(
+                        source=src,
+                        source_start=float(segments[i]["start"]),
+                        target_start=float(curr["target_start"]),
+                        duration=float(curr["duration"]),
+                        combined_score=max(float(curr_combined), float(verify_avg)),
+                    )
+                    if not audio_passed:
+                        for k, old_start in rollback.items():
+                            segments[k]["start"] = old_start
+                        i = run_end + 1
+                        continue
+                else:
+                    audio_meta = {
+                        "checked": False,
+                        "forced_no_verify": True,
+                        "reason": "severe_overlap_run_shift_force_continuity",
+                    }
+
+                for k in range(i, run_end + 1):
+                    seg = segments[k]
+                    q = seg.get("quality", {}) or {}
+                    old_start = float(rollback[k])
+                    q["severe_overlap_run_shift_no_target"] = True
+                    q["severe_overlap_run_shift_from"] = float(old_start)
+                    q["severe_overlap_run_shift_to"] = float(seg["start"])
+                    q["severe_overlap_run_shift_delta"] = float(applied_shift)
+                    q["severe_overlap_run_shift_anchor_index"] = int(i)
+                    if k == i:
+                        q["severe_overlap_run_shift_before_gap"] = float(gap)
+                        q["severe_overlap_run_shift_after_gap"] = float(new_gap)
+                        q["severe_overlap_run_shift_force_continuity"] = bool(force_continuity)
+                        q["severe_overlap_run_shift_verify_avg"] = float(verify_avg)
+                        q["audio_guard"] = audio_meta
+                    seg["quality"] = q
+
+                adjusted += int(run_end - i + 1)
+                changed = True
+                i = run_end + 1
+
+            if not changed:
+                break
+
+        return int(adjusted)
+
+    def _redistribute_mild_run_overflow_no_target(self, segments: List[dict]) -> int:
+        """
+        禁兜底同源 run 轻量溢出分摊：
+        - 当 run 总时长略大于源可用容量时，把溢出量按边界均匀分摊；
+        - 仅处理“每边界分摊量较小”的 run，避免引入大范围错位；
+        - 每段都需通过 visual/audio 复核后才落地。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if len(segments) < 3:
+            return 0
+
+        max_per_boundary = max(
+            0.04,
+            float(getattr(self, "no_target_run_overflow_max_per_boundary", 0.16)),
+        )
+        tiny_forward_freeze = max(
+            0.0,
+            float(getattr(self, "no_target_run_overflow_tiny_forward_freeze", 0.03)),
+        )
+        adjusted = 0
+        i = 0
+        while i < len(segments):
+            src = segments[i]["source"]
+            if src == self.target_video:
+                i += 1
+                continue
+
+            j = i + 1
+            while j < len(segments) and segments[j]["source"] == src:
+                j += 1
+            run_len = j - i
+            if run_len < 3:
+                i = j
+                continue
+            if any(self._is_tail_sensitive_last_resort_segment(segments[k]) for k in range(i, j)):
+                i = j
+                continue
+
+            src_duration = self.get_video_duration(src)
+            if src_duration <= 0.0:
+                i = j
+                continue
+
+            first_start = float(segments[i]["start"])
+            total_duration = sum(float(segments[k]["duration"]) for k in range(i, j))
+            overflow = max(0.0, float(first_start + total_duration - src_duration))
+            boundaries = run_len - 1
+            if overflow <= 1e-6 or boundaries <= 0:
+                i = j
+                continue
+            per_boundary = float(overflow / float(boundaries))
+            if per_boundary > max_per_boundary:
+                i = j
+                continue
+
+            proposed: List[float] = [float(first_start)]
+            for k in range(i + 1, j):
+                prev_seg = segments[k - 1]
+                proposed.append(float(proposed[-1] + float(prev_seg["duration"]) - per_boundary))
+
+            updates: Dict[int, Dict[str, object]] = {}
+            run_ok = True
+            fail_count = 0
+            for k in range(i + 1, j):
+                seg = segments[k]
+                old_start = float(seg["start"])
+                cand_start = float(proposed[k - i])
+                max_start = max(0.0, float(src_duration - float(seg["duration"])))
+                cand_start = max(0.0, min(float(cand_start), max_start))
+                # 末端小幅“向后推”更容易触发半秒级音频偏置；在极小差值下保守保留原起点。
+                if (cand_start > old_start) and ((cand_start - old_start) <= tiny_forward_freeze):
+                    cand_start = float(old_start)
+                if abs(cand_start - old_start) <= 0.02:
+                    continue
+
+                offsets = [
+                    0.0,
+                    float(seg["duration"]) * 0.25,
+                    float(seg["duration"]) * 0.5,
+                    float(seg["duration"]) * 0.75,
+                    max(0.0, float(seg["duration"]) - 0.1),
+                ]
+                passed, avg = self.verify_segment_visual(
+                    source=src,
+                    source_start=float(cand_start),
+                    target_start=float(seg["target_start"]),
+                    duration=float(seg["duration"]),
+                    offsets=offsets,
+                    min_avg=max(0.70, float(self.strict_verify_min_sim) - 0.08),
+                    min_floor=max(0.45, float(self.strict_verify_min_sim) - 0.24),
+                )
+                if not passed:
+                    run_ok = False
+                    fail_count += 1
+                    continue
+
+                audio_passed, audio_meta = self.quick_verify_audio(
+                    source=src,
+                    source_start=float(cand_start),
+                    target_start=float(seg["target_start"]),
+                    duration=float(seg["duration"]),
+                    combined_score=float(avg),
+                )
+                if not audio_passed:
+                    run_ok = False
+                    fail_count += 1
+                    continue
+                realigned_start, shift_meta, shifted_audio_meta = self.try_audio_guard_shift_realign(
+                    source=src,
+                    source_start=float(cand_start),
+                    target_start=float(seg["target_start"]),
+                    duration=float(seg["duration"]),
+                    combined_score=float(avg),
+                    audio_meta=audio_meta,
+                )
+                if bool(shift_meta.get("applied", False)):
+                    cand_start = float(realigned_start)
+                    avg = max(float(avg), float(shift_meta.get("candidate_verify_avg", avg)))
+                    if isinstance(shifted_audio_meta, dict):
+                        audio_meta = shifted_audio_meta
+                else:
+                    shift_meta = dict(shift_meta or {})
+
+                updates[k] = {
+                    "start": float(cand_start),
+                    "old_start": float(old_start),
+                    "avg": float(avg),
+                    "audio_meta": audio_meta,
+                    "audio_shift_meta": shift_meta,
+                }
+
+            if run_ok and updates:
+                for k, meta in updates.items():
+                    seg = segments[k]
+                    seg["start"] = float(meta["start"])
+                    q = seg.get("quality", {}) or {}
+                    q["run_overflow_redistributed_no_target"] = True
+                    q["run_overflow_redistributed_from"] = float(meta["old_start"])
+                    q["run_overflow_redistributed_to"] = float(meta["start"])
+                    q["run_overflow_redistributed_per_boundary"] = float(per_boundary)
+                    q["run_overflow_redistributed_overflow"] = float(overflow)
+                    q["run_overflow_redistributed_verify_avg"] = float(meta["avg"])
+                    q["audio_guard"] = meta["audio_meta"]
+                    q["run_overflow_redistributed_audio_shift_fix"] = meta.get("audio_shift_meta", {})
+                    seg["quality"] = q
+                    adjusted += 1
+            elif updates and fail_count > 0 and overflow > 0.35:
+                # 部分段复核失败时，对“低置信/强制恢复”段启用连续性优先的保守落地，
+                # 目的是避免尾部把重叠集中到单一边界（常见表现：末段重读/倒放感）。
+                forced_updates = 0
+                for k, meta in updates.items():
+                    seg = segments[k]
+                    q = seg.get("quality", {}) or {}
+                    recover_mode = str(q.get("recover_mode", "") or "")
+                    combined = float(q.get("combined", 0.0))
+                    tail_zone = bool(k >= (j - 3))
+                    forceable = bool(
+                        (combined <= 0.90)
+                        or (recover_mode in {"neighbors_last_resort_no_target", "neighbors_forced_no_verify"})
+                        or tail_zone
+                    )
+                    if not forceable:
+                        continue
+                    seg["start"] = float(meta["start"])
+                    q["run_overflow_redistributed_no_target"] = True
+                    q["run_overflow_redistributed_from"] = float(meta["old_start"])
+                    q["run_overflow_redistributed_to"] = float(meta["start"])
+                    q["run_overflow_redistributed_per_boundary"] = float(per_boundary)
+                    q["run_overflow_redistributed_overflow"] = float(overflow)
+                    q["run_overflow_redistributed_verify_avg"] = float(meta["avg"])
+                    q["audio_guard"] = meta["audio_meta"]
+                    q["run_overflow_redistributed_audio_shift_fix"] = meta.get("audio_shift_meta", {})
+                    q["run_overflow_redistributed_force_continuity"] = True
+                    q["run_overflow_redistributed_fail_count"] = int(fail_count)
+                    seg["quality"] = q
+                    adjusted += 1
+                    forced_updates += 1
+
+            i = j
+
+        return int(adjusted)
+
+    def _boundary_audio_similarity(
+        self,
+        source: Path,
+        target_boundary_sec: float,
+        source_boundary_sec: float,
+        window_sec: float,
+    ) -> float:
+        """边界音频相似度探针（短窗）。"""
+        clip_dur = max(0.25, float(window_sec))
+        tgt_start = max(0.0, float(target_boundary_sec) - clip_dur * 0.5)
+        src_start = max(0.0, float(source_boundary_sec) - clip_dur * 0.5)
+        target_fp = self._get_audio_fp_cached(self.target_video, tgt_start, clip_dur)
+        source_fp = self._get_audio_fp_cached(source, src_start, clip_dur)
+        if not target_fp or not source_fp:
+            return 0.0
+        return float(compare_chromaprint(target_fp, source_fp))
+
+    def _boundary_audio_silence_mismatch(
+        self,
+        source: Path,
+        target_boundary_sec: float,
+        source_boundary_sec: float,
+        window_sec: float,
+    ) -> Tuple[bool, Optional[float], Optional[float]]:
+        """
+        边界静音错配探针：
+        - 目标边界有明显语音，但候选边界接近静音时判为 mismatch。
+        """
+        clip_dur = max(0.25, float(window_sec))
+        tgt_start = max(0.0, float(target_boundary_sec) - clip_dur * 0.5)
+        src_start = max(0.0, float(source_boundary_sec) - clip_dur * 0.5)
+        tgt_db = self._audio_dbfs_sample(self.target_video, tgt_start, clip_dur)
+        src_db = self._audio_dbfs_sample(source, src_start, clip_dur)
+        mismatch = bool(
+            (src_db is not None)
+            and (float(src_db) <= -45.0)
+            and ((tgt_db is None) or (float(tgt_db) > -40.0))
+        )
+        return mismatch, src_db, tgt_db
+
+    def _enforce_boundary_hard_constraints_no_target(self, segments: List[dict], max_passes: int = 2) -> int:
+        """
+        边界硬约束（禁兜底）：
+        - 同源相邻段禁止负重叠（仅允许极小容差）；
+        - 同时抑制明显正缝隙，减少丢词风险。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if len(segments) < 2:
+            return 0
+
+        adjusted = 0
+        neg_tol = max(0.0, float(getattr(self, "boundary_hard_max_negative_overlap", 0.01)))
+        pos_tol = max(0.0, float(getattr(self, "boundary_hard_max_positive_gap", 0.06)))
+        max_shift_sec = max(0.0, float(getattr(self, "boundary_hard_max_shift_sec", 1.2)))
+        for _ in range(max(1, int(max_passes))):
+            changed = False
+            for i in range(1, len(segments)):
+                prev = segments[i - 1]
+                curr = segments[i]
+                if prev["source"] == self.target_video or curr["source"] == self.target_video:
+                    continue
+                if prev["source"] != curr["source"]:
+                    continue
+
+                prev_end = float(prev["start"]) + float(prev["duration"])
+                curr_start = float(curr["start"])
+                gap = float(curr_start - prev_end)
+                if gap >= -neg_tol and gap <= pos_tol:
+                    continue
+
+                src = curr["source"]
+                src_duration = self.get_video_duration(src)
+                if src_duration <= 0.0:
+                    continue
+                max_start = max(0.0, float(src_duration - float(curr["duration"])))
+                cand_start = max(0.0, min(float(prev_end), max_start))
+                if abs(cand_start - curr_start) <= 1e-6:
+                    continue
+                shift_sec = abs(float(cand_start) - float(curr_start))
+                if max_shift_sec > 1e-6 and shift_sec > (max_shift_sec + 1e-6):
+                    q = curr.get("quality", {}) or {}
+                    q["boundary_hard_skipped_large_shift_no_target"] = True
+                    q["boundary_hard_skip_shift_sec"] = float(shift_sec)
+                    q["boundary_hard_skip_max_shift_sec"] = float(max_shift_sec)
+                    q["boundary_hard_skip_before_gap"] = float(gap)
+                    curr["quality"] = q
+                    continue
+
+                passed, avg = self.quick_verify(
+                    source=src,
+                    source_start=float(cand_start),
+                    target_start=float(curr["target_start"]),
+                    duration=float(curr["duration"]),
+                )
+                if not passed:
+                    continue
+                audio_passed, audio_meta = self.quick_verify_audio(
+                    source=src,
+                    source_start=float(cand_start),
+                    target_start=float(curr["target_start"]),
+                    duration=float(curr["duration"]),
+                    combined_score=float(avg),
+                )
+                if not audio_passed:
+                    continue
+
+                curr["start"] = float(cand_start)
+                after_gap = float(cand_start - prev_end)
+                q = curr.get("quality", {}) or {}
+                q["boundary_hard_clamped_no_target"] = True
+                q["boundary_hard_from"] = float(curr_start)
+                q["boundary_hard_to"] = float(cand_start)
+                q["boundary_hard_before_gap"] = float(gap)
+                q["boundary_hard_after_gap"] = float(after_gap)
+                q["boundary_hard_verify_avg"] = float(avg)
+                q["audio_guard"] = audio_meta
+                curr["quality"] = q
+                adjusted += 1
+                changed = True
+
+            if not changed:
+                break
+
+        return int(adjusted)
+
+    def _repair_boundary_audio_locally_no_target(self, segments: List[dict], max_passes: int = 2) -> Tuple[int, int]:
+        """
+        边界音频局部迭代修复（禁兜底）：
+        - 每个同源边界做短窗音频探针（±0.3~0.5s）；
+        - 命中重读/丢词/静音风险时，只局部重算当前边界起点；
+        - 不触发整片重跑。
+        返回: (修复数, 发现问题边界数)
+        """
+        if self.enable_target_video_fallback:
+            return 0, 0
+        if len(segments) < 2:
+            return 0, 0
+
+        repaired = 0
+        issues = 0
+        window_sec = max(0.3, float(getattr(self, "boundary_audio_probe_window_sec", 0.45)))
+        gain_trigger = max(0.02, float(getattr(self, "boundary_audio_expected_gain_trigger", 0.08)))
+        max_offset = max(0.1, float(getattr(self, "boundary_audio_repair_max_offset", 0.5)))
+        neg_tol = max(0.0, float(getattr(self, "boundary_hard_max_negative_overlap", 0.01)))
+        pos_tol = max(0.0, float(getattr(self, "boundary_hard_max_positive_gap", 0.06)))
+        repeat_safe_tol = max(
+            0.0,
+            float(
+                getattr(
+                    self,
+                    "boundary_audio_repeat_max_negative_overlap",
+                    max(0.02, float(neg_tol)),
+                )
+            ),
+        )
+
+        offset_candidates = [0.0, -0.5, -0.3, -0.2, -0.1, -0.05, 0.05, 0.1, 0.2, 0.3, 0.5]
+        offset_candidates = [x for x in offset_candidates if abs(float(x)) <= (max_offset + 1e-6)]
+        if 0.0 not in offset_candidates:
+            offset_candidates.insert(0, 0.0)
+
+        for _ in range(max(1, int(max_passes))):
+            changed = False
+            for i in range(1, len(segments)):
+                prev = segments[i - 1]
+                curr = segments[i]
+                if prev["source"] == self.target_video or curr["source"] == self.target_video:
+                    continue
+                if prev["source"] != curr["source"]:
+                    continue
+
+                src = curr["source"]
+                prev_end = float(prev["start"]) + float(prev["duration"])
+                curr_start = float(curr["start"])
+                gap = float(curr_start - prev_end)
+                target_boundary = float(curr["target_start"])
+
+                sim_curr = self._boundary_audio_similarity(
+                    source=src,
+                    target_boundary_sec=target_boundary,
+                    source_boundary_sec=float(curr_start),
+                    window_sec=window_sec,
+                )
+                sim_anchor = self._boundary_audio_similarity(
+                    source=src,
+                    target_boundary_sec=target_boundary,
+                    source_boundary_sec=float(prev_end),
+                    window_sec=window_sec,
+                )
+                silence_mismatch_before, src_db_before, tgt_db_before = self._boundary_audio_silence_mismatch(
+                    source=src,
+                    target_boundary_sec=target_boundary,
+                    source_boundary_sec=float(curr_start),
+                    window_sec=window_sec,
+                )
+
+                repeat_risk = bool(gap < -neg_tol)
+                drop_risk = bool(gap > pos_tol)
+                expected_better = bool(
+                    (sim_anchor >= (sim_curr + gain_trigger))
+                    and (abs(gap) >= 0.02)
+                )
+                if not (repeat_risk or drop_risk or expected_better or silence_mismatch_before):
+                    continue
+
+                issues += 1
+                src_duration = self.get_video_duration(src)
+                if src_duration <= 0.0:
+                    continue
+                max_start = max(0.0, float(src_duration - float(curr["duration"])))
+                anchor = max(0.0, min(float(prev_end), max_start))
+                nxt: Optional[dict] = None
+                next_gap_before = 0.0
+                next_penalty_before = 0.0
+                next_neg_trigger = 0.0
+                next_pos_trigger = 0.0
+                if (i + 1) < len(segments):
+                    maybe_next = segments[i + 1]
+                    if maybe_next["source"] == curr["source"] and maybe_next["source"] != self.target_video:
+                        nxt = maybe_next
+                        next_gap_before = float(maybe_next["start"]) - (float(curr_start) + float(curr["duration"]))
+                        next_neg_trigger = max(0.12, float(maybe_next["duration"]) * 0.02)
+                        next_pos_trigger = max(0.20, float(maybe_next["duration"]) * 0.04)
+                        if next_gap_before < -next_neg_trigger:
+                            next_penalty_before = float((-next_gap_before) - next_neg_trigger)
+                        elif next_gap_before > next_pos_trigger:
+                            next_penalty_before = float(next_gap_before - next_pos_trigger)
+                next_q = (nxt.get("quality", {}) or {}) if nxt is not None else {}
+                next_is_carryover_last_resort = bool(
+                    nxt is not None
+                    and str(next_q.get("recover_mode", "") or "") == "neighbors_last_resort_no_target"
+                    and bool(next_q.get("cross_source_prev_tail_carryover_shifted_no_target", False))
+                )
+                severe_next_penalty_limit = max(0.35, float(next_penalty_before) + 0.18)
+                if next_is_carryover_last_resort:
+                    severe_next_penalty_limit = min(
+                        severe_next_penalty_limit,
+                        float(next_penalty_before) + 0.02,
+                    )
+
+                curr_q = curr.get("quality", {}) or {}
+                curr_combined = float(curr_q.get("combined", 0.0))
+                curr_is_carryover_shifted = bool(curr_q.get("cross_source_prev_tail_carryover_shifted_no_target", False))
+                def build_anchor_force_candidate(min_avg: float) -> Optional[Dict[str, object]]:
+                    force_start = float(anchor)
+                    if abs(force_start - float(curr_start)) <= 1e-6:
+                        return None
+                    passed, avg = self.quick_verify(
+                        source=src,
+                        source_start=float(force_start),
+                        target_start=float(curr["target_start"]),
+                        duration=float(curr["duration"]),
+                    )
+                    if not passed or float(avg) + 1e-6 < float(min_avg):
+                        return None
+                    audio_passed, audio_meta = self.quick_verify_audio(
+                        source=src,
+                        source_start=float(force_start),
+                        target_start=float(curr["target_start"]),
+                        duration=float(curr["duration"]),
+                        combined_score=max(float(curr_combined), float(avg)),
+                    )
+                    if not audio_passed:
+                        return None
+                    sim_force = self._boundary_audio_similarity(
+                        source=src,
+                        target_boundary_sec=target_boundary,
+                        source_boundary_sec=float(force_start),
+                        window_sec=window_sec,
+                    )
+                    gap_force = float(force_start - prev_end)
+                    if curr_is_carryover_shifted and gap_force < -0.12:
+                        return None
+                    if gap_force < (-repeat_safe_tol):
+                        return None
+                    next_gap_force = 0.0
+                    next_penalty_force = 0.0
+                    if nxt is not None:
+                        next_gap_force = float(nxt["start"]) - (float(force_start) + float(curr["duration"]))
+                        if next_gap_force < -next_neg_trigger:
+                            next_penalty_force = float((-next_gap_force) - next_neg_trigger)
+                        elif next_gap_force > next_pos_trigger:
+                            next_penalty_force = float(next_gap_force - next_pos_trigger)
+                        if next_penalty_force > severe_next_penalty_limit:
+                            return None
+                    return {
+                        "start": float(force_start),
+                        "avg": float(avg),
+                        "sim": float(sim_force),
+                        "gap_after": float(gap_force),
+                        "next_gap_after": float(next_gap_force),
+                        "next_boundary_penalty_after": float(next_penalty_force),
+                        "audio_meta": audio_meta,
+                        "forced_repeat_safe_anchor": True,
+                    }
+                best_any: Optional[Dict[str, object]] = None
+                best_any_score = None
+                best_safe: Optional[Dict[str, object]] = None
+                best_safe_score = None
+                for off in offset_candidates:
+                    cand_start = max(0.0, min(float(anchor + float(off)), max_start))
+                    next_gap = 0.0
+                    next_boundary_penalty = 0.0
+                    if nxt is not None:
+                        next_gap = float(nxt["start"]) - (float(cand_start) + float(curr["duration"]))
+                        if next_gap < -next_neg_trigger:
+                            next_boundary_penalty = float((-next_gap) - next_neg_trigger)
+                        elif next_gap > next_pos_trigger:
+                            next_boundary_penalty = float(next_gap - next_pos_trigger)
+                        if next_is_carryover_last_resort and next_gap < -0.12:
+                            continue
+                        if next_boundary_penalty > severe_next_penalty_limit:
+                            continue
+                        if (not repeat_risk) and (not drop_risk) and next_boundary_penalty > (float(next_penalty_before) + 0.02):
+                            continue
+
+                    passed, avg = self.quick_verify(
+                        source=src,
+                        source_start=float(cand_start),
+                        target_start=float(curr["target_start"]),
+                        duration=float(curr["duration"]),
+                    )
+                    if not passed and abs(float(cand_start) - float(curr_start)) > 0.03:
+                        continue
+
+                    audio_passed, audio_meta = self.quick_verify_audio(
+                        source=src,
+                        source_start=float(cand_start),
+                        target_start=float(curr["target_start"]),
+                        duration=float(curr["duration"]),
+                        combined_score=max(float(curr_combined), float(avg)),
+                    )
+                    if not audio_passed:
+                        continue
+
+                    sim_cand = self._boundary_audio_similarity(
+                        source=src,
+                        target_boundary_sec=target_boundary,
+                        source_boundary_sec=float(cand_start),
+                        window_sec=window_sec,
+                    )
+                    gap_after = float(cand_start - prev_end)
+                    if curr_is_carryover_shifted and gap_after < -0.12:
+                        continue
+                    if repeat_risk and gap_after < (float(gap) - 0.03):
+                        continue
+                    if drop_risk and gap_after > (float(gap) + 0.03):
+                        continue
+                    overlap_penalty = max(0.0, -gap_after)
+                    drop_penalty = max(0.0, gap_after)
+                    overlap_weight = 3.4 if repeat_risk else 2.2
+                    drop_weight = 1.8 if drop_risk else 1.5
+                    score = (
+                        float(sim_cand)
+                        - float(overlap_penalty) * overlap_weight
+                        - float(drop_penalty) * drop_weight
+                        - float(next_boundary_penalty) * 0.80
+                        - abs(float(cand_start) - float(curr_start)) * 0.01
+                    )
+                    candidate = {
+                        "start": float(cand_start),
+                        "avg": float(avg),
+                        "sim": float(sim_cand),
+                        "gap_after": float(gap_after),
+                        "next_gap_after": float(next_gap),
+                        "next_boundary_penalty_after": float(next_boundary_penalty),
+                        "audio_meta": audio_meta,
+                    }
+                    if best_any_score is None or score > best_any_score:
+                        best_any_score = float(score)
+                        best_any = candidate
+
+                    repeat_safe = bool((not repeat_risk) or (gap_after >= (-repeat_safe_tol)))
+                    if repeat_safe and (best_safe_score is None or score > best_safe_score):
+                        best_safe_score = float(score)
+                        best_safe = candidate
+
+                best = best_safe if best_safe is not None else best_any
+                if repeat_risk and best_safe is None:
+                    # 对“重读风险但无安全候选”的边界，强制尝试 anchor(=prev_end) 收口，避免词尾双读。
+                    force_min_avg = max(0.80, float(curr_combined) - 0.08)
+                    forced_best = build_anchor_force_candidate(min_avg=float(force_min_avg))
+                    if forced_best is not None:
+                        best = forced_best
+                if best is None:
+                    q = curr.get("quality", {}) or {}
+                    q["boundary_audio_issue_detected_no_target"] = True
+                    q["boundary_audio_issue_gap_before"] = float(gap)
+                    q["boundary_audio_similarity_before"] = float(sim_curr)
+                    q["boundary_audio_similarity_anchor"] = float(sim_anchor)
+                    q["boundary_audio_silence_mismatch_before"] = bool(silence_mismatch_before)
+                    q["boundary_audio_source_dbfs_before"] = src_db_before
+                    q["boundary_audio_target_dbfs_before"] = tgt_db_before
+                    q["boundary_audio_next_gap_before"] = float(next_gap_before)
+                    q["boundary_audio_next_penalty_before"] = float(next_penalty_before)
+                    curr["quality"] = q
+                    continue
+
+                silence_mismatch_after, src_db_after, _ = self._boundary_audio_silence_mismatch(
+                    source=src,
+                    target_boundary_sec=target_boundary,
+                    source_boundary_sec=float(best["start"]),
+                    window_sec=window_sec,
+                )
+
+                improved = bool(
+                    (abs(float(best["gap_after"])) + 0.01) < abs(float(gap))
+                    or (float(best["sim"]) >= float(sim_curr) + 0.03)
+                    or (bool(silence_mismatch_before) and not bool(silence_mismatch_after))
+                )
+                unresolved_repeat_risk_after = bool(
+                    repeat_risk and (float(best["gap_after"]) < (-repeat_safe_tol))
+                )
+                if unresolved_repeat_risk_after and (not bool(best.get("forced_repeat_safe_anchor", False))):
+                    # 即使局部评分更高，只要重读风险仍未消除，就再尝试一次 anchor 强收口。
+                    force_min_avg = max(0.78, float(best["avg"]) - 0.05)
+                    forced_best = build_anchor_force_candidate(min_avg=float(force_min_avg))
+                    if forced_best is not None:
+                        best = forced_best
+                        unresolved_repeat_risk_after = False
+                silence_mismatch_after, src_db_after, _ = self._boundary_audio_silence_mismatch(
+                    source=src,
+                    target_boundary_sec=target_boundary,
+                    source_boundary_sec=float(best["start"]),
+                    window_sec=window_sec,
+                )
+                improved = bool(
+                    (abs(float(best["gap_after"])) + 0.01) < abs(float(gap))
+                    or (float(best["sim"]) >= float(sim_curr) + 0.03)
+                    or (bool(silence_mismatch_before) and not bool(silence_mismatch_after))
+                    or bool(best.get("forced_repeat_safe_anchor", False))
+                )
+                if (not improved) or (abs(float(best["start"]) - float(curr_start)) <= 1e-6):
+                    q = curr.get("quality", {}) or {}
+                    q["boundary_audio_issue_detected_no_target"] = True
+                    q["boundary_audio_issue_gap_before"] = float(gap)
+                    q["boundary_audio_similarity_before"] = float(sim_curr)
+                    q["boundary_audio_similarity_anchor"] = float(sim_anchor)
+                    q["boundary_audio_similarity_after"] = float(best["sim"])
+                    q["boundary_audio_silence_mismatch_before"] = bool(silence_mismatch_before)
+                    q["boundary_audio_silence_mismatch_after"] = bool(silence_mismatch_after)
+                    q["boundary_audio_source_dbfs_before"] = src_db_before
+                    q["boundary_audio_source_dbfs_after"] = src_db_after
+                    q["boundary_audio_target_dbfs_before"] = tgt_db_before
+                    q["boundary_audio_repeat_risk_unresolved_after"] = bool(unresolved_repeat_risk_after)
+                    q["boundary_audio_next_gap_before"] = float(next_gap_before)
+                    q["boundary_audio_next_gap_after"] = float(best.get("next_gap_after", 0.0))
+                    q["boundary_audio_next_penalty_before"] = float(next_penalty_before)
+                    q["boundary_audio_next_penalty_after"] = float(best.get("next_boundary_penalty_after", 0.0))
+                    curr["quality"] = q
+                    continue
+
+                curr["start"] = float(best["start"])
+                q = curr.get("quality", {}) or {}
+                q["boundary_audio_issue_detected_no_target"] = True
+                q["boundary_audio_repaired_no_target"] = True
+                q["boundary_audio_repair_from"] = float(curr_start)
+                q["boundary_audio_repair_to"] = float(best["start"])
+                q["boundary_audio_repair_before_gap"] = float(gap)
+                q["boundary_audio_repair_after_gap"] = float(best["gap_after"])
+                q["boundary_audio_similarity_before"] = float(sim_curr)
+                q["boundary_audio_similarity_anchor"] = float(sim_anchor)
+                q["boundary_audio_similarity_after"] = float(best["sim"])
+                q["boundary_audio_silence_mismatch_before"] = bool(silence_mismatch_before)
+                q["boundary_audio_silence_mismatch_after"] = bool(silence_mismatch_after)
+                q["boundary_audio_source_dbfs_before"] = src_db_before
+                q["boundary_audio_source_dbfs_after"] = src_db_after
+                q["boundary_audio_target_dbfs_before"] = tgt_db_before
+                q["boundary_audio_repair_verify_avg"] = float(best["avg"])
+                q["boundary_audio_repeat_safe_tol"] = float(repeat_safe_tol)
+                q["boundary_audio_repeat_risk_unresolved_after"] = bool(unresolved_repeat_risk_after)
+                q["boundary_audio_repeat_forced_anchor"] = bool(best.get("forced_repeat_safe_anchor", False))
+                q["boundary_audio_next_gap_before"] = float(next_gap_before)
+                q["boundary_audio_next_gap_after"] = float(best.get("next_gap_after", 0.0))
+                q["boundary_audio_next_penalty_before"] = float(next_penalty_before)
+                q["boundary_audio_next_penalty_after"] = float(best.get("next_boundary_penalty_after", 0.0))
+                q["audio_guard"] = best["audio_meta"]
+                curr["quality"] = q
+                repaired += 1
+                changed = True
+
+            if not changed:
+                break
+
+        return int(repaired), int(issues)
+
+    def _trim_tail_overlaps_with_shortfall_tolerance_no_target(self, segments: List[dict]) -> int:
+        """
+        尾段短缺容忍裁尾（禁兜底）：
+        - 对尾部同源负重叠边界，优先裁掉前一段尾巴；
+        - 只在尾段允许短缺预算内生效，避免为了凑满总时长把重复留到成片结尾；
+        - 不改后段起点，尽量保持后续句子连续。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if len(segments) < 2:
+            return 0
+
+        budget = max(0.0, float(getattr(self, "no_target_tail_shortfall_tolerance_sec", 0.0)))
+        if budget <= 1e-6:
+            return 0
+
+        adjusted = 0
+        min_prev_duration = max(0.8, min(2.0, float(self.segment_duration) * 0.18))
+        total_segments = len(segments)
+
+        for i in range(total_segments - 1, 0, -1):
+            if budget <= 1e-6:
+                break
+            prev = segments[i - 1]
+            curr = segments[i]
+            if prev["source"] == self.target_video or curr["source"] == self.target_video:
+                continue
+            if prev["source"] != curr["source"]:
+                continue
+            if not self._is_tail_shortfall_relax_boundary(i, curr, total_segments):
+                continue
+
+            prev_start = float(prev["start"])
+            prev_duration = float(prev["duration"])
+            curr_start = float(curr["start"])
+            gap = float(curr_start - (prev_start + prev_duration))
+            overlap = max(0.0, -gap)
+            if overlap <= 0.015:
+                continue
+
+            trimmable = max(0.0, float(prev_duration - min_prev_duration))
+            if trimmable <= 1e-6:
+                continue
+            trim = min(float(overlap), float(trimmable), float(budget))
+            if trim + 0.015 < overlap:
+                continue
+
+            new_prev_duration = float(prev_duration - trim)
+            new_gap = float(curr_start - (prev_start + new_prev_duration))
+            if new_gap < -0.02:
+                continue
+
+            prev["duration"] = float(new_prev_duration)
+            prev_q = prev.get("quality", {}) or {}
+            prev_q["tail_shortfall_overlap_trim_no_target"] = True
+            prev_q["tail_shortfall_overlap_trim_sec"] = float(trim)
+            prev_q["tail_shortfall_overlap_trim_boundary_index"] = int(i)
+            prev_q["tail_shortfall_overlap_trim_before_gap"] = float(gap)
+            prev_q["tail_shortfall_overlap_trim_after_gap"] = float(new_gap)
+            prev_q["tail_shortfall_overlap_trim_budget_left"] = float(max(0.0, budget - trim))
+            prev["quality"] = prev_q
+
+            curr_q = curr.get("quality", {}) or {}
+            curr_q["tail_shortfall_overlap_trimmed_prev_no_target"] = True
+            curr_q["tail_shortfall_overlap_trim_boundary_index"] = int(i)
+            curr_q["tail_shortfall_overlap_trim_prev_sec"] = float(trim)
+            curr_q["tail_shortfall_overlap_trim_before_gap"] = float(gap)
+            curr_q["tail_shortfall_overlap_trim_after_gap"] = float(new_gap)
+            curr["quality"] = curr_q
+
+            budget -= float(trim)
+            adjusted += 1
+
+        return int(adjusted)
+
+    def _clamp_carryover_shifted_overlap_boundaries_no_target(self, segments: List[dict]) -> int:
+        """
+        前源尾巴接入后的重叠收口（禁兜底）：
+        - 仅处理已被 cross_source_prev_tail_carryover 前移过的同源段；
+        - 若前边界仍残留 >0.12s 的负重叠，则优先将当前段轻微后推贴近边界；
+        - 目的不是追求完全 gap=0，而是避免 0.3s 级别的可听重读反复出现。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if len(segments) < 2:
+            return 0
+
+        adjusted = 0
+        for i in range(1, len(segments)):
+            prev = segments[i - 1]
+            curr = segments[i]
+            if prev["source"] == self.target_video or curr["source"] == self.target_video:
+                continue
+            if prev["source"] != curr["source"]:
+                continue
+
+            curr_q = curr.get("quality", {}) or {}
+            if not bool(curr_q.get("cross_source_prev_tail_carryover_shifted_no_target", False)):
+                continue
+
+            prev_end = float(prev["start"]) + float(prev["duration"])
+            curr_start = float(curr["start"])
+            gap = float(curr_start - prev_end)
+            if gap >= -0.12:
+                continue
+
+            src = curr["source"]
+            src_duration = self.get_video_duration(src)
+            if src_duration <= 0.0:
+                continue
+            duration = float(curr["duration"])
+            max_start = max(0.0, float(src_duration - duration))
+
+            next_seg: Optional[dict] = None
+            if (i + 1) < len(segments) and segments[i + 1]["source"] == curr["source"]:
+                next_seg = segments[i + 1]
+
+            candidate_starts: List[float] = []
+            for offset in (-0.12, -0.08, -0.04, 0.0):
+                candidate_starts.append(max(0.0, min(float(prev_end + offset), max_start)))
+            candidate_starts.append(float(curr_start))
+
+            best: Optional[Dict[str, object]] = None
+            best_score: Optional[float] = None
+            seen: Set[float] = set()
+            for raw_start in candidate_starts:
+                cand_start = float(raw_start)
+                key = round(cand_start, 3)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                cand_gap = float(cand_start - prev_end)
+                if cand_gap < -0.12:
+                    continue
+
+                next_gap = 0.0
+                if next_seg is not None:
+                    next_gap = float(next_seg["start"]) - (cand_start + duration)
+                    if next_gap < -0.20:
+                        continue
+
+                passed, avg = self.quick_verify(
+                    source=src,
+                    source_start=float(cand_start),
+                    target_start=float(curr["target_start"]),
+                    duration=duration,
+                )
+                if not passed:
+                    continue
+                audio_passed, audio_meta = self.quick_verify_audio(
+                    source=src,
+                    source_start=float(cand_start),
+                    target_start=float(curr["target_start"]),
+                    duration=duration,
+                    combined_score=float(avg),
+                )
+                if not audio_passed:
+                    continue
+
+                aligned = float((audio_meta or {}).get("aligned_similarity", 0.0) or 0.0)
+                score = float(avg) + aligned * 0.04 - abs(cand_gap) * 0.9 - max(0.0, -next_gap) * 0.4
+                if best_score is None or score > best_score:
+                    best_score = float(score)
+                    best = {
+                        "start": float(cand_start),
+                        "avg": float(avg),
+                        "gap": float(cand_gap),
+                        "next_gap": float(next_gap),
+                        "audio_meta": dict(audio_meta or {}),
+                    }
+
+            if best is None:
+                continue
+            if abs(float(best["start"]) - float(curr_start)) <= 1e-6:
+                continue
+
+            curr["start"] = float(best["start"])
+            curr_q["carryover_overlap_clamped_no_target"] = True
+            curr_q["carryover_overlap_clamped_from"] = float(curr_start)
+            curr_q["carryover_overlap_clamped_to"] = float(best["start"])
+            curr_q["carryover_overlap_clamped_gap_before"] = float(gap)
+            curr_q["carryover_overlap_clamped_gap_after"] = float(best["gap"])
+            curr_q["carryover_overlap_clamped_next_gap_after"] = float(best["next_gap"])
+            curr_q["carryover_overlap_clamped_verify_avg"] = float(best["avg"])
+            curr_q["audio_guard"] = best["audio_meta"]
+            curr["quality"] = curr_q
+            adjusted += 1
+
+        return int(adjusted)
+
+    def _trim_prev_for_carryover_shifted_overlaps_no_target(self, segments: List[dict]) -> int:
+        """
+        前源尾巴接入后的前段裁尾（禁兜底）：
+        - 对 carryover 后仍残留明显负重叠的边界，优先裁掉前一段尾巴；
+        - 避免当前段继续前后游走导致重复问题反复出现。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if len(segments) < 2:
+            return 0
+
+        adjusted = 0
+        min_prev_duration = max(0.8, min(2.0, float(self.segment_duration) * 0.18))
+        for i in range(1, len(segments)):
+            prev = segments[i - 1]
+            curr = segments[i]
+            if prev["source"] == self.target_video or curr["source"] == self.target_video:
+                continue
+            if prev["source"] != curr["source"]:
+                continue
+
+            curr_q = curr.get("quality", {}) or {}
+            if not bool(curr_q.get("cross_source_prev_tail_carryover_shifted_no_target", False)):
+                continue
+
+            prev_start = float(prev["start"])
+            prev_duration = float(prev["duration"])
+            curr_start = float(curr["start"])
+            gap = float(curr_start - (prev_start + prev_duration))
+            if gap >= -0.12:
+                continue
+
+            trimmable = max(0.0, float(prev_duration - min_prev_duration))
+            if trimmable <= 1e-6:
+                continue
+
+            trim = min(float((-gap) - 0.12), float(trimmable))
+            if trim <= 1e-6:
+                continue
+
+            prev["duration"] = float(prev_duration - trim)
+            new_gap = float(curr_start - (prev_start + float(prev["duration"])))
+
+            prev_q = prev.get("quality", {}) or {}
+            prev_q["carryover_prev_trim_no_target"] = True
+            prev_q["carryover_prev_trim_boundary_index"] = int(i)
+            prev_q["carryover_prev_trim_sec"] = float(trim)
+            prev_q["carryover_prev_trim_gap_before"] = float(gap)
+            prev_q["carryover_prev_trim_gap_after"] = float(new_gap)
+            prev["quality"] = prev_q
+
+            curr_q["carryover_prev_trimmed_no_target"] = True
+            curr_q["carryover_prev_trim_boundary_index"] = int(i)
+            curr_q["carryover_prev_trim_sec"] = float(trim)
+            curr_q["carryover_prev_trim_gap_before"] = float(gap)
+            curr_q["carryover_prev_trim_gap_after"] = float(new_gap)
+            curr["quality"] = curr_q
+            adjusted += 1
+
+        return int(adjusted)
+
+    def _suppress_small_negative_overlaps_no_target(self, segments: List[dict], max_passes: int = 2) -> int:
+        """
+        语音敏感小重叠抑制（禁兜底）：
+        - 处理同源相邻段的 -0.04~-0.20s 小负重叠（最容易触发单字重读）；
+        - 仅对高置信边界生效，并要求 visual/audio 复核通过；
+        - 优先把边界贴到 prev_end（gap≈0），避免词头重复。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if len(segments) < 2:
+            return 0
+
+        adjusted = 0
+        for _ in range(max(1, int(max_passes))):
+            changed = False
+            for i in range(1, len(segments)):
+                prev = segments[i - 1]
+                curr = segments[i]
+                if prev["source"] == self.target_video or curr["source"] == self.target_video:
+                    continue
+                if prev["source"] != curr["source"]:
+                    continue
+
+                prev_end = float(prev["start"]) + float(prev["duration"])
+                curr_start = float(curr["start"])
+                gap = float(curr_start - prev_end)
+                # 只处理中小幅负重叠：过大重叠由前序强修复逻辑处理。
+                if gap >= -0.04 or gap < -0.20:
+                    continue
+
+                prev_q = prev.get("quality", {}) or {}
+                curr_q = curr.get("quality", {}) or {}
+                prev_comb = float(prev_q.get("combined", 0.0))
+                curr_comb = float(curr_q.get("combined", 0.0))
+                if min(prev_comb, curr_comb) < 0.84:
+                    continue
+
+                src = curr["source"]
+                src_duration = self.get_video_duration(src)
+                if src_duration <= 0.0:
+                    continue
+                max_start = max(0.0, float(src_duration - float(curr["duration"])))
+                anchor = max(0.0, min(float(prev_end), max_start))
+
+                raw_candidates = [
+                    anchor,
+                    anchor + 0.02,
+                    anchor - 0.02,
+                    anchor + 0.05,
+                    anchor - 0.05,
+                ]
+                candidates: List[float] = []
+                seen: Set[float] = set()
+                for raw in raw_candidates:
+                    cand = max(0.0, min(float(raw), max_start))
+                    key = round(cand, 3)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(float(cand))
+
+                best: Optional[Dict[str, object]] = None
+                best_score: Optional[float] = None
+                for cand_start in candidates:
+                    new_gap = float(cand_start - prev_end)
+                    overlap_after = max(0.0, -new_gap)
+                    # 至少要把重叠显著压缩，目标接近 0。
+                    if overlap_after > 0.025:
+                        continue
+
+                    if (i + 1) < len(segments):
+                        nxt = segments[i + 1]
+                        if nxt["source"] == curr["source"] and nxt["source"] != self.target_video:
+                            next_gap = float(nxt["start"]) - (float(cand_start) + float(curr["duration"]))
+                            next_neg_trigger = max(0.12, float(nxt["duration"]) * 0.02)
+                            if next_gap < -next_neg_trigger:
+                                continue
+
+                    passed, avg = self.quick_verify(
+                        source=src,
+                        source_start=float(cand_start),
+                        target_start=float(curr["target_start"]),
+                        duration=float(curr["duration"]),
+                    )
+                    if not passed:
+                        continue
+                    audio_passed, audio_meta = self.quick_verify_audio(
+                        source=src,
+                        source_start=float(cand_start),
+                        target_start=float(curr["target_start"]),
+                        duration=float(curr["duration"]),
+                        combined_score=max(float(avg), float(curr_comb)),
+                    )
+                    if not audio_passed:
+                        continue
+
+                    score = float(avg) - float(overlap_after) * 0.35 - abs(float(cand_start) - float(curr_start)) * 0.01
+                    if best_score is None or score > best_score:
+                        best_score = float(score)
+                        best = {
+                            "start": float(cand_start),
+                            "avg": float(avg),
+                            "new_gap": float(new_gap),
+                            "audio_meta": audio_meta,
+                        }
+
+                if best is None:
+                    continue
+                if abs(float(best["start"]) - float(curr_start)) <= 1e-6:
+                    continue
+
+                curr["start"] = float(best["start"])
+                q = curr.get("quality", {}) or {}
+                q["small_overlap_suppressed_no_target"] = True
+                q["small_overlap_suppressed_from"] = float(curr_start)
+                q["small_overlap_suppressed_to"] = float(best["start"])
+                q["small_overlap_suppressed_before_gap"] = float(gap)
+                q["small_overlap_suppressed_after_gap"] = float(best["new_gap"])
+                q["small_overlap_suppressed_verify_avg"] = float(best["avg"])
+                q["audio_guard"] = best["audio_meta"]
+                curr["quality"] = q
+                adjusted += 1
+                changed = True
+
+            if not changed:
+                break
+
+        return int(adjusted)
+
+    def snap_small_adjacent_gaps_without_target_fallback(self, segments: List[dict]) -> Tuple[int, int]:
+        """
+        禁用目标兜底时的同源边界校正：
+        - 处理同源相邻段的重叠/断缝，减少重复词、回放感、局部节奏错位。
+        - 优先使用 quick_verify 通过的候选；必要时仅对高置信段做受控强制贴齐。
+        返回：(已修复边界数, 未收敛边界数)
+        """
+        if self.enable_target_video_fallback:
+            return 0, 0
+        if len(segments) < 2:
+            return 0, 0
+
+        adjusted = 0
+        max_passes = 3
+        unresolved = 0
+        boundary_hard_clamped = 0
+        boundary_audio_issues = 0
+        boundary_audio_repaired = 0
+
+        def verify_score(source: Path, source_start: float, target_start: float, duration: float) -> Tuple[bool, float]:
+            passed, avg = self.quick_verify(
+                source=source,
+                source_start=float(source_start),
+                target_start=float(target_start),
+                duration=float(duration),
+            )
+            return bool(passed), float(avg)
+
+        for _ in range(max_passes):
+            changed = False
+            unresolved = 0
+            for i in range(1, len(segments)):
+                prev = segments[i - 1]
+                curr = segments[i]
+                if prev["source"] == self.target_video or curr["source"] == self.target_video:
+                    continue
+                if prev["source"] != curr["source"]:
+                    continue
+
+                prev_end = float(prev["start"]) + float(prev["duration"])
+                curr_start = float(curr["start"])
+                gap = curr_start - prev_end
+
+                neg_trigger = max(0.12, float(curr["duration"]) * 0.02)
+                pos_trigger = max(0.20, float(curr["duration"]) * 0.04)
+                if (gap >= -neg_trigger) and (gap <= pos_trigger):
+                    continue
+                current_excess = 0.0
+                if gap < -neg_trigger:
+                    current_excess = float((-gap) - neg_trigger)
+                elif gap > pos_trigger:
+                    current_excess = float(gap - pos_trigger)
+
+                source_duration = self.get_video_duration(curr["source"])
+                max_start = max(0.0, float(source_duration - float(curr["duration"])))
+                anchor = max(0.0, min(float(prev_end), max_start))
+                if abs(anchor - curr_start) <= 1e-6:
+                    continue
+
+                next_same_source = False
+                next_seg: Optional[dict] = None
+                if i + 1 < len(segments):
+                    nxt = segments[i + 1]
+                    if nxt["source"] == curr["source"] and nxt["source"] != self.target_video:
+                        next_same_source = True
+                        next_seg = nxt
+
+                # 从当前段到同源 run 尾的最小占用时长，用于评估“尾部容量是否被挤爆”。
+                run_end = i
+                while (run_end + 1) < len(segments) and segments[run_end + 1]["source"] == curr["source"]:
+                    run_end += 1
+                remaining_run_duration = sum(float(segments[k]["duration"]) for k in range(i, run_end + 1))
+                tail_overflow_at_anchor = max(
+                    0.0,
+                    float(anchor) + float(remaining_run_duration) - float(source_duration),
+                )
+
+                # 在锚点附近做小范围搜索：
+                # - 负重叠：仅允许向后（>= anchor），避免继续重叠导致重复词
+                # - 正缝隙：仅允许向前（<= anchor），避免继续跳过内容
+                if gap < -neg_trigger:
+                    max_forward = max(0.5, min(float(curr["duration"]) * 0.60, max_start - anchor))
+                    max_backward_relief = 0.0
+                    if tail_overflow_at_anchor > 0.04:
+                        # run 尾部容量不足时，允许少量向前回退分摊重叠，避免把重叠全部挤到后续边界。
+                        max_backward_relief = max(
+                            0.35,
+                            min(
+                                float(anchor),
+                                max(float(curr["duration"]) * 0.60, float(tail_overflow_at_anchor) + 0.20),
+                            ),
+                        )
+                    needed = max(0.0, min(-float(gap), max_forward))
+                    raw_offsets = [
+                        0.0, 0.04, 0.08, 0.12, 0.2, 0.35,
+                        0.5, 0.8, 1.0, 1.2, 1.5, 2.0,
+                        needed * 0.5,
+                        needed * 0.75,
+                        needed,
+                        min(max_forward, needed + 0.2),
+                    ]
+                    if max_backward_relief > 0.0:
+                        raw_offsets.extend(
+                            [
+                                -min(max_backward_relief, float(tail_overflow_at_anchor) * 0.50),
+                                -min(max_backward_relief, float(tail_overflow_at_anchor) * 0.80),
+                                -min(max_backward_relief, float(tail_overflow_at_anchor)),
+                                -float(max_backward_relief),
+                            ]
+                        )
+                    offsets = sorted(
+                        {
+                            round(max(-max_backward_relief, min(max_forward, float(o))), 3)
+                            for o in raw_offsets
+                        }
+                    )
+                elif gap > pos_trigger:
+                    max_backward = max(0.5, min(float(curr["duration"]) * 0.60, anchor))
+                    needed = max(0.0, min(float(gap), max_backward))
+                    raw_offsets = [
+                        0.0, -0.04, -0.08, -0.12, -0.2, -0.35,
+                        -0.5, -0.8, -1.0, -1.2, -1.5, -2.0,
+                        -(needed * 0.5),
+                        -(needed * 0.75),
+                        -needed,
+                        -min(max_backward, needed + 0.2),
+                    ]
+                    offsets = sorted(
+                        {
+                            round(max(-max_backward, min(0.0, float(o))), 3)
+                            for o in raw_offsets
+                        }
+                    )
+                else:
+                    offsets = [0.0]
+                best = None
+                for off in offsets:
+                    cand = max(0.0, min(anchor + off, max_start))
+                    passed, avg = verify_score(
+                        source=curr["source"],
+                        source_start=cand,
+                        target_start=float(curr["target_start"]),
+                        duration=float(curr["duration"]),
+                    )
+                    audio_passed = False
+                    audio_meta: Dict[str, object] = {"checked": False}
+                    shift_meta: Dict[str, object] = {"applied": False, "checked": False}
+                    if passed:
+                        audio_passed, audio_meta = self.quick_verify_audio(
+                            source=curr["source"],
+                            source_start=float(cand),
+                            target_start=float(curr["target_start"]),
+                            duration=float(curr["duration"]),
+                            combined_score=float(avg),
+                        )
+                        if not audio_passed:
+                            passed = False
+                        else:
+                            realigned_start, shift_meta, shifted_audio_meta = self.try_audio_guard_shift_realign(
+                                source=curr["source"],
+                                source_start=float(cand),
+                                target_start=float(curr["target_start"]),
+                                duration=float(curr["duration"]),
+                                combined_score=float(avg),
+                                audio_meta=audio_meta,
+                            )
+                            if bool(shift_meta.get("applied", False)):
+                                cand = float(realigned_start)
+                                avg = max(float(avg), float(shift_meta.get("candidate_verify_avg", avg)))
+                                if isinstance(shifted_audio_meta, dict):
+                                    audio_meta = shifted_audio_meta
+                            else:
+                                shift_meta = dict(shift_meta or {})
+
+                    after_gap = float(cand - prev_end)
+                    residual_penalty = 0.0
+                    if after_gap < -neg_trigger:
+                        residual_penalty = float((-after_gap) - neg_trigger)
+                    elif after_gap > pos_trigger:
+                        residual_penalty = float(after_gap - pos_trigger)
+                    allow_after_excess_increase = 0.0
+                    if gap < -neg_trigger and tail_overflow_at_anchor > 0.04:
+                        allow_after_excess_increase = min(1.8, float(tail_overflow_at_anchor) * 0.95)
+                    if residual_penalty > (current_excess + allow_after_excess_increase + 1e-6):
+                        continue
+
+                    next_gap = 0.0
+                    next_boundary_penalty = 0.0
+                    if next_same_source and next_seg is not None:
+                        next_gap = float(next_seg["start"]) - (float(cand) + float(curr["duration"]))
+                        next_neg_trigger = max(0.12, float(next_seg["duration"]) * 0.02)
+                        next_pos_trigger = max(0.20, float(next_seg["duration"]) * 0.04)
+                        if next_gap < -next_neg_trigger:
+                            next_boundary_penalty = float((-next_gap) - next_neg_trigger)
+                        elif next_gap > next_pos_trigger:
+                            next_boundary_penalty = float(next_gap - next_pos_trigger)
+
+                    run_tail_overflow = max(
+                        0.0,
+                        float(cand) + float(remaining_run_duration) - float(source_duration),
+                    )
+                    offset_penalty = abs(float(cand) - float(anchor))
+
+                    score = (
+                        float(avg)
+                        - float(offset_penalty) * 0.02
+                        - float(residual_penalty) * 0.30
+                        - float(next_boundary_penalty) * 0.65
+                        - float(run_tail_overflow) * 0.55
+                    )
+                    if best is None or score > best["score"]:
+                        best = {
+                            "start": float(cand),
+                            "avg": float(avg),
+                            "passed": bool(passed),
+                            "audio_passed": bool(audio_passed),
+                            "audio_checked": bool((audio_meta or {}).get("checked", False)),
+                            "audio_meta": dict(audio_meta or {}),
+                            "audio_shift_meta": dict(shift_meta or {}),
+                            "after_gap": float(after_gap),
+                            "residual_penalty": float(residual_penalty),
+                            "next_gap": float(next_gap),
+                            "next_boundary_penalty": float(next_boundary_penalty),
+                            "run_tail_overflow": float(run_tail_overflow),
+                            "offset": float(off),
+                            "score": float(score),
+                        }
+
+                if best is None:
+                    unresolved += 1
+                    continue
+
+                forced_by_confidence = False
+                selected = best
+                if not bool(selected["passed"]):
+                    if bool(selected.get("audio_checked", False)) and (not bool(selected.get("audio_passed", False))):
+                        unresolved += 1
+                        continue
+                    curr_q = curr.get("quality", {}) or {}
+                    combined = float(curr_q.get("combined", 0.0))
+                    recover_mode = str(curr_q.get("recover_mode", "") or "")
+                    force_overlap_limit = max(0.9, float(curr["duration"]) * 0.22)
+                    # 仅允许“负重叠 + 高置信 + 核验分不差”的受控强制贴齐
+                    if (
+                        gap < -neg_trigger
+                        and abs(gap) <= force_overlap_limit
+                        and combined >= 0.92
+                        and float(selected["avg"]) >= 0.88
+                    ):
+                        forced_by_confidence = True
+                    elif (
+                        gap < -neg_trigger
+                        and abs(gap) <= max(0.35, float(curr["duration"]) * 0.07)
+                        and combined >= 0.95
+                    ):
+                        # 小幅负重叠在高置信段上优先消除重复，避免反复出现“词尾双读”。
+                        forced_by_confidence = True
+                    elif (
+                        gap < -neg_trigger
+                        and recover_mode == "neighbors_forced_no_verify"
+                        and abs(gap) <= max(2.5, float(curr["duration"]) * 0.60)
+                    ):
+                        # 低置信强制邻段恢复本身风险更高，优先保证时间轴不重叠。
+                        forced_by_confidence = True
+                    else:
+                        unresolved += 1
+                        continue
+
+                new_start = float(selected["start"])
+                if abs(new_start - curr_start) <= 1e-6:
+                    continue
+
+                # 防止“修复当前边界却把下一边界推到明显重叠/断缝”。
+                next_penalty = float(selected.get("next_boundary_penalty", 0.0))
+                if next_penalty > max(0.55, current_excess + 0.28):
+                    unresolved += 1
+                    continue
+
+                curr["start"] = new_start
+                q = curr.get("quality", {}) or {}
+                q["micro_gap_snapped_no_target"] = True
+                q["micro_gap_before"] = float(gap)
+                q["micro_gap_after"] = float(selected.get("after_gap", curr["start"] - prev_end))
+                q["micro_gap_residual_penalty"] = float(selected.get("residual_penalty", 0.0))
+                q["micro_gap_next_gap"] = float(selected.get("next_gap", 0.0))
+                q["micro_gap_next_boundary_penalty"] = float(selected.get("next_boundary_penalty", 0.0))
+                q["micro_gap_run_tail_overflow"] = float(selected.get("run_tail_overflow", 0.0))
+                q["micro_gap_verify_passed"] = bool(selected["passed"])
+                q["micro_gap_verify_avg"] = float(selected["avg"])
+                q["micro_gap_search_offset"] = float(selected["offset"])
+                q["micro_gap_forced_by_confidence"] = bool(forced_by_confidence)
+                q["audio_guard"] = selected.get("audio_meta", {"checked": False})
+                q["micro_gap_audio_shift_fix"] = selected.get("audio_shift_meta", {})
+                curr["quality"] = q
+                adjusted += 1
+                changed = True
+
+            if not changed:
+                break
+
+        unresolved = self._count_no_target_boundary_unresolved(segments)
+        if unresolved > 0:
+            backprop_fixed = self._backprop_resolve_locked_tail_overlaps_no_target(segments)
+            if backprop_fixed > 0:
+                adjusted += int(backprop_fixed)
+                unresolved = self._count_no_target_boundary_unresolved(segments)
+        if unresolved > 0:
+            rematch_max_attempts = max(0, int(getattr(self, "no_target_boundary_rematch_max_attempts", 0)))
+            if rematch_max_attempts > 0:
+                rematched = self._rematch_unresolved_boundaries_without_target_fallback(
+                    segments,
+                    max_attempts=rematch_max_attempts,
+                )
+                if rematched > 0:
+                    adjusted += int(rematched)
+                    unresolved = self._count_no_target_boundary_unresolved(segments)
+        cross_nudged = self._nudge_cross_source_head_boundaries_no_target(segments)
+        if cross_nudged > 0:
+            adjusted += int(cross_nudged)
+            unresolved = self._count_no_target_boundary_unresolved(segments)
+        rebalanced = self._rebalance_neighbor_recovered_segments_no_target(segments)
+        if rebalanced > 0:
+            adjusted += int(rebalanced)
+            unresolved = self._count_no_target_boundary_unresolved(segments)
+        lag_fixed = self._repair_same_source_step_lag_runs_no_target(segments)
+        if lag_fixed > 0:
+            adjusted += int(lag_fixed)
+            unresolved = self._count_no_target_boundary_unresolved(segments)
+        post_lag_cleanup = self._cleanup_unresolved_boundaries_post_lag_no_target(segments, max_passes=2)
+        if post_lag_cleanup > 0:
+            adjusted += int(post_lag_cleanup)
+            unresolved = self._count_no_target_boundary_unresolved(segments)
+        run_redistributed = self._redistribute_mild_run_overflow_no_target(segments)
+        if run_redistributed > 0:
+            adjusted += int(run_redistributed)
+            unresolved = self._count_no_target_boundary_unresolved(segments)
+        severe_overlap_fixed = self._resolve_severe_same_source_overlaps_no_target(segments, max_passes=2)
+        if severe_overlap_fixed > 0:
+            adjusted += int(severe_overlap_fixed)
+            unresolved = self._count_no_target_boundary_unresolved(segments)
+        small_overlap_suppressed = self._suppress_small_negative_overlaps_no_target(segments, max_passes=2)
+        if small_overlap_suppressed > 0:
+            adjusted += int(small_overlap_suppressed)
+            unresolved = self._count_no_target_boundary_unresolved(segments)
+        hard_clamped = self._enforce_boundary_hard_constraints_no_target(segments, max_passes=2)
+        if hard_clamped > 0:
+            adjusted += int(hard_clamped)
+            boundary_hard_clamped += int(hard_clamped)
+            unresolved = self._count_no_target_boundary_unresolved(segments)
+        audio_repaired, audio_issues = self._repair_boundary_audio_locally_no_target(
+            segments,
+            max_passes=max(1, int(getattr(self, "boundary_audio_repair_max_passes", 2))),
+        )
+        boundary_audio_repaired += int(audio_repaired)
+        boundary_audio_issues += int(audio_issues)
+        if audio_repaired > 0:
+            adjusted += int(audio_repaired)
+        if audio_issues > 0:
+            unresolved = self._count_no_target_boundary_unresolved(segments)
+            # 音频边界修复后执行一次“硬约束 + 回推收尾”：
+            # 有些边界贴近源尾时，单点修复无法完全消除负重叠，需要把重叠向前分摊。
+            hard_clamped_after = self._enforce_boundary_hard_constraints_no_target(segments, max_passes=1)
+            if hard_clamped_after > 0:
+                adjusted += int(hard_clamped_after)
+                boundary_hard_clamped += int(hard_clamped_after)
+            backprop_after_audio = self._backprop_resolve_locked_tail_overlaps_no_target(segments)
+            if backprop_after_audio > 0:
+                adjusted += int(backprop_after_audio)
+            severe_after_audio = self._resolve_severe_same_source_overlaps_no_target(segments, max_passes=1)
+            if severe_after_audio > 0:
+                adjusted += int(severe_after_audio)
+            if hard_clamped_after > 0 or backprop_after_audio > 0:
+                unresolved = self._count_no_target_boundary_unresolved(segments)
+            if severe_after_audio > 0:
+                unresolved = self._count_no_target_boundary_unresolved(segments)
+
+        # 终态重匹配收尾：
+        # 前序 lag/overflow/边界音频修复可能在尾部再引入新的未收敛边界，
+        # 这里再执行一次定点重匹配，避免“最后几段重复词/断词”残留到最终输出。
+        if unresolved > 0:
+            final_rematch_attempts = max(0, int(getattr(self, "no_target_boundary_rematch_max_attempts", 0)))
+            if final_rematch_attempts > 0:
+                final_rematched = self._rematch_unresolved_boundaries_without_target_fallback(
+                    segments,
+                    max_attempts=final_rematch_attempts,
+                )
+                if final_rematched > 0:
+                    adjusted += int(final_rematched)
+                    unresolved = self._count_no_target_boundary_unresolved(segments)
+                    hard_after_final_rematch = self._enforce_boundary_hard_constraints_no_target(segments, max_passes=1)
+                    if hard_after_final_rematch > 0:
+                        adjusted += int(hard_after_final_rematch)
+                        boundary_hard_clamped += int(hard_after_final_rematch)
+                        unresolved = self._count_no_target_boundary_unresolved(segments)
+                    audio_repaired_final, audio_issues_final = self._repair_boundary_audio_locally_no_target(
+                        segments,
+                        max_passes=1,
+                    )
+                    if audio_repaired_final > 0:
+                        adjusted += int(audio_repaired_final)
+                    boundary_audio_issues += int(audio_issues_final)
+                    boundary_audio_repaired += int(audio_repaired_final)
+                    unresolved = self._count_no_target_boundary_unresolved(segments)
+
+        tail_shortfall_trimmed = self._trim_tail_overlaps_with_shortfall_tolerance_no_target(segments)
+        if tail_shortfall_trimmed > 0:
+            adjusted += int(tail_shortfall_trimmed)
+            unresolved = self._count_no_target_boundary_unresolved(segments)
+
+        self.last_boundary_repair_stats = {
+            "hard_clamped": int(boundary_hard_clamped),
+            "audio_issue_detected": int(boundary_audio_issues),
+            "audio_repaired": int(boundary_audio_repaired),
+            "tail_shortfall_trimmed": int(tail_shortfall_trimmed),
+        }
+
+        return adjusted, unresolved
+
+    def _prepare_cross_source_shortfall_bridges_no_target(self, segments: List[dict]) -> int:
+        """
+        跨源短缺拼桥（禁兜底）：
+        - 当前段命中源尾、与上一同源段存在可感知重复时，
+          若下一段来自新源且接近片头，则允许把下一源的开头借到当前段尾部；
+        - 同步顺延下一段起点，避免“前段重复 + 后段缺字/断音”反复出现。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if not bool(getattr(self, "cross_source_shortfall_bridge_enabled", True)):
+            return 0
+        if len(segments) < 3:
+            return 0
+
+        min_shortfall = max(0.05, float(getattr(self, "cross_source_shortfall_bridge_min_sec", 0.12)))
+        max_shortfall = max(min_shortfall, float(getattr(self, "cross_source_shortfall_bridge_max_sec", 1.20)))
+        next_head_window = max(0.2, float(getattr(self, "cross_source_shortfall_bridge_next_head_window", 0.95)))
+        base_search_cap = max(0.0, float(getattr(self, "cross_source_shortfall_bridge_base_search_cap", 0.40)))
+        extra_trim_cap = max(0.0, float(getattr(self, "cross_source_shortfall_bridge_extra_trim_cap", 0.90)))
+        repaired = 0
+
+        for i in range(1, len(segments) - 1):
+            prev = segments[i - 1]
+            curr = segments[i]
+            nxt = segments[i + 1]
+
+            if prev["source"] == self.target_video or curr["source"] == self.target_video or nxt["source"] == self.target_video:
+                continue
+            if prev["source"] != curr["source"]:
+                continue
+            if curr["source"] == nxt["source"]:
+                continue
+            if self._is_secondary_source(Path(curr["source"])) or self._is_secondary_source(Path(nxt["source"])):
+                continue
+
+            curr_q = curr.get("quality", {}) or {}
+            if bool(curr_q.get("cross_source_shortfall_bridge_no_target", False)):
+                continue
+
+            curr_duration = float(curr["duration"])
+            next_duration = float(nxt["duration"])
+            curr_source_duration = self.get_video_duration(curr["source"])
+            next_source_duration = self.get_video_duration(nxt["source"])
+            if curr_source_duration <= 0.0 or next_source_duration <= 0.0:
+                continue
+
+            prev_end = float(prev["start"]) + float(prev["duration"])
+            curr_start = float(curr["start"])
+            overlap_trim = max(0.0, float(prev_end - curr_start))
+            if overlap_trim < max(0.08, curr_duration * 0.015):
+                continue
+
+            effective_curr_start = max(float(curr_start), float(prev_end))
+            curr_available = max(0.0, float(curr_source_duration - effective_curr_start))
+            if curr_available >= (curr_duration - 0.06):
+                continue
+            shortfall = float(curr_duration - curr_available)
+            if shortfall < min_shortfall or shortfall > max_shortfall:
+                continue
+            if curr_available < max(1.0, curr_duration * 0.55):
+                continue
+
+            next_start_now = float(nxt["start"])
+            if next_start_now > (next_head_window + shortfall + 0.12):
+                continue
+
+            max_next_start = max(0.0, float(next_source_duration - next_duration))
+            if max_next_start <= 0.0:
+                continue
+
+            curr_target_start = float(curr["target_start"])
+            next_target_start = float(nxt["target_start"])
+            base_passed, base_avg = self.quick_verify(
+                source=nxt["source"],
+                source_start=float(next_start_now),
+                target_start=next_target_start,
+                duration=next_duration,
+            )
+            if not base_passed:
+                continue
+            base_audio_passed, base_audio_meta = self.quick_verify_audio(
+                source=nxt["source"],
+                source_start=float(next_start_now),
+                target_start=next_target_start,
+                duration=next_duration,
+                combined_score=float(base_avg),
+            )
+            base_score = (
+                float(base_avg)
+                + float(base_audio_meta.get("aligned_similarity", 0.0) or 0.0) * 0.03
+                - float(base_audio_meta.get("shift_gain", 0.0) or 0.0) * 0.06
+            )
+            if not base_audio_passed:
+                base_score -= 0.25
+
+            baseline_curr_start = float(curr["start"])
+            baseline_curr_passed, baseline_curr_avg = self.quick_verify(
+                source=curr["source"],
+                source_start=baseline_curr_start,
+                target_start=curr_target_start,
+                duration=curr_duration,
+            )
+            if baseline_curr_passed:
+                baseline_curr_audio_passed, baseline_curr_audio_meta = self.quick_verify_audio(
+                    source=curr["source"],
+                    source_start=baseline_curr_start,
+                    target_start=curr_target_start,
+                    duration=curr_duration,
+                    combined_score=float(baseline_curr_avg),
+                )
+                baseline_curr_score = (
+                    float(baseline_curr_avg)
+                    + float(baseline_curr_audio_meta.get("aligned_similarity", 0.0) or 0.0) * 0.03
+                    - float(baseline_curr_audio_meta.get("shift_gain", 0.0) or 0.0) * 0.06
+                )
+                if not baseline_curr_audio_passed:
+                    baseline_curr_score -= 0.25
+            else:
+                baseline_curr_audio_meta = {"checked": False, "reason": "baseline_curr_single_source_failed"}
+                baseline_curr_score = float(curr_q.get("combined", 0.0) or 0.0)
+            base_total_score = float(base_score) + float(baseline_curr_score)
+
+            base_candidates = [0.0, 0.1, 0.2, 0.3, 0.4]
+            dynamic_candidates = [
+                max(0.0, float(next_start_now - shortfall)),
+                min(float(next_start_now), float(base_search_cap)),
+                min(float(base_search_cap), float(shortfall)),
+            ]
+            candidate_bases: List[float] = []
+            seen_base: Set[float] = set()
+            for raw_base in [*base_candidates, *dynamic_candidates]:
+                base = max(0.0, min(float(raw_base), float(base_search_cap), float(max_next_start)))
+                key = round(float(base), 3)
+                if key in seen_base:
+                    continue
+                seen_base.add(key)
+                candidate_bases.append(float(base))
+
+            max_extra_trim = min(
+                float(extra_trim_cap),
+                max(0.0, float(curr_available - max(0.35, curr_duration * 0.58))),
+                max(0.0, float(max_shortfall - shortfall)),
+            )
+            extra_trim_candidates_raw = [0.0, 0.06, 0.12, 0.18, 0.24, 0.32, 0.48, 0.64, 0.80]
+            extra_trim_candidates: List[float] = []
+            seen_trim: Set[float] = set()
+            for raw_trim in extra_trim_candidates_raw:
+                trim = max(0.0, min(float(raw_trim), float(max_extra_trim)))
+                key = round(float(trim), 3)
+                if key in seen_trim:
+                    continue
+                seen_trim.add(key)
+                extra_trim_candidates.append(float(trim))
+
+            best_choice: Optional[Dict[str, object]] = None
+            best_score: Optional[float] = None
+
+            for extra_trim in extra_trim_candidates:
+                curr_first_start = float(effective_curr_start + extra_trim)
+                first_part_duration = max(0.0, float(curr_source_duration - curr_first_start))
+                if first_part_duration < max(0.35, curr_duration * 0.55):
+                    continue
+                borrow_duration = float(curr_duration - first_part_duration)
+                if borrow_duration < min_shortfall or borrow_duration > max_shortfall:
+                    continue
+
+                for base in candidate_bases:
+                    new_next_start = float(base + borrow_duration)
+                    if new_next_start > (max_next_start + 1e-6):
+                        continue
+
+                    if (i + 2) < len(segments):
+                        nxt2 = segments[i + 2]
+                        if nxt2["source"] == nxt["source"] and nxt2["source"] != self.target_video:
+                            next_gap = float(nxt2["start"]) - (float(new_next_start) + next_duration)
+                            if next_gap < -max(0.30, next_duration * 0.04):
+                                continue
+                        else:
+                            next_gap = None
+                    else:
+                        next_gap = None
+
+                    composite_parts = [
+                        {
+                            "source": str(curr["source"]),
+                            "start": float(curr_first_start),
+                            "duration": float(first_part_duration),
+                        },
+                        {
+                            "source": str(nxt["source"]),
+                            "start": float(base),
+                            "duration": float(borrow_duration),
+                        },
+                    ]
+                    curr_probe = self._probe_composite_parts_against_target(
+                        composite_parts,
+                        target_start=curr_target_start,
+                        duration=curr_duration,
+                    )
+                    if curr_probe is None:
+                        continue
+
+                    passed, avg = self.quick_verify(
+                        source=nxt["source"],
+                        source_start=float(new_next_start),
+                        target_start=next_target_start,
+                        duration=next_duration,
+                    )
+                    if not passed:
+                        continue
+
+                    audio_passed, audio_meta = self.quick_verify_audio(
+                        source=nxt["source"],
+                        source_start=float(new_next_start),
+                        target_start=next_target_start,
+                        duration=next_duration,
+                        combined_score=float(avg),
+                    )
+                    if not audio_passed:
+                        continue
+
+                    next_score = (
+                        float(avg)
+                        + float(audio_meta.get("aligned_similarity", 0.0) or 0.0) * 0.03
+                        - float(audio_meta.get("shift_gain", 0.0) or 0.0) * 0.06
+                        - abs(float(new_next_start) - float(next_start_now)) * 0.01
+                        - float(base) * 0.01
+                    )
+                    if next_gap is not None:
+                        next_score -= abs(float(next_gap)) * 0.08
+
+                    total_score = float(curr_probe["score"]) * 1.35 + float(next_score)
+                    total_score -= float(extra_trim) * 0.02
+                    if not baseline_curr_passed:
+                        # 单源当前段本身已不足以覆盖目标内容时，优先给更长的借段机会，
+                        # 避免只补到“刚够时长”却仍吞掉句尾关键词。
+                        total_score += float(borrow_duration) * 0.12
+                    if best_score is None or total_score > best_score + 1e-6:
+                        best_score = float(total_score)
+                        best_choice = {
+                            "curr_start": float(curr_first_start),
+                            "first_part_duration": float(first_part_duration),
+                            "borrow_duration": float(borrow_duration),
+                            "base_start": float(base),
+                            "next_start": float(new_next_start),
+                            "verify_avg": float(avg),
+                            "audio_meta": audio_meta,
+                            "next_gap": None if next_gap is None else float(next_gap),
+                            "curr_probe": curr_probe,
+                            "curr_parts": composite_parts,
+                            "extra_trim": float(extra_trim),
+                        }
+
+            if best_choice is None:
+                continue
+            if float(best_score) + 0.015 < float(base_total_score):
+                continue
+
+            old_curr_start = float(curr["start"])
+            old_next_start = float(nxt["start"])
+            curr["start"] = float(best_choice["curr_start"])
+            curr["composite_parts"] = list(best_choice["curr_parts"])
+            nxt["start"] = float(best_choice["next_start"])
+
+            curr_q["cross_source_shortfall_bridge_no_target"] = True
+            curr_q["cross_source_shortfall_bridge_curr_start_from"] = float(old_curr_start)
+            curr_q["cross_source_shortfall_bridge_curr_start_to"] = float(best_choice["curr_start"])
+            curr_q["cross_source_shortfall_bridge_overlap_trim_sec"] = float(overlap_trim)
+            curr_q["cross_source_shortfall_bridge_shortfall_sec"] = float(best_choice["borrow_duration"])
+            curr_q["cross_source_shortfall_bridge_first_part_duration"] = float(best_choice["first_part_duration"])
+            curr_q["cross_source_shortfall_bridge_extra_trim_sec"] = float(best_choice["extra_trim"])
+            curr_q["cross_source_shortfall_bridge_borrow_source"] = str(nxt["source"])
+            curr_q["cross_source_shortfall_bridge_borrow_start"] = float(best_choice["base_start"])
+            curr_q["cross_source_shortfall_bridge_borrow_duration"] = float(best_choice["borrow_duration"])
+            curr_q["cross_source_shortfall_bridge_next_start_from"] = float(old_next_start)
+            curr_q["cross_source_shortfall_bridge_next_start_to"] = float(best_choice["next_start"])
+            curr_q["cross_source_shortfall_bridge_next_verify_avg"] = float(best_choice["verify_avg"])
+            curr_q["cross_source_shortfall_bridge_next_audio_guard"] = best_choice["audio_meta"]
+            curr_q["cross_source_shortfall_bridge_parts"] = list(curr["composite_parts"])
+            curr_q["cross_source_shortfall_bridge_curr_verify_avg"] = float(best_choice["curr_probe"]["verify_avg"])
+            curr_q["cross_source_shortfall_bridge_curr_audio_guard"] = best_choice["curr_probe"]["audio_meta"]
+            curr_q["cross_source_shortfall_bridge_total_score"] = float(best_score)
+            curr_q["cross_source_shortfall_bridge_baseline_curr_single_source_passed"] = bool(baseline_curr_passed)
+            curr_q["cross_source_shortfall_bridge_baseline_curr_score"] = float(baseline_curr_score)
+            curr_q["cross_source_shortfall_bridge_baseline_curr_audio_guard"] = baseline_curr_audio_meta
+            curr["quality"] = curr_q
+
+            next_q = nxt.get("quality", {}) or {}
+            next_q["cross_source_shortfall_bridge_from_prev"] = True
+            next_q["cross_source_shortfall_bridge_prev_index"] = int(curr["index"])
+            next_q["cross_source_shortfall_bridge_prev_source"] = str(curr["source"])
+            next_q["cross_source_shortfall_bridge_prev_borrow_start"] = float(best_choice["base_start"])
+            next_q["cross_source_shortfall_bridge_prev_borrow_duration"] = float(best_choice["borrow_duration"])
+            next_q["cross_source_shortfall_bridge_start_from"] = float(old_next_start)
+            next_q["cross_source_shortfall_bridge_start_to"] = float(best_choice["next_start"])
+            next_q["cross_source_shortfall_bridge_verify_avg"] = float(best_choice["verify_avg"])
+            next_q["cross_source_shortfall_bridge_audio_guard"] = best_choice["audio_meta"]
+            if best_choice.get("next_gap") is not None:
+                next_q["cross_source_shortfall_bridge_next_gap"] = float(best_choice["next_gap"])
+            nxt["quality"] = next_q
+            repaired += 1
+
+        return int(repaired)
+
+    def _prepare_cross_source_prev_tail_carryovers_no_target(self, segments: List[dict]) -> int:
+        """
+        跨源前源尾巴接入（禁兜底）：
+        - 上一源仍剩一小段尾巴、下一段却直接从新源片头开始时，
+          允许把上一源尾巴接到当前段开头；
+        - 同步把当前源后续同源 run 向前平移，避免切源处丢掉 0.5~1.5 秒内容。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        if len(segments) < 2:
+            return 0
+
+        min_borrow = max(0.10, float(getattr(self, "cross_source_shortfall_bridge_min_sec", 0.12)))
+        max_borrow = max(
+            min_borrow,
+            min(1.60, float(getattr(self, "cross_source_shortfall_bridge_max_sec", 1.20)) + 0.25),
+        )
+        head_window = max(
+            0.25,
+            float(getattr(self, "cross_source_shortfall_bridge_next_head_window", 0.95)) + 0.10,
+        )
+        verify_window_sec = max(10.0, float(self.segment_duration) * 5.0)
+        repaired = 0
+
+        for i in range(1, len(segments)):
+            prev = segments[i - 1]
+            curr = segments[i]
+            if prev["source"] == self.target_video or curr["source"] == self.target_video:
+                continue
+            if prev["source"] == curr["source"]:
+                continue
+            if self._is_secondary_source(Path(prev["source"])) or self._is_secondary_source(Path(curr["source"])):
+                continue
+
+            curr_q = curr.get("quality", {}) or {}
+            if bool(curr_q.get("cross_source_prev_tail_carryover_no_target", False)):
+                continue
+
+            prev_src_dur = self.get_video_duration(prev["source"])
+            if prev_src_dur <= 0.0:
+                continue
+            prev_end = float(prev["start"]) + float(prev["duration"])
+            prev_tail_left = max(0.0, float(prev_src_dur - prev_end))
+            if prev_tail_left < min_borrow:
+                continue
+
+            curr_start = float(curr["start"])
+            if curr_start > head_window:
+                continue
+
+            run_end = i
+            while (run_end + 1) < len(segments) and segments[run_end + 1]["source"] == curr["source"]:
+                run_end += 1
+            if run_end == i:
+                continue
+
+            raw_borrows = [
+                min(float(prev_tail_left), float(max_borrow)),
+                min(float(prev_tail_left), float(max_borrow), 1.20),
+                min(float(prev_tail_left), float(max_borrow), 1.00),
+                min(float(prev_tail_left), float(max_borrow), 0.85),
+                min(float(prev_tail_left), float(max_borrow), 0.65),
+            ]
+            borrow_candidates: List[float] = []
+            seen_borrow: Set[float] = set()
+            for raw in raw_borrows:
+                borrow = max(0.0, min(float(raw), float(curr["duration"]) - 0.6))
+                key = round(float(borrow), 3)
+                if borrow < min_borrow or key in seen_borrow:
+                    continue
+                seen_borrow.add(key)
+                borrow_candidates.append(float(borrow))
+            if not borrow_candidates:
+                continue
+
+            best_choice: Optional[Dict[str, object]] = None
+            best_score: Optional[float] = None
+            for borrow in borrow_candidates:
+                composite_parts = [
+                    {
+                        "source": str(prev["source"]),
+                        "start": float(prev_end),
+                        "duration": float(borrow),
+                    },
+                    {
+                        "source": str(curr["source"]),
+                        "start": float(curr_start),
+                        "duration": float(curr["duration"] - borrow),
+                    },
+                ]
+                curr_probe = self._probe_composite_parts_against_target(
+                    composite_parts,
+                    target_start=float(curr["target_start"]),
+                    duration=float(curr["duration"]),
+                )
+                if not isinstance(curr_probe, dict):
+                    continue
+                if not bool(curr_probe.get("passed", False)):
+                    continue
+
+                shifted_starts: Dict[int, float] = {}
+                shifted_audio_meta: Dict[int, Dict[str, object]] = {}
+                shifted_verify_avg: Dict[int, float] = {}
+                run_ok = True
+                total_score = float(curr_probe.get("verify_avg", 0.0)) + float(curr_probe.get("aligned_similarity", 0.0)) * 0.08
+                verified_follow_duration = 0.0
+                verified_follow_segments = 0
+                for k in range(i + 1, run_end + 1):
+                    seg = segments[k]
+                    new_start = float(seg["start"]) - float(borrow)
+                    if new_start < 0.0:
+                        run_ok = False
+                        break
+                    shifted_starts[k] = float(new_start)
+                    if verified_follow_duration < verify_window_sec:
+                        passed, avg = self.quick_verify(
+                            source=seg["source"],
+                            source_start=float(new_start),
+                            target_start=float(seg["target_start"]),
+                            duration=float(seg["duration"]),
+                        )
+                        audio_passed, audio_meta = self.quick_verify_audio(
+                            source=seg["source"],
+                            source_start=float(new_start),
+                            target_start=float(seg["target_start"]),
+                            duration=float(seg["duration"]),
+                            combined_score=float(avg),
+                        )
+                        if not audio_passed:
+                            run_ok = False
+                            break
+                        aligned = float((audio_meta or {}).get("aligned_similarity", 0.0) or 0.0)
+                        relaxed_ok = bool((not passed) and float(avg) >= 0.90 and aligned >= 0.66)
+                        if (not passed) and (not relaxed_ok):
+                            run_ok = False
+                            break
+                        best_shift = float((audio_meta or {}).get("best_shift_sec", 0.0) or 0.0)
+                        shift_gain = float((audio_meta or {}).get("shift_gain", 0.0) or 0.0)
+                        if abs(best_shift) >= 0.45 and shift_gain >= 0.10:
+                            run_ok = False
+                            break
+                        shifted_audio_meta[k] = dict(audio_meta or {})
+                        shifted_verify_avg[k] = float(avg)
+                        total_score += float(avg) + aligned * 0.05
+                        verified_follow_duration += float(seg["duration"])
+                        verified_follow_segments += 1
+
+                if not run_ok:
+                    continue
+                if verified_follow_segments <= 0:
+                    continue
+
+                score = float(total_score) - float(borrow) * 0.03
+                if best_score is None or score > best_score:
+                    best_score = float(score)
+                    best_choice = {
+                        "borrow": float(borrow),
+                        "curr_parts": composite_parts,
+                        "curr_probe": curr_probe,
+                        "shifted_starts": shifted_starts,
+                        "shifted_audio_meta": shifted_audio_meta,
+                        "shifted_verify_avg": shifted_verify_avg,
+                    }
+
+            if best_choice is None:
+                continue
+
+            curr["composite_parts"] = list(best_choice["curr_parts"])
+            curr_q["cross_source_prev_tail_carryover_no_target"] = True
+            curr_q["cross_source_prev_tail_carryover_prev_source"] = str(prev["source"])
+            curr_q["cross_source_prev_tail_carryover_prev_tail_start"] = float(prev_end)
+            curr_q["cross_source_prev_tail_carryover_prev_tail_duration"] = float(best_choice["borrow"])
+            curr_q["cross_source_prev_tail_carryover_curr_source_start"] = float(curr_start)
+            curr_q["cross_source_prev_tail_carryover_curr_source_duration"] = float(curr["duration"] - best_choice["borrow"])
+            curr_q["cross_source_prev_tail_carryover_verify_avg"] = float(best_choice["curr_probe"].get("verify_avg", 0.0))
+            curr_q["cross_source_prev_tail_carryover_audio_guard"] = best_choice["curr_probe"].get("audio_meta", {})
+            curr["quality"] = curr_q
+
+            for k, new_start in best_choice["shifted_starts"].items():
+                seg = segments[k]
+                old_start = float(seg["start"])
+                seg["start"] = float(new_start)
+                q = seg.get("quality", {}) or {}
+                q["cross_source_prev_tail_carryover_shifted_no_target"] = True
+                q["cross_source_prev_tail_carryover_shift_from"] = float(old_start)
+                q["cross_source_prev_tail_carryover_shift_to"] = float(new_start)
+                q["cross_source_prev_tail_carryover_shift_sec"] = float(best_choice["borrow"])
+                q["cross_source_prev_tail_carryover_anchor_index"] = int(i)
+                q["audio_guard"] = best_choice["shifted_audio_meta"].get(k, q.get("audio_guard", {}))
+                seg["quality"] = q
+
+            repaired += 1
+
+        return int(repaired)
+
+    def _probe_composite_parts_against_target(
+        self,
+        parts: List[dict],
+        target_start: float,
+        duration: float,
+    ) -> Optional[Dict[str, object]]:
+        """临时拼接 composite 段并复用现有 visual/audio 守卫评分。"""
+        probe_clip = self.temp_dir / f"bridge_probe_{uuid.uuid4().hex}.mp4"
+        output_fps = max(12.0, float(self.output_fps or 24.0))
+        fps_expr = f"fps={output_fps:.6f},format=yuv420p"
+        ok, _ = self._extract_composite_av_clip(
+            parts,
+            probe_clip,
+            fps_expr,
+            total_duration=float(duration),
+            expected_frames=max(1, int(round(float(duration) * output_fps))),
+            include_audio=True,
+        )
+        if not ok:
+            probe_clip.unlink(missing_ok=True)
+            return None
+        try:
+            passed, avg = self.quick_verify(
+                source=probe_clip,
+                source_start=0.0,
+                target_start=float(target_start),
+                duration=float(duration),
+            )
+            if not passed:
+                return None
+            audio_passed, audio_meta = self.quick_verify_audio(
+                source=probe_clip,
+                source_start=0.0,
+                target_start=float(target_start),
+                duration=float(duration),
+                combined_score=float(avg),
+            )
+            if not audio_passed:
+                return None
+            score = (
+                float(avg)
+                + float(audio_meta.get("aligned_similarity", 0.0) or 0.0) * 0.03
+                - float(audio_meta.get("shift_gain", 0.0) or 0.0) * 0.06
+            )
+            return {
+                "passed": True,
+                "verify_avg": float(avg),
+                "audio_meta": audio_meta,
+                "score": float(score),
+            }
+        finally:
+            probe_clip.unlink(missing_ok=True)
+
+    def _extract_composite_av_clip(
+        self,
+        parts: List[dict],
+        output_clip: Path,
+        fps_expr: str,
+        total_duration: float,
+        expected_frames: int = 0,
+        include_audio: bool = True,
+    ) -> Tuple[bool, str]:
+        """提取并拼接 composite 段（多源桥接段）。"""
+        usable_parts = [dict(part) for part in parts if float(part.get("duration", 0.0) or 0.0) > 0.03]
+        if not usable_parts:
+            return False, "empty_composite_parts"
+
+        output_clip.unlink(missing_ok=True)
+        seg_ext = output_clip.suffix or ".mp4"
+        output_fps = max(12.0, float(self.output_fps or 24.0))
+        part_clips: List[Path] = []
+        errors: List[str] = []
+
+        for part_idx, part in enumerate(usable_parts):
+            part_duration = float(part.get("duration", 0.0) or 0.0)
+            part_clip = output_clip.with_name(f"{output_clip.stem}.part{part_idx}{seg_ext}")
+            part_expected_frames = max(1, int(round(part_duration * output_fps))) if expected_frames else 0
+            ok, err = self._extract_av_clip(
+                Path(str(part["source"])),
+                float(part["start"]),
+                float(part_duration),
+                part_clip,
+                fps_expr,
+                expected_frames=part_expected_frames,
+                include_audio=include_audio,
+            )
+            if not ok:
+                errors.append(f"part{part_idx}:{err}")
+                for clip in part_clips:
+                    clip.unlink(missing_ok=True)
+                part_clip.unlink(missing_ok=True)
+                return False, " | ".join(errors[:3])
+            part_clips.append(part_clip)
+
+        if len(part_clips) == 1:
+            os.replace(part_clips[0], output_clip)
+            return True, ""
+
+        gop = max(12, int(round(float(self.output_fps or 25.0))))
+        concat_cmd: List[str] = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error']
+        for clip in part_clips:
+            concat_cmd.extend(['-i', str(clip)])
+
+        if include_audio:
+            concat_inputs = "".join(f"[{idx}:v:0][{idx}:a:0]" for idx in range(len(part_clips)))
+            filter_expr = (
+                f"{concat_inputs}concat=n={len(part_clips)}:v=1:a=1[v][a_raw];"
+                f"[a_raw]aresample=async=1:first_pts=0,atrim=0:{float(total_duration):.6f},"
+                f"asetpts=PTS-STARTPTS[a]"
+            )
+        else:
+            concat_inputs = "".join(f"[{idx}:v:0]" for idx in range(len(part_clips)))
+            filter_expr = f"{concat_inputs}concat=n={len(part_clips)}:v=1:a=0[v]"
+
+        concat_cmd.extend([
+            '-filter_complex', filter_expr,
+            '-map', '[v]',
+            '-t', f"{float(total_duration):.6f}",
+            '-reset_timestamps', '1',
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+            '-bf', '0',
+            '-g', str(gop),
+            '-keyint_min', str(gop),
+            '-sc_threshold', '0',
+        ])
+        if include_audio:
+            concat_cmd.extend([
+                '-map', '[a]',
+                '-ar', '48000',
+                '-ac', '2',
+            ])
+            if bool(getattr(self, "segment_intermediate_pcm_audio", False)):
+                concat_cmd.extend(['-c:a', 'pcm_s16le'])
+            else:
+                concat_cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
+        else:
+            concat_cmd.extend(['-an'])
+            if expected_frames > 0:
+                concat_cmd.extend(['-frames:v', str(max(1, int(expected_frames)))])
+        concat_cmd.append(str(output_clip))
+
+        concat_proc = subprocess.run(concat_cmd, capture_output=True, text=True)
+        for clip in part_clips:
+            clip.unlink(missing_ok=True)
+        if concat_proc.returncode != 0 or (not output_clip.exists()) or output_clip.stat().st_size <= 0:
+            output_clip.unlink(missing_ok=True)
+            return False, f"composite_concat_failed:{(concat_proc.stderr or '').strip()}"
+
+        return True, ""
+
     def _extract_av_clip(
         self,
         source: Path,
@@ -2277,37 +8769,158 @@ class FastHighPrecisionReconstructor:
     ) -> Tuple[bool, str]:
         """提取单段 AV 片段，返回 (是否成功, 错误信息)。"""
         frame_count = max(1, int(expected_frames)) if expected_frames else 0
+        use_pcm_audio = bool(include_audio and getattr(self, "segment_intermediate_pcm_audio", False))
         # 播放兼容优先：固定 GOP + 关闭 B 帧，降低个别播放器“音频前进/画面卡住”观感概率。
         gop = max(12, int(round(float(self.output_fps or 25.0))))
-        cmd = [
-            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-            '-i', str(source),
-            '-ss', str(start),
-            '-t', str(duration),
-            '-vf', fps_expr,
-            '-reset_timestamps', '1',
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-            '-bf', '0',
-            '-g', str(gop),
-            '-keyint_min', str(gop),
-            '-sc_threshold', '0',
-        ]
-        if include_audio:
-            cmd.extend([
-                '-af', f'aresample=async=1:first_pts=0,atrim=0:{duration:.6f},asetpts=PTS-STARTPTS',
-                '-c:a', 'aac', '-b:a', '128k',
-            ])
-        else:
-            cmd.extend(['-an'])
-        if frame_count > 0:
-            cmd.extend(['-frames:v', str(frame_count)])
-        cmd.append(str(output_clip))
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            return False, (result.stderr or "").strip()
-        if not output_clip.exists() or output_clip.stat().st_size <= 0:
-            return False, "empty_output"
-        return True, ""
+        prefer_accurate_seek = bool(include_audio and getattr(self, "audio_segment_accurate_seek", True))
+        seek_plan = [prefer_accurate_seek]
+        if include_audio and (not prefer_accurate_seek):
+            seek_plan.append(True)
+        elif include_audio and prefer_accurate_seek:
+            seek_plan.append(False)
+
+        errors: List[str] = []
+
+        def build_extract_cmd(use_accurate_seek: bool) -> List[str]:
+            if use_accurate_seek:
+                cmd = [
+                    'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                    '-i', str(source),
+                    '-ss', str(start),
+                    '-t', str(duration),
+                    '-vf', fps_expr,
+                    '-reset_timestamps', '1',
+                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+                    '-bf', '0',
+                    '-g', str(gop),
+                    '-keyint_min', str(gop),
+                    '-sc_threshold', '0',
+                ]
+            else:
+                cmd = [
+                    'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                    '-ss', str(start),
+                    '-t', str(duration),
+                    '-i', str(source),
+                    '-vf', fps_expr,
+                    '-reset_timestamps', '1',
+                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+                    '-bf', '0',
+                    '-g', str(gop),
+                    '-keyint_min', str(gop),
+                    '-sc_threshold', '0',
+                ]
+            if include_audio:
+                audio_chain = [
+                    '-af', f'aresample=async=1:first_pts=0,atrim=0:{duration:.6f},asetpts=PTS-STARTPTS',
+                    '-ar', '48000',
+                    '-ac', '2',
+                ]
+                if use_pcm_audio:
+                    audio_chain.extend(['-c:a', 'pcm_s16le'])
+                else:
+                    audio_chain.extend(['-c:a', 'aac', '-b:a', '128k'])
+                cmd.extend(audio_chain)
+            else:
+                cmd.extend(['-an'])
+                if frame_count > 0:
+                    cmd.extend(['-frames:v', str(frame_count)])
+            cmd.append(str(output_clip))
+            return cmd
+
+        def pad_shortfall_if_needed(attempt_tag: str, shortfall: float) -> Tuple[bool, str]:
+            if shortfall <= 1e-6:
+                return True, ""
+
+            padded_clip = output_clip.with_name(f"{output_clip.stem}.{attempt_tag}.pad.mp4")
+            pad_vf = f"{fps_expr},tpad=stop_mode=clone:stop_duration={shortfall:.6f}"
+            pad_cmd = [
+                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                '-i', str(output_clip),
+                '-vf', pad_vf,
+                '-t', f"{duration:.6f}",
+                '-reset_timestamps', '1',
+                '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+                '-bf', '0',
+                '-g', str(gop),
+                '-keyint_min', str(gop),
+                '-sc_threshold', '0',
+            ]
+            if include_audio:
+                audio_chain = [
+                    '-af', f'aresample=async=1:first_pts=0,apad,atrim=0:{duration:.6f},asetpts=PTS-STARTPTS',
+                    '-ar', '48000',
+                    '-ac', '2',
+                ]
+                if use_pcm_audio:
+                    audio_chain.extend(['-c:a', 'pcm_s16le'])
+                else:
+                    audio_chain.extend(['-c:a', 'aac', '-b:a', '128k'])
+                pad_cmd.extend(audio_chain)
+            else:
+                pad_cmd.extend(['-an'])
+            pad_cmd.append(str(padded_clip))
+
+            pad_proc = subprocess.run(pad_cmd, capture_output=True, text=True)
+            if pad_proc.returncode != 0 or (not padded_clip.exists()) or padded_clip.stat().st_size <= 0:
+                padded_clip.unlink(missing_ok=True)
+                return False, (pad_proc.stderr or "").strip()
+
+            os.replace(padded_clip, output_clip)
+            return True, ""
+
+        for attempt_idx, use_accurate_seek in enumerate(seek_plan):
+            attempt_tag = f"attempt{attempt_idx + 1}"
+            cmd = build_extract_cmd(use_accurate_seek=bool(use_accurate_seek))
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                mode = "accurate" if use_accurate_seek else "fast"
+                errors.append(f"{mode}_seek_extract_failed:{(result.stderr or '').strip()}")
+                continue
+            if (not output_clip.exists()) or output_clip.stat().st_size <= 0:
+                errors.append("empty_output")
+                continue
+
+            self._invalidate_media_duration_cache(output_clip)
+            clip_video_dur = float(self.get_video_duration(output_clip))
+            clip_audio_dur = float(self.get_audio_duration(output_clip)) if include_audio else clip_video_dur
+            if clip_video_dur <= 0.02:
+                errors.append("zero_video_duration")
+                continue
+            if include_audio and clip_audio_dur <= 0.02:
+                mode = "accurate" if use_accurate_seek else "fast"
+                errors.append(f"{mode}_seek_no_audio_stream")
+                continue
+
+            if bool(getattr(self, "segment_shortfall_pad", True)):
+                base_dur = min(clip_video_dur, clip_audio_dur) if include_audio else clip_video_dur
+                shortfall = max(0.0, float(duration) - float(base_dur))
+                if shortfall > max(0.06, float(duration) * 0.015):
+                    hard_fail_sec = max(0.0, float(getattr(self, "segment_shortfall_pad_hard_fail_sec", 0.90)))
+                    hard_fail_ratio = max(0.0, float(getattr(self, "segment_shortfall_pad_hard_fail_ratio", 0.22)))
+                    if shortfall > max(hard_fail_sec, float(duration) * hard_fail_ratio):
+                        errors.append(f"shortfall_too_large:{shortfall:.3f}s")
+                        continue
+                    ok_pad, pad_err = pad_shortfall_if_needed(attempt_tag=attempt_tag, shortfall=float(shortfall))
+                    if not ok_pad:
+                        # 轻微短缺允许继续；较大短缺强制进入下一抽取策略。
+                        errors.append(f"pad_shortfall_failed:{pad_err[:200]}")
+                        if shortfall > max(0.35, float(duration) * 0.08):
+                            continue
+
+                    self._invalidate_media_duration_cache(output_clip)
+                    clip_video_dur = float(self.get_video_duration(output_clip))
+                    if include_audio:
+                        clip_audio_dur = float(self.get_audio_duration(output_clip))
+                        if clip_audio_dur <= 0.02:
+                            errors.append("shortfall_pad_no_audio_stream")
+                            continue
+
+            return True, ""
+
+        if not errors:
+            return False, "extract_failed_unknown"
+        return False, " | ".join(errors[:3])
 
     def _quick_frame_similarity(self, frame_a: np.ndarray, frame_b: np.ndarray) -> float:
         """轻量帧相似度（1-归一化绝对差），用于单帧突刺检测。"""
@@ -2427,6 +9040,7 @@ class FastHighPrecisionReconstructor:
         cap = cv2.VideoCapture(str(input_video))
         prev_full_frame = None
         frame_idx = 0
+        pipe_broken = False
         try:
             while True:
                 ok, frame = cap.read()
@@ -2437,7 +9051,11 @@ class FastHighPrecisionReconstructor:
                     out_frame = prev_full_frame
                 if proc.stdin is None:
                     break
-                proc.stdin.write(out_frame.tobytes())
+                try:
+                    proc.stdin.write(out_frame.tobytes())
+                except BrokenPipeError:
+                    pipe_broken = True
+                    break
                 prev_full_frame = frame
                 frame_idx += 1
             if proc.stdin is not None:
@@ -2448,7 +9066,7 @@ class FastHighPrecisionReconstructor:
             if proc.poll() is None:
                 proc.kill()
 
-        if ret != 0 or not repaired_video_only.exists():
+        if pipe_broken or ret != 0 or not repaired_video_only.exists():
             return input_video, 0
 
         # 若后续会强制覆盖目标音轨，这里不再回灌输入音轨，
@@ -2524,21 +9142,33 @@ class FastHighPrecisionReconstructor:
             seg_source = seg['source']
             seg_start = seg['start']
             seg_expected_frames = max(1, int(round(float(seg['duration']) * output_fps)))
-            av_clip = self.temp_dir / f"seg_{seg['index']:03d}_av.mp4"
+            seg_ext = "mkv" if ((not render_target_audio_only) and bool(getattr(self, "segment_intermediate_pcm_audio", False))) else "mp4"
+            av_clip = self.temp_dir / f"seg_{seg['index']:03d}_av.{seg_ext}"
             seg_extract_perf = time.perf_counter()
 
-            ok, err = self._extract_av_clip(
-                seg_source,
-                seg_start,
-                seg['duration'],
-                av_clip,
-                fps_expr,
-                expected_frames=seg_expected_frames,
-                include_audio=(not render_target_audio_only),
-            )
+            composite_parts = seg.get("composite_parts")
+            if isinstance(composite_parts, list) and composite_parts:
+                ok, err = self._extract_composite_av_clip(
+                    composite_parts,
+                    av_clip,
+                    fps_expr,
+                    total_duration=float(seg['duration']),
+                    expected_frames=seg_expected_frames,
+                    include_audio=(not render_target_audio_only),
+                )
+            else:
+                ok, err = self._extract_av_clip(
+                    seg_source,
+                    seg_start,
+                    seg['duration'],
+                    av_clip,
+                    fps_expr,
+                    expected_frames=seg_expected_frames,
+                    include_audio=(not render_target_audio_only),
+                )
 
             fallback_used = False
-            if not ok and seg_source != self.target_video:
+            if not ok and seg_source != self.target_video and self.enable_target_video_fallback:
                 fallback_used = True
                 q = seg.get("quality", {}) or {}
                 q["fallback"] = True
@@ -2629,7 +9259,11 @@ class FastHighPrecisionReconstructor:
         concat_perf = time.perf_counter()
         # 经验阈值：当大量段已兜底到目标素材时，copy 拼接更容易在个别播放器出现边界卡顿观感。
         concat_reencode_fallback_ratio = 0.85
-        fallback_count = sum(1 for seg in segments if bool(seg.get("fallback", False)))
+        fallback_count = sum(
+            1
+            for seg in segments
+            if bool((seg.get("quality", {}) or {}).get("fallback", False))
+        )
         fallback_ratio = (float(fallback_count) / float(len(segments))) if segments else 0.0
 
         def _run_concat_reencode(out_path: Path) -> Tuple[bool, str]:
@@ -2650,7 +9284,17 @@ class FastHighPrecisionReconstructor:
             if render_target_audio_only:
                 reencode_cmd.extend(['-an'])
             else:
-                reencode_cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
+                audio_advance = max(0.0, float(getattr(self, "audio_sync_advance_sec", 0.0)))
+                if audio_advance > 1e-6:
+                    af_expr = f"asetpts=PTS-{audio_advance:.6f}/TB,aresample=async=1:first_pts=0"
+                else:
+                    af_expr = 'aresample=async=1:first_pts=0'
+                reencode_cmd.extend([
+                    '-af', af_expr,
+                    '-ar', '48000',
+                    '-ac', '2',
+                    '-c:a', 'aac', '-b:a', '128k',
+                ])
             reencode_cmd.append(str(out_path))
             reencode_proc = subprocess.run(reencode_cmd, capture_output=True, text=True)
             if reencode_proc.returncode == 0 and out_path.exists():
@@ -2658,7 +9302,14 @@ class FastHighPrecisionReconstructor:
             return False, (reencode_proc.stderr or "").strip()
 
         concat_error = ""
-        if fallback_ratio >= concat_reencode_fallback_ratio:
+        if not self.enable_target_video_fallback:
+            # 严格禁兜底模式下优先稳定性：始终重编码拼接，避免 copy 拼接时间戳抖动导致掉音/循环。
+            ok, concat_error = _run_concat_reencode(temp_output)
+            if ok:
+                concat_mode = "reencode_no_target_fallback"
+            else:
+                concat_mode = ""
+        elif fallback_ratio >= concat_reencode_fallback_ratio:
             # 高兜底场景直接使用稳定重编码拼接，优先播放兼容性。
             ok, concat_error = _run_concat_reencode(temp_output)
             if ok:
@@ -2751,9 +9402,12 @@ class FastHighPrecisionReconstructor:
 
         stitched_audio_duration = self.get_audio_duration(temp_output)
         min_audio_required = max(5.0, float(target_duration) * 0.90)
-        auto_target_audio_fallback = (
-            stitched_audio_duration <= 0.0
-            or (stitched_audio_duration + 0.5) < min_audio_required
+        auto_target_audio_fallback = bool(
+            self.enable_target_video_fallback
+            and (
+                stitched_audio_duration <= 0.0
+                or (stitched_audio_duration + 0.5) < min_audio_required
+            )
         )
         if auto_target_audio_fallback and not self.force_target_audio:
             print(
@@ -2761,7 +9415,40 @@ class FastHighPrecisionReconstructor:
                 "自动切换目标音轨封装"
             )
 
-        use_target_audio_mux = bool(self.force_target_audio or auto_target_audio_fallback)
+        if (not self.enable_target_video_fallback) and (
+            stitched_audio_duration <= 0.0
+            or (stitched_audio_duration + 0.5) < min_audio_required
+        ):
+            self.last_render_metrics = {
+                "status": "failed",
+                "error": "stitched_audio_too_short_without_target_fallback",
+                "segments_total": len(segments),
+                "render_fallback_segments": render_fallbacks,
+                "clip_extract_total_sec": round(float(clip_extract_total), 3),
+                "concat_elapsed_sec": round(float(concat_elapsed), 3),
+                "trim_elapsed_sec": round(float(trim_elapsed), 3),
+                "mux_elapsed_sec": round(float(mux_elapsed), 3),
+                "concat_mode": concat_mode,
+                "render_target_audio_only": bool(render_target_audio_only),
+                "boundary_glitch_fixed_frames": int(boundary_glitch_fixed_frames),
+                "stitched_audio_duration": round(float(stitched_audio_duration), 3),
+                "final_audio_duration": round(float(final_audio_duration), 3),
+                "auto_target_audio_fallback": bool(auto_target_audio_fallback),
+                "render_total_sec": round(float(time.perf_counter() - render_perf), 3),
+            }
+            print(
+                f"❌ 拼接音轨偏短: {stitched_audio_duration:.2f}s/{target_duration:.2f}s，"
+                "且已禁用目标素材兜底，终止输出"
+            )
+            return False
+
+        use_target_audio_mux = bool(
+            self.enable_target_video_fallback
+            and (self.force_target_audio or auto_target_audio_fallback)
+        )
+        output_path_obj = Path(output_path)
+        # 先删除旧输出，再写同名新文件，避免 Finder 继续显示旧创建时间。
+        output_path_obj.unlink(missing_ok=True)
 
         if use_target_audio_mux:
             # 使用目标音轨进行最终封装（显式启用或音轨偏短自动兜底）
@@ -2783,7 +9470,7 @@ class FastHighPrecisionReconstructor:
             mux_elapsed = time.perf_counter() - mux_perf
 
             if muxed_output.exists():
-                shutil.copy(muxed_output, output_path)
+                shutil.copy(muxed_output, output_path_obj)
                 final_audio_duration = self.get_audio_duration(muxed_output)
                 print("   🔊 已使用目标音轨封装")
             else:
@@ -2807,16 +9494,16 @@ class FastHighPrecisionReconstructor:
                     }
                     print("❌ 目标音轨封装失败，且拼接音轨明显偏短，终止输出")
                     return False
-                shutil.copy(temp_output, output_path)
+                shutil.copy(temp_output, output_path_obj)
                 final_audio_duration = stitched_audio_duration
                 print("   ⚠️ 目标音轨封装失败，回退为原拼接音轨")
         else:
-            shutil.copy(temp_output, output_path)
+            shutil.copy(temp_output, output_path_obj)
             final_audio_duration = stitched_audio_duration
             print("   🔊 保留拼接片段原音轨（未使用目标音轨封装）")
 
-        if Path(output_path).exists():
-            final_duration = self.get_video_duration(Path(output_path))
+        if output_path_obj.exists():
+            final_duration = self.get_video_duration(output_path_obj)
             print(f"   最终视频时长: {final_duration:.2f}s")
             self.last_render_metrics = {
                 "status": "ok",
@@ -3071,7 +9758,6 @@ def run_evidence_validation(
 
 def main():
     root = Path(__file__).resolve().parent
-    default_cache = root / "runtime" / "cache"
 
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", default="", help="配置文件路径（JSON）")
@@ -3079,52 +9765,100 @@ def main():
 
     try:
         cfg, cfg_path = load_section_config(root, "v6_fast", explicit_path=pre_args.config)
-        cache_default = cfg_str(cfg, "cache", str(default_cache))
-        segment_duration_default = cfg_float(cfg, "segment_duration", 5.0)
-        workers_default = cfg_int(cfg, "workers", 0)
-        render_workers_default = cfg_int(cfg, "render_workers", 0)
-        low_score_threshold_default = cfg_float(cfg, "low_score_threshold", 0.82)
-        rematch_window_default = cfg_int(cfg, "rematch_window", 2)
-        rematch_max_window_default = cfg_int(cfg, "rematch_max_window", 12)
-        continuity_weight_default = cfg_float(cfg, "continuity_weight", 0.05)
-        strict_visual_verify_default = cfg_bool(cfg, "strict_visual_verify", True)
-        strict_verify_min_sim_default = cfg_float(cfg, "strict_verify_min_sim", 0.78)
-        tail_guard_seconds_default = cfg_float(cfg, "tail_guard_seconds", 20.0)
-        tail_verify_min_avg_default = cfg_float(cfg, "tail_verify_min_avg", 0.84)
-        tail_verify_min_floor_default = cfg_float(cfg, "tail_verify_min_floor", 0.78)
-        adjacent_overlap_trigger_default = cfg_float(cfg, "adjacent_overlap_trigger", 0.6)
-        adjacent_lag_trigger_default = cfg_float(cfg, "adjacent_lag_trigger", 0.8)
-        isolated_drift_trigger_default = cfg_float(cfg, "isolated_drift_trigger", 0.8)
-        cross_source_mapping_jump_trigger_default = cfg_float(cfg, "cross_source_mapping_jump_trigger", 0.75)
-        max_mapping_drift_trigger_default = cfg_float(cfg, "max_mapping_drift_trigger", 0.75)
-        max_mapping_drift_combined_floor_default = cfg_float(cfg, "max_mapping_drift_combined_floor", 0.95)
-        use_audio_matching_default = cfg_bool(cfg, "use_audio_matching", False)
-        force_target_audio_default = cfg_bool(cfg, "force_target_audio", False)
-        verify_interval_default = cfg_float(cfg, "verify_interval", 3.0)
-        verify_clip_duration_default = cfg_float(cfg, "verify_clip_duration", 2.0)
-        verify_max_points_default = cfg_int(cfg, "verify_max_points", 1200)
-        verify_asr_mode_default = cfg_str(cfg, "verify_asr_mode", "auto")
-        verify_target_sub_default = cfg_str(cfg, "verify_target_sub", "")
-        verify_output_sub_default = cfg_str(cfg, "verify_output_sub", "")
-        verify_asr_cmd_default = cfg_str(cfg, "verify_asr_cmd", "")
-        verify_asr_python_default = cfg_str(cfg, "verify_asr_python", "")
-        verify_asr_model_default = cfg_str(cfg, "verify_asr_model", "base")
-        verify_language_default = cfg_str(cfg, "verify_language", "zh")
-        verify_whisper_candidates_default = cfg_str_list(cfg, "verify_whisper_python_candidates", [])
-        verify_output_root_default = cfg_str(cfg, "verify_output_root", "")
-        run_evidence_validation_default = cfg_bool(cfg, "run_evidence_validation", False)
-        run_ai_verify_snapshots_default = cfg_bool(cfg, "run_ai_verify_snapshots", False)
-        boundary_glitch_fix_default = cfg_bool(cfg, "boundary_glitch_fix", True)
-        boundary_glitch_hi_threshold_default = cfg_float(cfg, "boundary_glitch_hi_threshold", 0.965)
-        boundary_glitch_lo_threshold_default = cfg_float(cfg, "boundary_glitch_lo_threshold", 0.94)
-        boundary_glitch_gap_threshold_default = cfg_float(cfg, "boundary_glitch_gap_threshold", 0.03)
-        audio_guard_enabled_default = cfg_bool(cfg, "audio_guard_enabled", True)
-        audio_guard_score_trigger_default = cfg_float(cfg, "audio_guard_score_trigger", 0.93)
-        audio_guard_sample_duration_default = cfg_float(cfg, "audio_guard_sample_duration", 1.8)
-        audio_guard_min_similarity_default = cfg_float(cfg, "audio_guard_min_similarity", 0.34)
-        audio_guard_hard_floor_default = cfg_float(cfg, "audio_guard_hard_floor", 0.18)
-        audio_guard_shift_margin_default = cfg_float(cfg, "audio_guard_shift_margin", 0.16)
-        allow_numeric_fallback_default = cfg_bool(cfg, "allow_numeric_fallback", False)
+        cache_default = cfg_req_str(cfg, "cache")
+        match_threshold_default = cfg_req_float(cfg, "match_threshold")
+        segment_duration_default = cfg_req_float(cfg, "segment_duration")
+        frame_index_sample_interval_default = cfg_req_float(cfg, "frame_index_sample_interval")
+        workers_default = cfg_req_int(cfg, "workers")
+        render_workers_default = cfg_req_int(cfg, "render_workers")
+        low_score_threshold_default = cfg_req_float(cfg, "low_score_threshold")
+        rematch_window_default = cfg_req_int(cfg, "rematch_window")
+        rematch_max_window_default = cfg_req_int(cfg, "rematch_max_window")
+        continuity_weight_default = cfg_req_float(cfg, "continuity_weight")
+        strict_visual_verify_default = cfg_req_bool(cfg, "strict_visual_verify")
+        strict_verify_min_sim_default = cfg_req_float(cfg, "strict_verify_min_sim")
+        tail_guard_seconds_default = cfg_req_float(cfg, "tail_guard_seconds")
+        tail_verify_min_avg_default = cfg_req_float(cfg, "tail_verify_min_avg")
+        tail_verify_min_floor_default = cfg_req_float(cfg, "tail_verify_min_floor")
+        adjacent_overlap_trigger_default = cfg_req_float(cfg, "adjacent_overlap_trigger")
+        adjacent_lag_trigger_default = cfg_req_float(cfg, "adjacent_lag_trigger")
+        isolated_drift_trigger_default = cfg_req_float(cfg, "isolated_drift_trigger")
+        cross_source_mapping_jump_trigger_default = cfg_req_float(cfg, "cross_source_mapping_jump_trigger")
+        max_mapping_drift_trigger_default = cfg_req_float(cfg, "max_mapping_drift_trigger")
+        max_mapping_drift_combined_floor_default = cfg_req_float(cfg, "max_mapping_drift_combined_floor")
+        use_audio_matching_default = cfg_req_bool(cfg, "use_audio_matching")
+        force_target_audio_default = cfg_req_bool(cfg, "force_target_audio")
+        verify_interval_default = cfg_req_float(cfg, "verify_interval")
+        verify_clip_duration_default = cfg_req_float(cfg, "verify_clip_duration")
+        verify_max_points_default = cfg_req_int(cfg, "verify_max_points")
+        verify_asr_mode_default = cfg_req_str(cfg, "verify_asr_mode")
+        verify_target_sub_default = cfg_req_str(cfg, "verify_target_sub")
+        verify_output_sub_default = cfg_req_str(cfg, "verify_output_sub")
+        verify_asr_cmd_default = cfg_req_str(cfg, "verify_asr_cmd")
+        verify_asr_python_default = cfg_req_str(cfg, "verify_asr_python")
+        verify_asr_model_default = cfg_req_str(cfg, "verify_asr_model")
+        verify_language_default = cfg_req_str(cfg, "verify_language")
+        verify_whisper_candidates_default = cfg_req_str_list(cfg, "verify_whisper_python_candidates")
+        verify_output_root_default = cfg_req_str(cfg, "verify_output_root")
+        run_evidence_validation_default = cfg_req_bool(cfg, "run_evidence_validation")
+        run_ai_verify_snapshots_default = cfg_req_bool(cfg, "run_ai_verify_snapshots")
+        boundary_glitch_fix_default = cfg_req_bool(cfg, "boundary_glitch_fix")
+        boundary_glitch_hi_threshold_default = cfg_req_float(cfg, "boundary_glitch_hi_threshold")
+        boundary_glitch_lo_threshold_default = cfg_req_float(cfg, "boundary_glitch_lo_threshold")
+        boundary_glitch_gap_threshold_default = cfg_req_float(cfg, "boundary_glitch_gap_threshold")
+        audio_guard_enabled_default = cfg_req_bool(cfg, "audio_guard_enabled")
+        audio_guard_score_trigger_default = cfg_req_float(cfg, "audio_guard_score_trigger")
+        audio_guard_sample_duration_default = cfg_req_float(cfg, "audio_guard_sample_duration")
+        audio_guard_min_similarity_default = cfg_req_float(cfg, "audio_guard_min_similarity")
+        audio_guard_hard_floor_default = cfg_req_float(cfg, "audio_guard_hard_floor")
+        audio_guard_shift_margin_default = cfg_req_float(cfg, "audio_guard_shift_margin")
+        audio_segment_accurate_seek_default = cfg_req_bool(cfg, "audio_segment_accurate_seek")
+        segment_shortfall_pad_default = cfg_req_bool(cfg, "segment_shortfall_pad")
+        segment_intermediate_pcm_audio_default = cfg_req_bool(cfg, "segment_intermediate_pcm_audio")
+        audio_guard_shift_candidates_raw = cfg_req_str_list(
+            cfg,
+            "audio_guard_shift_candidates",
+        )
+        try:
+            audio_guard_shift_candidates_default = [float(x) for x in audio_guard_shift_candidates_raw if str(x).strip()]
+        except Exception as exc:
+            raise RuntimeError(
+                f"配置项 audio_guard_shift_candidates 需要 float 列表，当前值: {audio_guard_shift_candidates_raw!r}"
+            ) from exc
+        if not audio_guard_shift_candidates_default:
+            raise RuntimeError("配置项 audio_guard_shift_candidates 不能为空")
+        boundary_glitch_use_videotoolbox_default = cfg_req_bool(cfg, "boundary_glitch_use_videotoolbox")
+        bridge_motion_guard_enabled_default = cfg_req_bool(cfg, "bridge_motion_guard_enabled")
+        bridge_motion_min_target_motion_default = cfg_req_float(cfg, "bridge_motion_min_target_motion")
+        bridge_motion_min_ratio_default = cfg_req_float(cfg, "bridge_motion_min_ratio")
+        bridge_motion_samples_default = cfg_req_int(cfg, "bridge_motion_samples")
+        bridge_recover_min_target_start_default = cfg_req_float(cfg, "bridge_recover_min_target_start")
+        source_tail_safety_enabled_default = cfg_req_bool(cfg, "source_tail_safety_enabled")
+        source_tail_safety_margin_default = cfg_req_float(cfg, "source_tail_safety_margin")
+        source_tail_safety_target_tail_ignore_sec_default = cfg_req_float(cfg, "source_tail_safety_target_tail_ignore_sec")
+        source_tail_safety_switch_min_gain_default = cfg_req_float(cfg, "source_tail_safety_switch_min_gain")
+        cross_source_head_nudge_enabled_default = cfg_req_bool(cfg, "cross_source_head_nudge_enabled")
+        cross_source_head_nudge_prev_tail_window_default = cfg_req_float(cfg, "cross_source_head_nudge_prev_tail_window")
+        cross_source_head_nudge_curr_head_window_default = cfg_req_float(cfg, "cross_source_head_nudge_curr_head_window")
+        cross_source_head_nudge_max_offset_default = cfg_req_float(cfg, "cross_source_head_nudge_max_offset")
+        cross_source_head_nudge_score_bias_default = cfg_req_float(cfg, "cross_source_head_nudge_score_bias")
+        cross_source_head_nudge_max_verify_drop_default = cfg_req_float(cfg, "cross_source_head_nudge_max_verify_drop")
+        cross_source_head_nudge_allow_backward_default = cfg_req_bool(cfg, "cross_source_head_nudge_allow_backward")
+        cross_source_head_nudge_backward_cap_default = cfg_req_float(cfg, "cross_source_head_nudge_backward_cap")
+        cross_source_head_nudge_backward_gain_trigger_default = cfg_req_float(cfg, "cross_source_head_nudge_backward_gain_trigger")
+        cross_source_head_nudge_boundary_audio_weight_default = cfg_req_float(cfg, "cross_source_head_nudge_boundary_audio_weight")
+        no_target_backprop_overlap_fix_default = cfg_req_bool(cfg, "no_target_backprop_overlap_fix")
+        no_target_backprop_max_shift_default = cfg_req_float(cfg, "no_target_backprop_max_shift")
+        no_target_backprop_min_quality_default = cfg_req_float(cfg, "no_target_backprop_min_quality")
+        no_target_backprop_neg_trigger_floor_default = cfg_req_float(cfg, "no_target_backprop_neg_trigger_floor")
+        no_target_tail_shortfall_tolerance_sec_default = cfg_req_float(cfg, "no_target_tail_shortfall_tolerance_sec")
+        no_target_boundary_rematch_enabled_default = cfg_req_bool(cfg, "no_target_boundary_rematch_enabled")
+        no_target_boundary_rematch_max_attempts_default = cfg_req_int(cfg, "no_target_boundary_rematch_max_attempts")
+        boundary_hard_max_shift_sec_default = cfg_req_float(cfg, "boundary_hard_max_shift_sec")
+        audio_fp_cache_max_items_default = cfg_req_int(cfg, "audio_fp_cache_max_items")
+        frame_cache_max_items_default = cfg_req_int(cfg, "frame_cache_max_items")
+        frame_feature_cache_max_items_default = cfg_req_int(cfg, "frame_feature_cache_max_items")
+        allow_numeric_fallback_default = cfg_req_bool(cfg, "allow_numeric_fallback")
     except RuntimeError as exc:
         print(f"❌ {exc}")
         return
@@ -3136,6 +9870,7 @@ def main():
     parser.add_argument("--output", help="输出视频路径")
     parser.add_argument("--cache", default=cache_default, help="缓存目录")
     parser.add_argument("--segment-duration", type=float, default=segment_duration_default, help="分段时长（秒）")
+    parser.add_argument("--frame-index-sample-interval", type=float, default=frame_index_sample_interval_default, help="pHash 帧索引采样间隔（秒）")
     parser.add_argument("--workers", type=int, default=workers_default, help="并行线程数（0=自动）")
     parser.add_argument("--render-workers", type=int, default=render_workers_default, help="渲染分段提取线程数（0=自动）")
     parser.add_argument("--low-score-threshold", type=float, default=low_score_threshold_default, help="低分段重匹配阈值")
@@ -3183,6 +9918,31 @@ def main():
     parser.add_argument("--audio-guard-min-similarity", type=float, default=audio_guard_min_similarity_default, help="音频守卫最小对齐相似度阈值")
     parser.add_argument("--audio-guard-hard-floor", type=float, default=audio_guard_hard_floor_default, help="音频守卫硬兜底阈值（低于即回退）")
     parser.add_argument("--audio-guard-shift-margin", type=float, default=audio_guard_shift_margin_default, help="音频守卫偏移收益阈值（用于判定音频错位）")
+    add_bool_arg(parser, "--audio-segment-accurate-seek", audio_segment_accurate_seek_default, "带音轨分段提取使用精确寻址（降低词尾重复/音画错位）")
+    add_bool_arg(parser, "--segment-shortfall-pad", segment_shortfall_pad_default, "分段素材不足时补齐末帧与静音，避免局部掉音/黑帧")
+    add_bool_arg(parser, "--segment-intermediate-pcm-audio", segment_intermediate_pcm_audio_default, "中间分段使用 PCM 音轨（减少边界瞬断/吞字）")
+    add_bool_arg(parser, "--source-tail-safety-enabled", source_tail_safety_enabled_default, "启用源片尾安全边距（避开片尾高风险黑场/尾音异常）")
+    parser.add_argument("--source-tail-safety-margin", type=float, default=source_tail_safety_margin_default, help="源片尾安全边距（秒）")
+    parser.add_argument("--source-tail-safety-target-tail-ignore-sec", type=float, default=source_tail_safety_target_tail_ignore_sec_default, help="目标视频尾段忽略源片尾安全边距检查的范围（秒）")
+    parser.add_argument("--source-tail-safety-switch-min-gain", type=float, default=source_tail_safety_switch_min_gain_default, help="源片尾安全切换最小收益阈值（verify_avg 提升量）")
+    add_bool_arg(parser, "--cross-source-head-nudge-enabled", cross_source_head_nudge_enabled_default, "启用跨源边界头部微调（减少跨源接缝重复词/黑一下）")
+    parser.add_argument("--cross-source-head-nudge-prev-tail-window", type=float, default=cross_source_head_nudge_prev_tail_window_default, help="跨源微调触发：前段接近源片尾阈值（秒）")
+    parser.add_argument("--cross-source-head-nudge-curr-head-window", type=float, default=cross_source_head_nudge_curr_head_window_default, help="跨源微调触发：后段接近源片头阈值（秒）")
+    parser.add_argument("--cross-source-head-nudge-max-offset", type=float, default=cross_source_head_nudge_max_offset_default, help="跨源边界后段最大前移量（秒）")
+    parser.add_argument("--cross-source-head-nudge-score-bias", type=float, default=cross_source_head_nudge_score_bias_default, help="跨源微调评分偏置（越大越倾向更大前移）")
+    parser.add_argument("--cross-source-head-nudge-max-verify-drop", type=float, default=cross_source_head_nudge_max_verify_drop_default, help="跨源微调允许的画面核验下降上限")
+    add_bool_arg(parser, "--cross-source-head-nudge-allow-backward", cross_source_head_nudge_allow_backward_default, "跨源片头微调允许向前回拉（贴近句首）")
+    parser.add_argument("--cross-source-head-nudge-backward-cap", type=float, default=cross_source_head_nudge_backward_cap_default, help="跨源片头回拉最大幅度（秒）")
+    parser.add_argument("--cross-source-head-nudge-backward-gain-trigger", type=float, default=cross_source_head_nudge_backward_gain_trigger_default, help="跨源片头回拉最小收益阈值")
+    parser.add_argument("--cross-source-head-nudge-boundary-audio-weight", type=float, default=cross_source_head_nudge_boundary_audio_weight_default, help="跨源片头微调时边界音频相似度权重")
+    add_bool_arg(parser, "--backprop-overlap-fix-no-target", no_target_backprop_overlap_fix_default, "禁兜底模式下启用同源尾段重叠反向回推修复")
+    parser.add_argument("--no-target-backprop-max-shift", type=float, default=no_target_backprop_max_shift_default, help="禁兜底尾段重叠回推最大允许修正量（秒）")
+    parser.add_argument("--no-target-backprop-min-quality", type=float, default=no_target_backprop_min_quality_default, help="禁兜底尾段回推最小置信门限（combined）")
+    parser.add_argument("--no-target-backprop-neg-trigger-floor", type=float, default=no_target_backprop_neg_trigger_floor_default, help="禁兜底尾段回推负重叠触发下限（秒）")
+    parser.add_argument("--no-target-tail-shortfall-tolerance-sec", type=float, default=no_target_tail_shortfall_tolerance_sec_default, help="禁兜底尾段允许短缺时长（秒，优先裁掉尾部重复）")
+    add_bool_arg(parser, "--boundary-rematch-no-target", no_target_boundary_rematch_enabled_default, "禁兜底模式下对未收敛边界启用定点重匹配")
+    parser.add_argument("--no-target-boundary-rematch-max-attempts", type=int, default=no_target_boundary_rematch_max_attempts_default, help="禁兜底未收敛边界定点重匹配最大尝试次数")
+    parser.add_argument("--boundary-hard-max-shift-sec", type=float, default=boundary_hard_max_shift_sec_default, help="边界硬约束单次最大位移（秒，超过则跳过硬夹紧）")
     parser.add_argument(
         "--verify-whisper-candidates",
         default=",".join(verify_whisper_candidates_default),
@@ -3206,7 +9966,7 @@ def main():
         print(f"❌ 源视频目录不存在: {source_dir}")
         return
 
-    source_videos = [str(f) for f in source_dir.iterdir() if f.suffix.lower() == '.mp4']
+    source_videos = [str(f) for f in sorted(source_dir.iterdir()) if f.suffix.lower() == '.mp4']
     if not source_videos:
         print(f"❌ 源视频目录中未找到 mp4: {source_dir}")
         return
@@ -3221,7 +9981,15 @@ def main():
     output.parent.mkdir(parents=True, exist_ok=True)
 
     reconstructor = FastHighPrecisionReconstructor(str(target), source_videos, str(cache))
+    if reconstructor.secondary_source_videos:
+        secondary_names = ", ".join(src.name for src in reconstructor.secondary_source_videos)
+        print(
+            f"🧹 源池分级: 主源 {len(reconstructor.primary_source_videos)} 个, "
+            f"次级救援源 {len(reconstructor.secondary_source_videos)} 个 ({secondary_names})"
+        )
+    reconstructor.match_threshold = min(1.0, max(0.0, float(match_threshold_default)))
     reconstructor.segment_duration = max(1.0, args.segment_duration)
+    reconstructor.frame_index_sample_interval = max(0.1, float(args.frame_index_sample_interval))
     if args.workers and args.workers > 0:
         reconstructor.max_workers = max(1, args.workers)
     if args.render_workers and args.render_workers > 0:
@@ -3254,6 +10022,41 @@ def main():
         max(0.0, float(args.audio_guard_hard_floor)),
     )
     reconstructor.audio_guard_shift_margin = min(1.0, max(0.0, float(args.audio_guard_shift_margin)))
+    reconstructor.audio_segment_accurate_seek = bool(args.audio_segment_accurate_seek)
+    reconstructor.segment_shortfall_pad = bool(args.segment_shortfall_pad)
+    reconstructor.segment_intermediate_pcm_audio = bool(args.segment_intermediate_pcm_audio)
+    reconstructor.source_tail_safety_enabled = bool(args.source_tail_safety_enabled)
+    reconstructor.source_tail_safety_margin = max(0.0, float(args.source_tail_safety_margin))
+    reconstructor.source_tail_safety_target_tail_ignore_sec = max(0.0, float(args.source_tail_safety_target_tail_ignore_sec))
+    reconstructor.source_tail_safety_switch_min_gain = max(0.0, float(args.source_tail_safety_switch_min_gain))
+    reconstructor.cross_source_head_nudge_enabled = bool(args.cross_source_head_nudge_enabled)
+    reconstructor.cross_source_head_nudge_prev_tail_window = max(0.0, float(args.cross_source_head_nudge_prev_tail_window))
+    reconstructor.cross_source_head_nudge_curr_head_window = max(0.0, float(args.cross_source_head_nudge_curr_head_window))
+    reconstructor.cross_source_head_nudge_max_offset = max(0.0, float(args.cross_source_head_nudge_max_offset))
+    reconstructor.cross_source_head_nudge_score_bias = float(args.cross_source_head_nudge_score_bias)
+    reconstructor.cross_source_head_nudge_max_verify_drop = max(0.0, float(args.cross_source_head_nudge_max_verify_drop))
+    reconstructor.cross_source_head_nudge_allow_backward = bool(args.cross_source_head_nudge_allow_backward)
+    reconstructor.cross_source_head_nudge_backward_cap = max(0.0, float(args.cross_source_head_nudge_backward_cap))
+    reconstructor.cross_source_head_nudge_backward_gain_trigger = max(0.0, float(args.cross_source_head_nudge_backward_gain_trigger))
+    reconstructor.cross_source_head_nudge_boundary_audio_weight = max(0.0, float(args.cross_source_head_nudge_boundary_audio_weight))
+    reconstructor.no_target_backprop_overlap_fix = bool(args.backprop_overlap_fix_no_target)
+    reconstructor.no_target_backprop_max_shift = max(0.0, float(args.no_target_backprop_max_shift))
+    reconstructor.no_target_backprop_min_quality = min(1.0, max(0.0, float(args.no_target_backprop_min_quality)))
+    reconstructor.no_target_backprop_neg_trigger_floor = max(0.0, float(args.no_target_backprop_neg_trigger_floor))
+    reconstructor.no_target_tail_shortfall_tolerance_sec = max(0.0, float(args.no_target_tail_shortfall_tolerance_sec))
+    reconstructor.no_target_boundary_rematch_enabled = bool(args.boundary_rematch_no_target)
+    reconstructor.no_target_boundary_rematch_max_attempts = max(0, int(args.no_target_boundary_rematch_max_attempts))
+    reconstructor.boundary_hard_max_shift_sec = max(0.0, float(args.boundary_hard_max_shift_sec))
+    reconstructor.audio_guard_shift_candidates = [float(x) for x in audio_guard_shift_candidates_default]
+    reconstructor.boundary_glitch_use_videotoolbox = bool(boundary_glitch_use_videotoolbox_default)
+    reconstructor.bridge_motion_guard_enabled = bool(bridge_motion_guard_enabled_default)
+    reconstructor.bridge_motion_min_target_motion = max(0.0, float(bridge_motion_min_target_motion_default))
+    reconstructor.bridge_motion_min_ratio = min(1.0, max(0.0, float(bridge_motion_min_ratio_default)))
+    reconstructor.bridge_motion_samples = max(1, int(bridge_motion_samples_default))
+    reconstructor.bridge_recover_min_target_start = max(0.0, float(bridge_recover_min_target_start_default))
+    reconstructor.audio_fp_cache_max_items = max(128, int(audio_fp_cache_max_items_default))
+    reconstructor.frame_cache_max_items = max(128, int(frame_cache_max_items_default))
+    reconstructor.frame_feature_cache_max_items = max(128, int(frame_feature_cache_max_items_default))
     reconstructor.use_audio_matching = bool(args.use_audio_matching)
     reconstructor.force_target_audio = bool(args.force_target_audio)
     reconstructor.run_ai_verify_snapshots = bool(args.run_ai_verify_snapshots)

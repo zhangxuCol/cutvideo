@@ -30,11 +30,11 @@ from PIL import Image
 import imagehash
 from pipeline_config import (
     load_section_config,
-    cfg_str,
-    cfg_int,
-    cfg_float,
-    cfg_bool,
-    cfg_str_list,
+    cfg_req_str,
+    cfg_req_int,
+    cfg_req_float,
+    cfg_req_bool,
+    cfg_req_str_list,
     split_csv,
 )
 
@@ -131,6 +131,10 @@ class FastHighPrecisionReconstructor:
         # 配置
         self.match_threshold = 0.95
         self.segment_duration = 5.0  # 降低分段时长提高精度
+        self.frame_index_sample_interval = 1.0 / 3.0
+        self.phash_preprocess_version = 2
+        # 当前策略：禁止回退到目标素材，避免输出混入原视频内容。
+        self.enable_target_video_fallback = False
         cpu_count = os.cpu_count() or 8
         self.max_workers = min(12, max(4, cpu_count // 2))  # 并行线程数（自动）
         self.low_score_threshold = 0.82
@@ -271,11 +275,167 @@ class FastHighPrecisionReconstructor:
 
     def compute_phash(self, img: Image.Image) -> imagehash.ImageHash:
         """计算感知哈希"""
-        return imagehash.phash(img, hash_size=8)
+        processed = self.preprocess_frame_for_phash(img)
+        return imagehash.phash(processed, hash_size=8)
+
+    def _find_primary_activity_span(self, scores: np.ndarray, min_len: int) -> Optional[Tuple[int, int]]:
+        """从一维活动分数中找主要内容区间。"""
+        values = np.asarray(scores, dtype=np.float32)
+        total = int(values.shape[0])
+        if total <= 0:
+            return None
+
+        p55 = float(np.percentile(values, 55))
+        p90 = float(np.percentile(values, 90))
+        mean_v = float(np.mean(values))
+        threshold = max(p55 + (p90 - p55) * 0.35, mean_v * 0.90, 0.8)
+
+        mask = values >= threshold
+        if not np.any(mask):
+            return None
+
+        segments: List[Tuple[int, int]] = []
+        start = -1
+        for idx, flag in enumerate(mask):
+            if flag and start < 0:
+                start = idx
+            elif (not flag) and start >= 0:
+                segments.append((start, idx))
+                start = -1
+        if start >= 0:
+            segments.append((start, total))
+
+        if not segments:
+            return None
+
+        gap_allow = max(1, int(round(total * 0.02)))
+        merged: List[Tuple[int, int]] = []
+        for seg_start, seg_end in segments:
+            if merged and seg_start - merged[-1][1] <= gap_allow:
+                merged[-1] = (merged[-1][0], seg_end)
+            else:
+                merged.append((seg_start, seg_end))
+
+        center = total * 0.5
+        best = None
+        best_score = -1.0
+        longest = None
+        longest_len = -1
+        for seg_start, seg_end in merged:
+            seg_len = seg_end - seg_start
+            if seg_len > longest_len:
+                longest_len = seg_len
+                longest = (seg_start, seg_end)
+            if seg_len < min_len:
+                continue
+            seg_energy = float(np.sum(values[seg_start:seg_end]))
+            seg_center = (seg_start + seg_end) * 0.5
+            center_penalty = abs(seg_center - center) / max(1.0, center)
+            seg_score = seg_energy * (1.0 - 0.35 * center_penalty)
+            if seg_score > best_score:
+                best_score = seg_score
+                best = (seg_start, seg_end)
+
+        if best is None:
+            if longest is None or longest_len < max(12, int(min_len * 0.70)):
+                return None
+            best = longest
+
+        margin = max(1, int(round(total * 0.02)))
+        left = max(0, best[0] - margin)
+        right = min(total, best[1] + margin)
+        if right - left < min_len:
+            need = min_len - (right - left)
+            left = max(0, left - need // 2)
+            right = min(total, right + need - need // 2)
+        return left, right
+
+    def preprocess_frame_for_phash(self, img: Image.Image) -> Image.Image:
+        """
+        对帧做内容区裁剪，降低黑边/角标/底部文案对 pHash 的干扰。
+        """
+        try:
+            rgb = img.convert("RGB")
+            arr = np.array(rgb)
+            if arr.ndim != 3 or arr.shape[0] < 32 or arr.shape[1] < 32:
+                return rgb
+
+            gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+            grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            edge = cv2.magnitude(grad_x, grad_y)
+
+            row_scores = edge.mean(axis=1) + 0.20 * gray.std(axis=1).astype(np.float32)
+            col_scores = edge.mean(axis=0) + 0.20 * gray.std(axis=0).astype(np.float32)
+
+            h, w = gray.shape
+            row_span = self._find_primary_activity_span(row_scores, min_len=max(24, int(round(h * 0.35))))
+            col_span = self._find_primary_activity_span(col_scores, min_len=max(24, int(round(w * 0.35))))
+
+            top, bottom = (row_span if row_span is not None else (0, h))
+            left, right = (col_span if col_span is not None else (0, w))
+            if bottom - top <= 0 or right - left <= 0:
+                return rgb
+
+            probe_h = max(8, int(round(h * 0.05)))
+            probe_w = max(8, int(round(w * 0.05)))
+            row_core_start = int(round(h * 0.35))
+            row_core_end = int(round(h * 0.65))
+            col_core_start = int(round(w * 0.35))
+            col_core_end = int(round(w * 0.65))
+
+            row_core_slice = row_scores[row_core_start:row_core_end]
+            col_core_slice = col_scores[col_core_start:col_core_end]
+            row_core = float(np.mean(row_core_slice)) if row_core_slice.size >= 8 else float(np.mean(row_scores))
+            col_core = float(np.mean(col_core_slice)) if col_core_slice.size >= 8 else float(np.mean(col_scores))
+            row_core = max(row_core, 1e-6)
+            col_core = max(col_core, 1e-6)
+
+            row_top_edge = float(np.mean(row_scores[:probe_h]))
+            row_bottom_edge = float(np.mean(row_scores[-probe_h:]))
+            col_left_edge = float(np.mean(col_scores[:probe_w]))
+            col_right_edge = float(np.mean(col_scores[-probe_w:]))
+
+            # 仅当边缘活动显著低于画面主体时，才允许对应方向裁剪，避免误裁主体。
+            if top > 0 and row_top_edge > row_core * 0.68:
+                top = 0
+            if bottom < h and row_bottom_edge > row_core * 0.68:
+                bottom = h
+
+            row_trim_ratio = (top + (h - bottom)) / float(max(1, h))
+            if row_trim_ratio >= 0.18:
+                # 已经识别出明显上下黑边时，不再做左右裁剪，避免中心人像被误裁。
+                left, right = 0, w
+            else:
+                if left > 0 and col_left_edge > col_core * 0.62:
+                    left = 0
+                if right < w and col_right_edge > col_core * 0.62:
+                    right = w
+
+            min_h = max(24, int(round(h * 0.30)))
+            min_w = max(24, int(round(w * 0.30)))
+            if bottom - top < min_h:
+                top, bottom = 0, h
+            if right - left < min_w:
+                left, right = 0, w
+
+            if (bottom - top) >= int(h * 0.98) and (right - left) >= int(w * 0.98):
+                return rgb
+
+            cropped = arr[top:bottom, left:right]
+            if cropped.size == 0:
+                return rgb
+            return Image.fromarray(cropped)
+        except Exception:
+            return img.convert("RGB")
 
     def build_frame_index(self, sample_interval: float = 1.0):
         """预建帧索引：提取所有源视频的帧 pHash"""
-        index_file = self.cache_dir / "frame_index_v6.pkl"
+        interval = max(0.1, float(sample_interval))
+        interval_tag = f"{interval:.3f}".rstrip("0").rstrip(".").replace(".", "p")
+        preprocess_tag = f"ppv{int(getattr(self, 'phash_preprocess_version', 1))}"
+        index_file = self.cache_dir / f"frame_index_v6_si{interval_tag}_{preprocess_tag}.pkl"
+        legacy_index_file = self.cache_dir / "frame_index_v6.pkl"
 
         if index_file.exists():
             print(f"\n📂 加载已有帧索引: {index_file}")
@@ -284,13 +444,24 @@ class FastHighPrecisionReconstructor:
             total_frames = sum(len(v) for v in self.frame_index.values())
             print(f"   ✅ 已索引 {len(self.frame_index)} 个视频，共 {total_frames} 帧")
             return
+        if (
+            abs(interval - 1.0) < 1e-9
+            and int(getattr(self, "phash_preprocess_version", 1)) <= 1
+            and legacy_index_file.exists()
+        ):
+            print(f"\n📂 加载已有帧索引: {legacy_index_file} (legacy)")
+            with open(legacy_index_file, 'rb') as f:
+                self.frame_index = pickle.load(f)
+            total_frames = sum(len(v) for v in self.frame_index.values())
+            print(f"   ✅ 已索引 {len(self.frame_index)} 个视频，共 {total_frames} 帧")
+            return
 
-        print(f"\n🔨 构建帧索引 (采样间隔: {sample_interval}s)...")
+        print(f"\n🔨 构建帧索引 (采样间隔: {interval}s)...")
         for i, video_path in enumerate(self.source_videos):
             print(f"   [{i+1}/{len(self.source_videos)}] {video_path.name}")
             duration = self.get_video_duration(video_path)
             frames = []
-            for t in np.arange(0, duration, sample_interval):
+            for t in np.arange(0, duration, interval):
                 img = self.extract_frame_to_pil(video_path, t)
                 if img:
                     frames.append((t, self.compute_phash(img)))
@@ -882,7 +1053,7 @@ class FastHighPrecisionReconstructor:
         return 0.5 * max(0, hist_sim) + 0.5 * template_sim
     
     def process_segment(self, task: SegmentTask) -> SegmentResult:
-        """处理单个段 - 音频+画面结合匹配，失败时用目标视频兜底"""
+        """处理单个段 - 音频+画面结合匹配"""
 
         # 音频+画面结合匹配
         source, source_start, combined_score = self.find_match_combined(
@@ -929,14 +1100,36 @@ class FastHighPrecisionReconstructor:
             source_start = float(refined_start)
 
         if not source or combined_score < 0.70:
-            # 兜底：使用目标视频本身对应时间段
-            print(f"   段 {task.index + 1}/{self.total_segments} ⚠️ 匹配失败 (score={combined_score:.2f})，使用目标视频兜底")
-            return SegmentResult(
-                index=task.index,
-                success=True,
-                source=self.target_video,
-                source_start=task.target_start,
-                quality={**quality, "combined": 0.0, "fallback": True}
+            if self.enable_target_video_fallback:
+                # 兜底：使用目标视频本身对应时间段
+                print(f"   段 {task.index + 1}/{self.total_segments} ⚠️ 匹配失败 (score={combined_score:.2f})，使用目标视频兜底")
+                return SegmentResult(
+                    index=task.index,
+                    success=True,
+                    source=self.target_video,
+                    source_start=task.target_start,
+                    quality={**quality, "combined": 0.0, "fallback": True}
+                )
+            if not source:
+                print(
+                    f"   段 {task.index + 1}/{self.total_segments} ❌ 匹配失败 "
+                    f"(score={combined_score:.2f})，且已禁用目标素材兜底"
+                )
+                return SegmentResult(
+                    index=task.index,
+                    success=False,
+                    quality={
+                        **quality,
+                        "combined": float(combined_score),
+                        "fallback_blocked": True,
+                        "fallback_reason": "match_failed_no_source",
+                    },
+                )
+            quality["fallback_blocked"] = True
+            quality["fallback_reason"] = "match_failed_low_score_no_target_fallback"
+            print(
+                f"   段 {task.index + 1}/{self.total_segments} ⚠️ 低分候选保留 "
+                f"(score={combined_score:.2f})，已禁用目标素材兜底"
             )
 
         # 通用防误匹配：段级画面快速核验，失败则回退目标片段
@@ -944,21 +1137,28 @@ class FastHighPrecisionReconstructor:
             passed, verify_avg = self.quick_verify(source, source_start, task.target_start, task.duration)
             quality["strict_verify"] = {"passed": bool(passed), "avg": float(verify_avg)}
             if not passed:
+                if self.enable_target_video_fallback:
+                    print(
+                        f"   段 {task.index + 1}/{self.total_segments} ⚠️ 画面核验失败 "
+                        f"(avg={verify_avg:.2f})，回退目标视频"
+                    )
+                    return SegmentResult(
+                        index=task.index,
+                        success=True,
+                        source=self.target_video,
+                        source_start=task.target_start,
+                        quality={
+                            **quality,
+                            "combined": 0.0,
+                            "fallback": True,
+                            "fallback_reason": "strict_visual_verify_failed",
+                        },
+                    )
+                quality["fallback_blocked"] = True
+                quality["fallback_reason"] = "strict_visual_verify_failed_no_target_fallback"
                 print(
                     f"   段 {task.index + 1}/{self.total_segments} ⚠️ 画面核验失败 "
-                    f"(avg={verify_avg:.2f})，回退目标视频"
-                )
-                return SegmentResult(
-                    index=task.index,
-                    success=True,
-                    source=self.target_video,
-                    source_start=task.target_start,
-                    quality={
-                        **quality,
-                        "combined": 0.0,
-                        "fallback": True,
-                        "fallback_reason": "strict_visual_verify_failed",
-                    },
+                    f"(avg={verify_avg:.2f})，已禁用目标素材兜底，保留当前候选"
                 )
 
         # 通用尾段守卫：末尾更严格核验，防止尾段误匹配导致“内容回跳”
@@ -975,21 +1175,28 @@ class FastHighPrecisionReconstructor:
             )
             quality["tail_verify"] = {"passed": bool(tail_passed), "avg": float(tail_avg)}
             if not tail_passed:
+                if self.enable_target_video_fallback:
+                    print(
+                        f"   段 {task.index + 1}/{self.total_segments} ⚠️ 尾段守卫失败 "
+                        f"(avg={tail_avg:.2f})，回退目标视频"
+                    )
+                    return SegmentResult(
+                        index=task.index,
+                        success=True,
+                        source=self.target_video,
+                        source_start=task.target_start,
+                        quality={
+                            **quality,
+                            "combined": 0.0,
+                            "fallback": True,
+                            "fallback_reason": "tail_guard_failed",
+                        },
+                    )
+                quality["fallback_blocked"] = True
+                quality["fallback_reason"] = "tail_guard_failed_no_target_fallback"
                 print(
                     f"   段 {task.index + 1}/{self.total_segments} ⚠️ 尾段守卫失败 "
-                    f"(avg={tail_avg:.2f})，回退目标视频"
-                )
-                return SegmentResult(
-                    index=task.index,
-                    success=True,
-                    source=self.target_video,
-                    source_start=task.target_start,
-                    quality={
-                        **quality,
-                        "combined": 0.0,
-                        "fallback": True,
-                        "fallback_reason": "tail_guard_failed",
-                    },
+                    f"(avg={tail_avg:.2f})，已禁用目标素材兜底，保留当前候选"
                 )
 
         print(f"   段 {task.index + 1}/{self.total_segments} ✅ {source.name} @ {source_start}s (综合: {combined_score:.2f})")
@@ -1014,7 +1221,7 @@ class FastHighPrecisionReconstructor:
         overall_perf = time.perf_counter()
 
         # 预建 pHash 帧索引（首次运行后缓存，后续秒速加载）
-        self.build_frame_index(sample_interval=1.0)
+        self.build_frame_index(sample_interval=float(self.frame_index_sample_interval))
 
         target_duration = self.get_video_duration(self.target_video)
         self.target_duration = target_duration
@@ -1057,7 +1264,7 @@ class FastHighPrecisionReconstructor:
                     print(f"   段 {task.index+1} 错误: {e}")
                     results[task.index] = SegmentResult(index=task.index, success=False)
         
-        # 整理结果：优先保全所有段，任何缺失段都用目标视频对应时间兜底
+        # 整理结果：默认保全所有段；若禁用目标兜底则缺失段直接记失败
         confirmed_by_index = {}
         for r in results:
             if r and r.success:
@@ -1076,18 +1283,25 @@ class FastHighPrecisionReconstructor:
             seg = confirmed_by_index.get(task.index)
             if seg is None:
                 missing_count += 1
-                seg = {
-                    'index': task.index,
-                    'source': self.target_video,
-                    'start': task.target_start,
-                    'duration': task.duration,
-                    'target_start': task.target_start,
-                    'quality': {'combined': 0.0, 'fallback': True, 'reason': 'missing_result'}
-                }
+                if self.enable_target_video_fallback:
+                    seg = {
+                        'index': task.index,
+                        'source': self.target_video,
+                        'start': task.target_start,
+                        'duration': task.duration,
+                        'target_start': task.target_start,
+                        'quality': {'combined': 0.0, 'fallback': True, 'reason': 'missing_result'}
+                    }
+                else:
+                    continue
             confirmed_segments.append(seg)
 
         if missing_count > 0:
-            print(f"   ⚠️ 自动补齐缺失段: {missing_count} 段")
+            if self.enable_target_video_fallback:
+                print(f"   ⚠️ 自动补齐缺失段: {missing_count} 段")
+            else:
+                print(f"❌ 存在缺失段 {missing_count} 段，且已禁用目标素材兜底，终止输出")
+                return False
 
         self.match_elapsed_sec = time.perf_counter() - match_perf
 
@@ -1251,6 +1465,13 @@ class FastHighPrecisionReconstructor:
 
         def fallback_segment(seg: dict, reason: str, metric: float):
             nonlocal fallback_switched
+            if not self.enable_target_video_fallback:
+                q = seg.get("quality", {}) or {}
+                q["fallback_blocked"] = True
+                q["fallback_reason"] = f"{reason}_no_target_fallback"
+                q["timeline_guard_metric"] = float(metric)
+                seg["quality"] = q
+                return
             seg["source"] = self.target_video
             seg["start"] = seg["target_start"]
             q = seg.get("quality", {}) or {}
@@ -1388,6 +1609,12 @@ class FastHighPrecisionReconstructor:
 
         def fallback_segment(seg: dict, reason: str):
             nonlocal switched
+            if not self.enable_target_video_fallback:
+                q = seg.get("quality", {}) or {}
+                q["fallback_blocked"] = True
+                q["fallback_reason"] = f"{reason}_no_target_fallback"
+                seg["quality"] = q
+                return
             if seg["source"] == self.target_video:
                 return
             seg["source"] = self.target_video
@@ -1476,6 +1703,13 @@ class FastHighPrecisionReconstructor:
 
         def fallback_segment(seg: dict, reason: str, metric: float):
             nonlocal switched
+            if not self.enable_target_video_fallback:
+                q = seg.get("quality", {}) or {}
+                q["fallback_blocked"] = True
+                q["fallback_reason"] = f"{reason}_no_target_fallback"
+                q["timeline_bias_metric"] = float(metric)
+                seg["quality"] = q
+                return
             if seg["source"] == self.target_video:
                 return
             seg["source"] = self.target_video
@@ -1561,6 +1795,13 @@ class FastHighPrecisionReconstructor:
 
         def fallback_segment(seg: dict, reason: str, metric: float):
             nonlocal switched
+            if not self.enable_target_video_fallback:
+                q = seg.get("quality", {}) or {}
+                q["fallback_blocked"] = True
+                q["fallback_reason"] = f"{reason}_no_target_fallback"
+                q["timeline_step_metric"] = float(metric)
+                seg["quality"] = q
+                return
             if seg["source"] == self.target_video:
                 return
             seg["source"] = self.target_video
@@ -1658,17 +1899,16 @@ class FastHighPrecisionReconstructor:
         frame_count = max(1, int(expected_frames)) if expected_frames else 0
         cmd = [
             'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-            '-i', str(source),
             '-ss', str(start),
             '-t', str(duration),
+            '-i', str(source),
             '-vf', fps_expr,
             '-af', f'aresample=async=1:first_pts=0,atrim=0:{duration:.6f},asetpts=PTS-STARTPTS',
             '-reset_timestamps', '1',
             '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
             '-c:a', 'aac', '-b:a', '128k',
         ]
-        if frame_count > 0:
-            cmd.extend(['-frames:v', str(frame_count)])
+        # 注意：带音频片段不能用 -frames:v 提前截断，否则会导致音频被异常截短。
         cmd.append(str(output_clip))
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -1876,7 +2116,7 @@ class FastHighPrecisionReconstructor:
                 fps_expr,
                 expected_frames=seg_expected_frames,
             )
-            if not ok and seg_source != self.target_video:
+            if not ok and seg_source != self.target_video and self.enable_target_video_fallback:
                 render_fallbacks += 1
                 q = seg.get("quality", {}) or {}
                 q["fallback"] = True
@@ -1994,9 +2234,12 @@ class FastHighPrecisionReconstructor:
 
         stitched_audio_duration = self.get_audio_duration(temp_output)
         min_audio_required = max(5.0, float(target_duration) * 0.90)
-        auto_target_audio_fallback = (
-            stitched_audio_duration <= 0.0
-            or (stitched_audio_duration + 0.5) < min_audio_required
+        auto_target_audio_fallback = bool(
+            self.enable_target_video_fallback
+            and (
+                stitched_audio_duration <= 0.0
+                or (stitched_audio_duration + 0.5) < min_audio_required
+            )
         )
         if auto_target_audio_fallback and not self.force_target_audio:
             print(
@@ -2004,7 +2247,35 @@ class FastHighPrecisionReconstructor:
                 "自动切换目标音轨封装"
             )
 
-        use_target_audio_mux = bool(self.force_target_audio or auto_target_audio_fallback)
+        if (not self.enable_target_video_fallback) and (
+            stitched_audio_duration <= 0.0
+            or (stitched_audio_duration + 0.5) < min_audio_required
+        ):
+            self.last_render_metrics = {
+                "status": "failed",
+                "error": "stitched_audio_too_short_without_target_fallback",
+                "segments_total": len(segments),
+                "render_fallback_segments": render_fallbacks,
+                "clip_extract_total_sec": round(float(clip_extract_total), 3),
+                "concat_elapsed_sec": round(float(concat_elapsed), 3),
+                "trim_elapsed_sec": round(float(trim_elapsed), 3),
+                "mux_elapsed_sec": round(float(mux_elapsed), 3),
+                "boundary_glitch_fixed_frames": int(boundary_glitch_fixed_frames),
+                "stitched_audio_duration": round(float(stitched_audio_duration), 3),
+                "final_audio_duration": round(float(final_audio_duration), 3),
+                "auto_target_audio_fallback": bool(auto_target_audio_fallback),
+                "render_total_sec": round(float(time.perf_counter() - render_perf), 3),
+            }
+            print(
+                f"❌ 拼接音轨偏短: {stitched_audio_duration:.2f}s/{target_duration:.2f}s，"
+                "且已禁用目标素材兜底，终止输出"
+            )
+            return False
+
+        use_target_audio_mux = bool(
+            self.enable_target_video_fallback
+            and (self.force_target_audio or auto_target_audio_fallback)
+        )
 
         if use_target_audio_mux:
             # 使用目标音轨进行最终封装（显式启用或音轨偏短自动兜底）
@@ -2308,7 +2579,6 @@ def run_evidence_validation(
 
 def main():
     root = Path(__file__).resolve().parent
-    default_cache = root / "runtime" / "cache"
 
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", default="", help="配置文件路径（JSON）")
@@ -2316,41 +2586,43 @@ def main():
 
     try:
         cfg, cfg_path = load_section_config(root, "v6_fast", explicit_path=pre_args.config)
-        cache_default = cfg_str(cfg, "cache", str(default_cache))
-        segment_duration_default = cfg_float(cfg, "segment_duration", 5.0)
-        workers_default = cfg_int(cfg, "workers", 0)
-        low_score_threshold_default = cfg_float(cfg, "low_score_threshold", 0.82)
-        rematch_window_default = cfg_int(cfg, "rematch_window", 2)
-        rematch_max_window_default = cfg_int(cfg, "rematch_max_window", 12)
-        continuity_weight_default = cfg_float(cfg, "continuity_weight", 0.05)
-        strict_visual_verify_default = cfg_bool(cfg, "strict_visual_verify", True)
-        strict_verify_min_sim_default = cfg_float(cfg, "strict_verify_min_sim", 0.78)
-        tail_guard_seconds_default = cfg_float(cfg, "tail_guard_seconds", 20.0)
-        tail_verify_min_avg_default = cfg_float(cfg, "tail_verify_min_avg", 0.84)
-        tail_verify_min_floor_default = cfg_float(cfg, "tail_verify_min_floor", 0.78)
-        adjacent_overlap_trigger_default = cfg_float(cfg, "adjacent_overlap_trigger", 0.6)
-        adjacent_lag_trigger_default = cfg_float(cfg, "adjacent_lag_trigger", 0.8)
-        isolated_drift_trigger_default = cfg_float(cfg, "isolated_drift_trigger", 0.8)
-        cross_source_mapping_jump_trigger_default = cfg_float(cfg, "cross_source_mapping_jump_trigger", 0.75)
-        use_audio_matching_default = cfg_bool(cfg, "use_audio_matching", False)
-        force_target_audio_default = cfg_bool(cfg, "force_target_audio", False)
-        verify_interval_default = cfg_float(cfg, "verify_interval", 3.0)
-        verify_clip_duration_default = cfg_float(cfg, "verify_clip_duration", 2.0)
-        verify_max_points_default = cfg_int(cfg, "verify_max_points", 1200)
-        verify_asr_mode_default = cfg_str(cfg, "verify_asr_mode", "auto")
-        verify_target_sub_default = cfg_str(cfg, "verify_target_sub", "")
-        verify_output_sub_default = cfg_str(cfg, "verify_output_sub", "")
-        verify_asr_cmd_default = cfg_str(cfg, "verify_asr_cmd", "")
-        verify_asr_python_default = cfg_str(cfg, "verify_asr_python", "")
-        verify_asr_model_default = cfg_str(cfg, "verify_asr_model", "base")
-        verify_language_default = cfg_str(cfg, "verify_language", "zh")
-        verify_whisper_candidates_default = cfg_str_list(cfg, "verify_whisper_python_candidates", [])
-        verify_output_root_default = cfg_str(cfg, "verify_output_root", "")
-        boundary_glitch_fix_default = cfg_bool(cfg, "boundary_glitch_fix", True)
-        boundary_glitch_hi_threshold_default = cfg_float(cfg, "boundary_glitch_hi_threshold", 0.965)
-        boundary_glitch_lo_threshold_default = cfg_float(cfg, "boundary_glitch_lo_threshold", 0.94)
-        boundary_glitch_gap_threshold_default = cfg_float(cfg, "boundary_glitch_gap_threshold", 0.03)
-        allow_numeric_fallback_default = cfg_bool(cfg, "allow_numeric_fallback", False)
+        cache_default = cfg_req_str(cfg, "cache")
+        match_threshold_default = cfg_req_float(cfg, "match_threshold")
+        segment_duration_default = cfg_req_float(cfg, "segment_duration")
+        frame_index_sample_interval_default = cfg_req_float(cfg, "frame_index_sample_interval")
+        workers_default = cfg_req_int(cfg, "workers")
+        low_score_threshold_default = cfg_req_float(cfg, "low_score_threshold")
+        rematch_window_default = cfg_req_int(cfg, "rematch_window")
+        rematch_max_window_default = cfg_req_int(cfg, "rematch_max_window")
+        continuity_weight_default = cfg_req_float(cfg, "continuity_weight")
+        strict_visual_verify_default = cfg_req_bool(cfg, "strict_visual_verify")
+        strict_verify_min_sim_default = cfg_req_float(cfg, "strict_verify_min_sim")
+        tail_guard_seconds_default = cfg_req_float(cfg, "tail_guard_seconds")
+        tail_verify_min_avg_default = cfg_req_float(cfg, "tail_verify_min_avg")
+        tail_verify_min_floor_default = cfg_req_float(cfg, "tail_verify_min_floor")
+        adjacent_overlap_trigger_default = cfg_req_float(cfg, "adjacent_overlap_trigger")
+        adjacent_lag_trigger_default = cfg_req_float(cfg, "adjacent_lag_trigger")
+        isolated_drift_trigger_default = cfg_req_float(cfg, "isolated_drift_trigger")
+        cross_source_mapping_jump_trigger_default = cfg_req_float(cfg, "cross_source_mapping_jump_trigger")
+        use_audio_matching_default = cfg_req_bool(cfg, "use_audio_matching")
+        force_target_audio_default = cfg_req_bool(cfg, "force_target_audio")
+        verify_interval_default = cfg_req_float(cfg, "verify_interval")
+        verify_clip_duration_default = cfg_req_float(cfg, "verify_clip_duration")
+        verify_max_points_default = cfg_req_int(cfg, "verify_max_points")
+        verify_asr_mode_default = cfg_req_str(cfg, "verify_asr_mode")
+        verify_target_sub_default = cfg_req_str(cfg, "verify_target_sub")
+        verify_output_sub_default = cfg_req_str(cfg, "verify_output_sub")
+        verify_asr_cmd_default = cfg_req_str(cfg, "verify_asr_cmd")
+        verify_asr_python_default = cfg_req_str(cfg, "verify_asr_python")
+        verify_asr_model_default = cfg_req_str(cfg, "verify_asr_model")
+        verify_language_default = cfg_req_str(cfg, "verify_language")
+        verify_whisper_candidates_default = cfg_req_str_list(cfg, "verify_whisper_python_candidates")
+        verify_output_root_default = cfg_req_str(cfg, "verify_output_root")
+        boundary_glitch_fix_default = cfg_req_bool(cfg, "boundary_glitch_fix")
+        boundary_glitch_hi_threshold_default = cfg_req_float(cfg, "boundary_glitch_hi_threshold")
+        boundary_glitch_lo_threshold_default = cfg_req_float(cfg, "boundary_glitch_lo_threshold")
+        boundary_glitch_gap_threshold_default = cfg_req_float(cfg, "boundary_glitch_gap_threshold")
+        allow_numeric_fallback_default = cfg_req_bool(cfg, "allow_numeric_fallback")
     except RuntimeError as exc:
         print(f"❌ {exc}")
         return
@@ -2362,6 +2634,7 @@ def main():
     parser.add_argument("--output", help="输出视频路径")
     parser.add_argument("--cache", default=cache_default, help="缓存目录")
     parser.add_argument("--segment-duration", type=float, default=segment_duration_default, help="分段时长（秒）")
+    parser.add_argument("--frame-index-sample-interval", type=float, default=frame_index_sample_interval_default, help="pHash 帧索引采样间隔（秒）")
     parser.add_argument("--workers", type=int, default=workers_default, help="并行线程数（0=自动）")
     parser.add_argument("--low-score-threshold", type=float, default=low_score_threshold_default, help="低分段重匹配阈值")
     parser.add_argument("--rematch-window", type=int, default=rematch_window_default, help="局部重匹配起始窗口（秒）")
@@ -2436,7 +2709,9 @@ def main():
     output.parent.mkdir(parents=True, exist_ok=True)
 
     reconstructor = FastHighPrecisionReconstructor(str(target), source_videos, str(cache))
+    reconstructor.match_threshold = min(1.0, max(0.0, float(match_threshold_default)))
     reconstructor.segment_duration = max(1.0, args.segment_duration)
+    reconstructor.frame_index_sample_interval = max(0.1, float(args.frame_index_sample_interval))
     if args.workers and args.workers > 0:
         reconstructor.max_workers = max(1, args.workers)
     reconstructor.low_score_threshold = min(0.95, max(0.60, args.low_score_threshold))

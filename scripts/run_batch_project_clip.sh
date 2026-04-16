@@ -8,7 +8,8 @@ fi
 
 PROJECT_DIR="$1"
 WORKERS="${2:-2}"
-RUN_ONE="/Users/zhangxu/.codex/worktrees/ce87/cutvideo/scripts/run_clip_one.sh"
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+RUN_ONE="$SCRIPT_DIR/run_clip_one.sh"
 
 if [[ ! -d "$PROJECT_DIR" ]]; then
   echo "project dir not found: $PROJECT_DIR"
@@ -92,4 +93,3 @@ BATCH_ELAPSED="$((BATCH_END-batch_start))"
 echo "[summary] total=$TOTAL ok=$OK_COUNT fail=$FAIL_COUNT elapsed=${BATCH_ELAPSED}s"
 echo "[summary] runtime_log=$RUNTIME_LOG"
 echo "[summary] progress_log=$PROGRESS_LOG"
-

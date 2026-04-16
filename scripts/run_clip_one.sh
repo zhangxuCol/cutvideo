@@ -7,7 +7,9 @@ if [[ $# -ne 1 ]]; then
 fi
 
 TARGET="$1"
-CFG="/Users/zhangxu/.codex/worktrees/ce87/cutvideo/configurations/ai_pipeline.defaults.json"
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+ROOT_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
+CFG="$ROOT_DIR/configurations/ai_pipeline.defaults.json"
 PY_BIN="/Users/zhangxu/.pyenv/versions/3.12.10/bin/python3"
 
 if [[ ! -f "$TARGET" ]]; then
@@ -49,7 +51,7 @@ echo "[clip-one] source=$SRC"
 echo "[clip-one] out=$out"
 echo "[clip-one] python=$PY_BIN"
 
-"$PY_BIN" /Users/zhangxu/.codex/worktrees/ce87/cutvideo/fast_v7.py \
+"$PY_BIN" "$ROOT_DIR/fast_v7.py" \
   --config "$CFG" \
   --target "$TARGET" \
   --source-dir "$SRC" \
@@ -61,6 +63,16 @@ echo "[clip-one] python=$PY_BIN"
 if [[ ! -f "$out" ]]; then
   echo "[clip-one] output missing: $out"
   exit 4
+fi
+
+report="${out%.mp4}.quality_report.json"
+if [[ -f "$report" ]]; then
+  render_status=$(jq -r '.render_metrics.status // empty' "$report" 2>/dev/null || true)
+  if [[ "$render_status" != "ok" ]]; then
+    echo "[clip-one] render status is not ok: ${render_status:-unknown}"
+    echo "[clip-one] report=$report"
+    exit 7
+  fi
 fi
 
 echo "[clip-one] done: $out"

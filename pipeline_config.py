@@ -146,3 +146,53 @@ def cfg_str_list(cfg: Dict[str, Any], key: str, default: List[str]) -> List[str]
 
 def split_csv(value: str) -> List[str]:
     return [x.strip() for x in str(value).split(",") if x.strip()]
+
+
+def _cfg_require(cfg: Dict[str, Any], key: str) -> Any:
+    if key not in cfg:
+        raise RuntimeError(f"缺少必填配置项: {key}")
+    return cfg[key]
+
+
+def cfg_req_str(cfg: Dict[str, Any], key: str) -> str:
+    v = _cfg_require(cfg, key)
+    if v is None:
+        return ""
+    return str(v)
+
+
+def cfg_req_int(cfg: Dict[str, Any], key: str) -> int:
+    v = _cfg_require(cfg, key)
+    try:
+        return int(v)
+    except Exception as exc:
+        raise RuntimeError(f"配置项 {key} 需要 int，当前值: {v!r}") from exc
+
+
+def cfg_req_float(cfg: Dict[str, Any], key: str) -> float:
+    v = _cfg_require(cfg, key)
+    try:
+        return float(v)
+    except Exception as exc:
+        raise RuntimeError(f"配置项 {key} 需要 float，当前值: {v!r}") from exc
+
+
+def cfg_req_bool(cfg: Dict[str, Any], key: str) -> bool:
+    v = _cfg_require(cfg, key)
+    try:
+        return _parse_bool(v)
+    except Exception as exc:
+        raise RuntimeError(f"配置项 {key} 需要 bool，当前值: {v!r}") from exc
+
+
+def cfg_req_str_list(cfg: Dict[str, Any], key: str) -> List[str]:
+    v = _cfg_require(cfg, key)
+    if v is None:
+        return []
+    if isinstance(v, list):
+        out = [str(x).strip() for x in v if str(x).strip()]
+        return out
+    if isinstance(v, str):
+        out = [x.strip() for x in v.split(",") if x.strip()]
+        return out
+    raise RuntimeError(f"配置项 {key} 需要 list[str] 或逗号分隔字符串，当前值: {v!r}")

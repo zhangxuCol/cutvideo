@@ -39,7 +39,8 @@
 ```json
 {
   "v6_fast": {
-    "segment_duration": 5.0
+    "segment_duration": 5.0,
+    "frame_index_sample_interval": 0.3333333333
   },
   "build_ai_video_audit_bundle": {
     "interval": 8.0
@@ -98,6 +99,7 @@ export CUTVIDEO_CONFIG=/abs/path/ai_pipeline.local.json
 | `--output` | string | - | 输出视频路径 |
 | `--cache` | string | `cache`（可选） | 缓存目录 |
 | `--segment-duration` | float | `segment_duration` | 分段时长（秒） |
+| `--frame-index-sample-interval` | float | `frame_index_sample_interval` | pHash 帧索引采样间隔（秒） |
 | `--workers` | int | `workers` | 并行线程数（0=自动） |
 | `--render-workers` | int | `render_workers` | 渲染分段提取线程数（0=自动） |
 | `--low-score-threshold` | float | `low_score_threshold` | 低分段重匹配阈值 |
@@ -123,6 +125,23 @@ export CUTVIDEO_CONFIG=/abs/path/ai_pipeline.local.json
 | `--audio-guard-min-similarity` | float | `audio_guard_min_similarity` | 音频守卫对齐相似度阈值（低于阈值判为可疑） |
 | `--audio-guard-hard-floor` | float | `audio_guard_hard_floor` | 音频守卫硬阈值（低于即回退目标段） |
 | `--audio-guard-shift-margin` | float | `audio_guard_shift_margin` | 音频偏移收益阈值（用于判定“疑似音频错位”） |
+| `--audio-segment-accurate-seek` / `--no-audio-segment-accurate-seek` | bool | `audio_segment_accurate_seek` | 带音轨分段提取使用精确寻址（降低词尾重复/音画错位） |
+| `--segment-shortfall-pad` / `--no-segment-shortfall-pad` | bool | `segment_shortfall_pad` | 分段素材不足时补齐末帧与静音，避免局部掉音/黑帧 |
+| `--source-tail-safety-enabled` / `--no-source-tail-safety-enabled` | bool | `source_tail_safety_enabled` | 启用源片尾安全边距（避开片尾高风险黑场/尾音异常） |
+| `--source-tail-safety-margin` | float | `source_tail_safety_margin` | 源片尾安全边距（秒） |
+| `--source-tail-safety-target-tail-ignore-sec` | float | `source_tail_safety_target_tail_ignore_sec` | 目标视频尾段忽略源片尾安全边距检查范围（秒） |
+| `--source-tail-safety-switch-min-gain` | float | `source_tail_safety_switch_min_gain` | 源片尾安全切换最小收益阈值（verify_avg 提升量） |
+| `--cross-source-head-nudge-enabled` / `--no-cross-source-head-nudge-enabled` | bool | `cross_source_head_nudge_enabled` | 启用跨源边界头部微调（减少接缝重复词/黑一下） |
+| `--cross-source-head-nudge-prev-tail-window` | float | `cross_source_head_nudge_prev_tail_window` | 跨源微调触发：前段接近源片尾阈值（秒） |
+| `--cross-source-head-nudge-curr-head-window` | float | `cross_source_head_nudge_curr_head_window` | 跨源微调触发：后段接近源片头阈值（秒） |
+| `--cross-source-head-nudge-max-offset` | float | `cross_source_head_nudge_max_offset` | 跨源边界后段最大前移量（秒） |
+| `--cross-source-head-nudge-score-bias` | float | `cross_source_head_nudge_score_bias` | 跨源微调评分偏置（越大越偏向更大前移） |
+| `--cross-source-head-nudge-max-verify-drop` | float | `cross_source_head_nudge_max_verify_drop` | 跨源微调允许的画面核验下降上限 |
+| `--backprop-overlap-fix-no-target` / `--no-backprop-overlap-fix-no-target` | bool | `no_target_backprop_overlap_fix` | 禁兜底模式下启用同源尾段重叠反向回推修复 |
+| `--no-target-backprop-max-shift` | float | `no_target_backprop_max_shift` | 禁兜底尾段重叠回推最大允许修正量（秒） |
+| `--no-target-backprop-min-quality` | float | `no_target_backprop_min_quality` | 禁兜底尾段回推最小置信门限（combined） |
+| `--boundary-rematch-no-target` / `--no-boundary-rematch-no-target` | bool | `no_target_boundary_rematch_enabled` | 禁兜底模式下对未收敛边界启用定点重匹配 |
+| `--no-target-boundary-rematch-max-attempts` | int | `no_target_boundary_rematch_max_attempts` | 禁兜底未收敛边界定点重匹配最大尝试次数 |
 | `--use-audio-matching` / `--no-use-audio-matching` | bool | `use_audio_matching` | 匹配阶段是否使用音频指纹 |
 | `--force-target-audio` / `--no-force-target-audio` | bool | `force_target_audio` | 封装阶段是否强制目标音轨 |
 | `--verify-interval` | float | `verify_interval` | 证据验证抽检间隔（秒） |
