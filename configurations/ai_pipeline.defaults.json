@@ -60,6 +60,7 @@
     "no_target_backprop_min_quality": 0.78,
     "no_target_backprop_neg_trigger_floor": 0.04,
     "no_target_tail_shortfall_tolerance_sec": 1.0,
+    "no_target_missing_tail_tolerance_sec": 4.5,
     "no_target_boundary_rematch_enabled": true,
     "no_target_boundary_rematch_max_attempts": 12,
     "boundary_hard_max_shift_sec": 1.2,
