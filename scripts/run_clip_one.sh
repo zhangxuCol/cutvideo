@@ -72,6 +72,19 @@ rm -f "$out" "$report"
 
 if [[ ! -f "$out" ]]; then
   echo "[clip-one] output missing: $out"
+  if [[ -f "$report" ]]; then
+    reconstruct_status=$(jq -r '.reconstruct_status // empty' "$report" 2>/dev/null || true)
+    failure_reason=$(jq -r '.failure.reason // .render_metrics.error // empty' "$report" 2>/dev/null || true)
+    material_shape=$(jq -r '.material_analysis.material_shape // empty' "$report" 2>/dev/null || true)
+    selected_strategy=$(jq -r '.material_analysis.selected_strategy // empty' "$report" 2>/dev/null || true)
+    missing_segments=$(jq -r '.failure.missing_segments_count // 0' "$report" 2>/dev/null || true)
+    echo "[clip-one] reconstruct status: ${reconstruct_status:-unknown}"
+    echo "[clip-one] failure reason: ${failure_reason:-unknown}"
+    echo "[clip-one] material shape: ${material_shape:-unknown}"
+    echo "[clip-one] selected strategy: ${selected_strategy:-unknown}"
+    echo "[clip-one] missing segments: ${missing_segments:-0}"
+    echo "[clip-one] report=$report"
+  fi
   exit 4
 fi
 

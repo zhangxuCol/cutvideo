@@ -226,6 +226,27 @@ class FastHighPrecisionReconstructor:
         self.phash_match_min_strong_ratio = 0.0
         self.phash_match_candidate_margin = 0.02
         self.phash_match_dedupe_sec = 0.6
+        self.material_shape_detection_enabled = True
+        self.target_sequence_inference_enabled = True
+        self.stitched_material_retry_enabled = True
+        self.stitched_material_retry_on_fail = True
+        self.source_pool_gap_target_fallback = False
+        self.sequence_inference_sample_count = 48
+        self.sequence_inference_window_sec = 5.0
+        self.sequence_prediction_search_radius_sec = 12.0
+        self.retry_on_missing_segments_threshold = 2
+        self.force_strategy = ""
+        self.material_shape = "unknown"
+        self.material_shape_confidence = 0.0
+        self.target_sequence_segments: List[Dict[str, object]] = []
+        self.target_sequence_samples: List[Dict[str, object]] = []
+        self.target_sequence_dominant_source = ""
+        self.target_sequence_dominant_ratio = 0.0
+        self.selected_strategy = "normal"
+        self.target_sequence_retry_recommended = False
+        self.source_pool_gap_target_fallback_details: Dict[str, object] = {}
+        self.print_material_shape = False
+        self.print_target_sequence = False
         # 当前策略：禁止回退到目标素材，避免输出混入原视频内容。
         self.enable_target_video_fallback = False
         cpu_count = os.cpu_count() or 8
@@ -369,6 +390,9 @@ class FastHighPrecisionReconstructor:
         self.guard_stats: Dict[str, int] = {}
         self.last_render_metrics: Dict[str, object] = {}
         self.last_boundary_repair_stats: Dict[str, int] = {}
+        self.last_reconstruct_status = "not_started"
+        self.last_failure_reason = ""
+        self.last_failure_details: Dict[str, object] = {}
 
         # pHash 帧索引
         self.frame_index = {}  # {video_path: [(time, phash), ...]}
@@ -432,6 +456,394 @@ class FastHighPrecisionReconstructor:
         if include_secondary or not self.secondary_source_videos:
             return list(self.source_videos)
         return list(self.primary_source_videos)
+
+    def _source_total_duration(self) -> float:
+        total = 0.0
+        for source in self.source_videos:
+            try:
+                total += max(0.0, float(self.get_video_duration(source)))
+            except Exception:
+                continue
+        return float(total)
+
+    def _merge_target_sequence_hits(
+        self,
+        hits: List[Dict[str, object]],
+        window_sec: float,
+    ) -> List[Dict[str, object]]:
+        if not hits:
+            return []
+
+        merged: List[Dict[str, object]] = []
+        continuity_tol = max(2.5, float(window_sec) * 1.25)
+        for hit in sorted(hits, key=lambda item: float(item["target_start"])):
+            target_start = float(hit["target_start"])
+            source_start = float(hit["source_start"])
+            mapping_offset = float(source_start - target_start)
+            source = Path(str(hit["source"]))
+            score = float(hit.get("score", 0.0))
+            if not merged:
+                merged.append(
+                    {
+                        "source": source,
+                        "source_key": self._source_key(source),
+                        "target_start": float(target_start),
+                        "target_end": float(target_start + float(window_sec)),
+                        "source_start": float(source_start),
+                        "source_end": float(source_start + float(window_sec)),
+                        "mapping_offset": float(mapping_offset),
+                        "scores": [float(score)],
+                        "samples": [dict(hit)],
+                    }
+                )
+                continue
+
+            prev = merged[-1]
+            if prev["source_key"] != self._source_key(source):
+                merged.append(
+                    {
+                        "source": source,
+                        "source_key": self._source_key(source),
+                        "target_start": float(target_start),
+                        "target_end": float(target_start + float(window_sec)),
+                        "source_start": float(source_start),
+                        "source_end": float(source_start + float(window_sec)),
+                        "mapping_offset": float(mapping_offset),
+                        "scores": [float(score)],
+                        "samples": [dict(hit)],
+                    }
+                )
+                continue
+
+            prev_target_delta = float(target_start - prev["target_end"])
+            predicted_source_start = float(target_start + float(prev["mapping_offset"]))
+            source_delta = abs(float(source_start - predicted_source_start))
+            if prev_target_delta <= max(continuity_tol, float(window_sec)) and source_delta <= continuity_tol:
+                prev["target_end"] = max(float(prev["target_end"]), float(target_start + float(window_sec)))
+                prev["source_end"] = max(float(prev["source_end"]), float(source_start + float(window_sec)))
+                prev["scores"].append(float(score))
+                prev["samples"].append(dict(hit))
+                prev["mapping_offset"] = float(
+                    np.mean([float(sample["source_start"]) - float(sample["target_start"]) for sample in prev["samples"]])
+                )
+                continue
+
+            merged.append(
+                {
+                    "source": source,
+                    "source_key": self._source_key(source),
+                    "target_start": float(target_start),
+                    "target_end": float(target_start + float(window_sec)),
+                    "source_start": float(source_start),
+                    "source_end": float(source_start + float(window_sec)),
+                    "mapping_offset": float(mapping_offset),
+                    "scores": [float(score)],
+                    "samples": [dict(hit)],
+                }
+            )
+
+        for seg in merged:
+            scores = [float(x) for x in seg.get("scores", [])]
+            seg["confidence"] = float(np.mean(scores)) if scores else 0.0
+            seg["sample_count"] = int(len(seg.get("samples", [])))
+        return merged
+
+    def _infer_target_sequence_and_shape(self) -> None:
+        self.material_shape = "unknown"
+        self.material_shape_confidence = 0.0
+        self.target_sequence_segments = []
+        self.target_sequence_samples = []
+        self.target_sequence_dominant_source = ""
+        self.target_sequence_dominant_ratio = 0.0
+        self.target_sequence_retry_recommended = False
+        self.selected_strategy = "normal"
+
+        if not bool(getattr(self, "material_shape_detection_enabled", True)):
+            return
+
+        target_duration = max(0.0, float(self.target_duration))
+        if target_duration <= 0.0 or not self.source_videos:
+            return
+
+        max_source_duration = 0.0
+        source_total_duration = 0.0
+        source_durations: Dict[str, float] = {}
+        for source in self.source_videos:
+            try:
+                dur = max(0.0, float(self.get_video_duration(source)))
+            except Exception:
+                dur = 0.0
+            max_source_duration = max(max_source_duration, dur)
+            source_total_duration += dur
+            source_durations[self._source_key(source)] = float(dur)
+
+        sample_window = max(
+            2.0,
+            min(
+                float(target_duration),
+                float(getattr(self, "sequence_inference_window_sec", 5.0)),
+                max(float(self.segment_duration), 5.0),
+            ),
+        )
+        sample_count = max(4, int(getattr(self, "sequence_inference_sample_count", 12)))
+        if target_duration <= sample_window + 1e-6:
+            sample_positions = [0.0]
+        else:
+            sample_count = min(sample_count, max(4, int(target_duration / max(sample_window * 0.75, 1.0)) + 1))
+            sample_positions = np.linspace(0.0, max(0.0, target_duration - sample_window), num=sample_count)
+
+        sample_hits: List[Dict[str, object]] = []
+        for pos in sample_positions:
+            target_start = float(pos)
+            candidates = self.find_match_by_phash(
+                target_start,
+                sample_window,
+                seg_index=-1,
+                top_k=8,
+                use_sequence_constraints=False,
+            )
+            best_hit: Optional[Dict[str, object]] = None
+            for cand_source, cand_start, cand_score in candidates[:4]:
+                verify_passed, verify_avg = self.quick_verify(
+                    cand_source,
+                    float(cand_start),
+                    float(target_start),
+                    float(sample_window),
+                )
+                if not verify_passed:
+                    continue
+                final_score = float(cand_score) * 0.35 + float(verify_avg) * 0.65
+                if best_hit is None or final_score > float(best_hit["score"]):
+                    best_hit = {
+                        "target_start": float(target_start),
+                        "duration": float(sample_window),
+                        "source": Path(cand_source),
+                        "source_start": float(cand_start),
+                        "score": float(final_score),
+                        "phash_score": float(cand_score),
+                        "verify_avg": float(verify_avg),
+                    }
+            if best_hit is not None:
+                sample_hits.append(best_hit)
+
+        self.target_sequence_samples = [dict(item) for item in sample_hits]
+        valid_ratio = float(len(sample_hits)) / float(len(sample_positions) or 1)
+        if not sample_hits:
+            self.material_shape_confidence = 0.0
+            if str(getattr(self, "force_strategy", "") or "") == "sequence_model":
+                self.selected_strategy = "sequence_model"
+            return
+
+        merged = self._merge_target_sequence_hits(sample_hits, sample_window)
+        self.target_sequence_segments = [dict(seg) for seg in merged]
+        sample_source_counts: Dict[str, int] = {}
+        for hit in sample_hits:
+            key = str(hit["source"])
+            sample_source_counts[key] = sample_source_counts.get(key, 0) + 1
+        dominant_source = ""
+        dominant_ratio = 0.0
+        if sample_source_counts:
+            dominant_source, dominant_count = max(sample_source_counts.items(), key=lambda item: item[1])
+            dominant_ratio = float(dominant_count) / float(len(sample_hits) or 1)
+        self.target_sequence_dominant_source = str(dominant_source)
+        self.target_sequence_dominant_ratio = float(dominant_ratio)
+        unique_sources = {str(seg["source"]) for seg in merged}
+        repeat_sources = 0
+        seen_counts: Dict[str, int] = {}
+        for seg in merged:
+            key = str(seg["source"])
+            seen_counts[key] = seen_counts.get(key, 0) + 1
+        repeat_sources = sum(1 for count in seen_counts.values() if count > 1)
+        avg_conf = float(np.mean([float(seg.get("confidence", 0.0)) for seg in merged])) if merged else 0.0
+        coverage_ratio = float(target_duration / source_total_duration) if source_total_duration > 1e-6 else 0.0
+        closest_source_delta = min(
+            (abs(float(target_duration) - float(dur)) for dur in source_durations.values() if float(dur) > 0.0),
+            default=float("inf"),
+        )
+        near_single_source_duration = bool(
+            max_source_duration > 0.0
+            and target_duration <= max_source_duration + 10.0
+            and closest_source_delta <= max(6.0, float(target_duration) * 0.02)
+        )
+
+        if (
+            near_single_source_duration
+            and (
+                dominant_ratio >= 0.55
+                or avg_conf < 0.88
+                or len(unique_sources) <= 2
+            )
+        ):
+            # 目标时长几乎等于某个原片时，少量 pHash 噪声不应把它推入多源策略。
+            # 真正的多源拼接仍可在多源证据很强时走后续分支。
+            material_shape = "single_source_fragment"
+        elif len(unique_sources) <= 1 and valid_ratio >= 0.55:
+            material_shape = "single_source_fragment"
+        elif (
+            dominant_ratio >= 0.75
+            and target_duration <= max_source_duration + 10.0
+        ):
+            material_shape = "single_source_fragment"
+        elif (
+            dominant_ratio >= 0.85
+            and avg_conf >= 0.72
+        ):
+            material_shape = "single_source_fragment"
+        elif len(unique_sources) >= max(2, min(3, len(self.source_videos))) and (
+            coverage_ratio >= 0.70 or repeat_sources > 0 or len(unique_sources) == len(self.source_videos)
+        ):
+            material_shape = "full_library_mixed_sequence"
+        elif len(unique_sources) >= 2:
+            material_shape = "stitched_subset"
+        else:
+            material_shape = "single_source_fragment" if target_duration <= max_source_duration + 1.0 else "stitched_subset"
+
+        shape_conf = min(
+            1.0,
+            max(
+                0.0,
+                avg_conf * 0.7 + valid_ratio * 0.3,
+            ),
+        )
+        self.material_shape = str(material_shape)
+        self.material_shape_confidence = float(shape_conf)
+        self.target_sequence_retry_recommended = bool(
+            material_shape in {"stitched_subset", "full_library_mixed_sequence"}
+            and len(merged) >= 2
+        )
+
+        forced = str(getattr(self, "force_strategy", "") or "").strip().lower()
+        if forced == "sequence_model":
+            self.selected_strategy = "sequence_model"
+        elif forced == "normal":
+            self.selected_strategy = "normal"
+        elif (
+            bool(getattr(self, "target_sequence_inference_enabled", True))
+            and self.target_sequence_retry_recommended
+            and shape_conf >= 0.55
+        ):
+            self.selected_strategy = "sequence_model"
+        else:
+            self.selected_strategy = "normal"
+
+    def _sequence_constraints_for_target(
+        self,
+        target_start: float,
+        duration: float,
+    ) -> List[Dict[str, object]]:
+        if str(getattr(self, "selected_strategy", "normal")) != "sequence_model":
+            return []
+        segments = list(getattr(self, "target_sequence_segments", []) or [])
+        if not segments:
+            return []
+
+        radius = max(2.0, float(getattr(self, "sequence_prediction_search_radius_sec", 8.0)))
+        center = float(target_start) + float(duration) * 0.5
+        constraints: Dict[str, Dict[str, object]] = {}
+
+        def add_constraint(seg: Dict[str, object]) -> None:
+            key = str(seg["source_key"])
+            predicted_start = float(target_start) + float(seg["mapping_offset"])
+            item = constraints.get(key)
+            min_start = max(0.0, float(predicted_start - radius))
+            max_start = max(0.0, float(predicted_start + radius))
+            if item is None:
+                constraints[key] = {
+                    "source": Path(seg["source"]),
+                    "source_key": key,
+                    "predicted_start": float(predicted_start),
+                    "min_start": float(min_start),
+                    "max_start": float(max_start),
+                    "confidence": float(seg.get("confidence", 0.0)),
+                }
+                return
+            item["min_start"] = min(float(item["min_start"]), float(min_start))
+            item["max_start"] = max(float(item["max_start"]), float(max_start))
+            if float(seg.get("confidence", 0.0)) > float(item.get("confidence", 0.0)):
+                item["predicted_start"] = float(predicted_start)
+                item["confidence"] = float(seg.get("confidence", 0.0))
+
+        matches = []
+        for seg in segments:
+            seg_start = float(seg["target_start"])
+            seg_end = float(seg["target_end"])
+            if center >= seg_start - radius and center <= seg_end + radius:
+                matches.append(seg)
+        if not matches:
+            nearest = min(
+                segments,
+                key=lambda seg: min(
+                    abs(center - float(seg["target_start"])),
+                    abs(center - float(seg["target_end"])),
+                ),
+            )
+            matches = [nearest]
+            nearest_idx = segments.index(nearest)
+            if nearest_idx > 0:
+                matches.append(segments[nearest_idx - 1])
+            if nearest_idx + 1 < len(segments):
+                matches.append(segments[nearest_idx + 1])
+        for seg in matches:
+            add_constraint(seg)
+        return list(constraints.values())
+
+    def _source_pool_gap_prefill_meta(self, task: SegmentTask) -> Optional[Dict[str, object]]:
+        """
+        源池缺口修复模式下的提前兜底判断。
+        当序列模型已经预测该段只会落到源片尾之后时，继续全源盲扫通常只会耗时后失败；
+        这里提前把该段标记为目标素材兜底，最终质量报告会保留原因和预测证据。
+        """
+        if not bool(getattr(self, "source_pool_gap_target_fallback", False)):
+            return None
+        if str(getattr(self, "selected_strategy", "normal") or "normal") != "sequence_model":
+            return None
+        if float(getattr(self, "material_shape_confidence", 0.0) or 0.0) < 0.35:
+            return None
+
+        constraints = self._sequence_constraints_for_target(float(task.target_start), float(task.duration))
+        if not constraints:
+            return None
+
+        exhausted: List[Dict[str, object]] = []
+        has_possible_source = False
+        tolerance = max(0.15, float(task.duration) * 0.04)
+        for item in constraints:
+            source = Path(item["source"])
+            if source == self.target_video:
+                has_possible_source = True
+                continue
+            try:
+                source_duration = float(self.get_video_duration(source))
+            except Exception:
+                source_duration = 0.0
+            predicted_start = float(item.get("predicted_start", 0.0) or 0.0)
+            predicted_end = predicted_start + float(task.duration)
+            if source_duration <= 0.0:
+                has_possible_source = True
+                continue
+            overrun_sec = float(predicted_end - source_duration)
+            underrun_sec = float(0.0 - predicted_start)
+            if overrun_sec <= tolerance and underrun_sec <= tolerance:
+                has_possible_source = True
+            else:
+                exhausted.append(
+                    {
+                        "source": str(source),
+                        "predicted_start": float(predicted_start),
+                        "predicted_end": float(predicted_end),
+                        "source_duration": float(source_duration),
+                        "overrun_sec": float(max(0.0, overrun_sec)),
+                        "underrun_sec": float(max(0.0, underrun_sec)),
+                        "confidence": float(item.get("confidence", 0.0) or 0.0),
+                    }
+                )
+
+        if has_possible_source or not exhausted:
+            return None
+        return {
+            "reason": "predicted_source_pool_gap",
+            "constraints": exhausted,
+        }
 
     def _no_target_boundary_thresholds(self, curr: dict) -> Tuple[float, float]:
         duration = max(0.0, float(curr.get("duration", 0.0)))
@@ -1655,7 +2067,8 @@ class FastHighPrecisionReconstructor:
             print(f"   ⚠️ 共享帧索引迁移失败: {exc}")
 
     def find_match_by_phash(self, target_start: float, duration: float,
-                            seg_index: int = 0, top_k: int = 10) -> List[Tuple[Path, float, float]]:
+                            seg_index: int = 0, top_k: int = 10,
+                            use_sequence_constraints: bool = True) -> List[Tuple[Path, float, float]]:
         """使用多帧 pHash 顺序检索候选，返回 [(source, start_time, similarity), ...]。"""
         target_offsets = self._target_phash_offsets(duration)
         target_hashes: List[imagehash.ImageHash] = []
@@ -1674,13 +2087,24 @@ class FastHighPrecisionReconstructor:
             float(getattr(self, "phash_match_dedupe_sec", 0.6)),
             float(getattr(self, "frame_index_sample_interval", 0.2)) * 1.5,
         )
+        sequence_constraints = (
+            self._sequence_constraints_for_target(float(target_start), float(duration))
+            if use_sequence_constraints
+            else []
+        )
+        sequence_constraints_by_key: Dict[str, List[Dict[str, object]]] = {}
+        for item in sequence_constraints:
+            sequence_constraints_by_key.setdefault(str(item["source_key"]), []).append(item)
 
-        def collect(include_secondary: bool) -> List[Tuple[Path, float, float]]:
+        def collect(include_secondary: bool, constrained: bool) -> List[Tuple[Path, float, float]]:
             allowed = {self._source_key(p) for p in self._candidate_source_videos(include_secondary=include_secondary)}
             found: List[Tuple[Path, float, float, float, float]] = []
             for video_path, frames in self.frame_index.items():
                 video_path = Path(video_path)
-                if self._source_key(video_path) not in allowed:
+                source_key = self._source_key(video_path)
+                if source_key not in allowed:
+                    continue
+                if constrained and source_key not in sequence_constraints_by_key:
                     continue
                 if len(frames) < len(target_hashes):
                     continue
@@ -1696,6 +2120,14 @@ class FastHighPrecisionReconstructor:
                     if scored is None:
                         continue
                     start_time = float(scored["start_time"])
+                    if constrained:
+                        valid = False
+                        for rule in sequence_constraints_by_key.get(source_key, []):
+                            if float(rule["min_start"]) - 1e-6 <= start_time <= float(rule["max_start"]) + 1e-6:
+                                valid = True
+                                break
+                        if not valid:
+                            continue
                     bucket = int(round(start_time / max(dedupe_sec, 1e-6)))
                     item = (
                         video_path,
@@ -1712,9 +2144,14 @@ class FastHighPrecisionReconstructor:
             found.sort(key=lambda x: (x[2], x[3], x[4]), reverse=True)
             return [(src, start, score) for src, start, score, _, _ in found[:top_k]]
 
-        candidates = collect(include_secondary=False)
+        constrained = bool(sequence_constraints)
+        candidates = collect(include_secondary=False, constrained=constrained)
         if (not candidates) and self.secondary_source_videos:
-            candidates = collect(include_secondary=True)
+            candidates = collect(include_secondary=True, constrained=constrained)
+        if (not candidates) and constrained:
+            candidates = collect(include_secondary=False, constrained=False)
+            if (not candidates) and self.secondary_source_videos:
+                candidates = collect(include_secondary=True, constrained=False)
         return candidates
 
     def precompute_fingerprints(self):
@@ -1745,6 +2182,7 @@ class FastHighPrecisionReconstructor:
             "phash_candidates": [],
             "candidate_count": 0,
             "ambiguous": False,
+            "selected_strategy": str(getattr(self, "selected_strategy", "normal")),
         }
 
         # 第一步：多帧 pHash 顺序预筛选候选
@@ -2003,6 +2441,10 @@ class FastHighPrecisionReconstructor:
         best_source = None
         best_start = 0
         best_score = 0.0
+        sequence_constraints = self._sequence_constraints_for_target(float(target_start), float(duration))
+        sequence_constraints_by_key: Dict[str, List[Dict[str, object]]] = {}
+        for item in sequence_constraints:
+            sequence_constraints_by_key.setdefault(str(item["source_key"]), []).append(item)
         
         # 提取目标帧（多个时间点）
         target_frames = []
@@ -2023,14 +2465,25 @@ class FastHighPrecisionReconstructor:
         # 遍历所有源视频（当前不再做按文件名主次分级）
         for source_group in source_passes:
             for source in source_group:
+                source_key = self._source_key(source)
+                constraints = sequence_constraints_by_key.get(source_key, [])
+                if sequence_constraints and (not constraints):
+                    continue
                 source_duration = self.get_video_duration(source)
-                
-                # 扩大搜索范围：在目标时间点附近搜索（±60秒）
-                search_start = max(0, int(target_start - 60))
-                search_end = min(int(source_duration - duration), int(target_start + 60))
-                
+                if constraints:
+                    min_start = min(float(item["min_start"]) for item in constraints)
+                    max_start = max(float(item["max_start"]) for item in constraints)
+                    search_start = max(0, int(min_start))
+                    search_end = min(int(source_duration - duration), int(max_start) + 1)
+                    search_step = 1
+                else:
+                    # 扩大搜索范围：在目标时间点附近搜索（±60秒）
+                    search_start = max(0, int(target_start - 60))
+                    search_end = min(int(source_duration - duration), int(target_start + 60))
+                    search_step = 2
+
                 # 滑动搜索（步长2秒，更精细）
-                for start_sec in range(search_start, search_end, 2):
+                for start_sec in range(search_start, search_end, search_step):
                     total_sim = 0
                     valid_frames = 0
 
@@ -2054,6 +2507,8 @@ class FastHighPrecisionReconstructor:
                 
                 if best_score > 0.90:
                     break
+            if (best_source is None) and sequence_constraints:
+                continue
             if best_source is not None and best_score >= 0.75:
                 break
         
@@ -3032,8 +3487,8 @@ class FastHighPrecisionReconstructor:
                 j += 1
             return None, None
 
-        prev_seg, _ = find_prev()
-        next_seg, _ = find_next()
+        prev_seg, prev_idx = find_prev()
+        next_seg, next_idx = find_next()
         candidates: List[Tuple[Path, float, str]] = []
 
         def clamp_start_by_neighbor_bounds(src: Path, raw_start: float) -> Tuple[float, Dict[str, object]]:
@@ -3135,6 +3590,163 @@ class FastHighPrecisionReconstructor:
                 min_floor=relaxed_min_floor,
             )
             return bool(relaxed_passed), float(relaxed_avg), True
+
+        def recover_cross_source_composite() -> Optional[dict]:
+            """
+            恢复跨源拼接边界上的缺失段。
+
+            长拼接素材常会出现一个 5 秒目标段横跨两个原片：前半来自上一源片尾，
+            后半来自下一源片头。单源匹配天然无法命中这种段，这里只在前后邻段都
+            已稳定且分属不同源时，拼出 composite 段并通过现有画面/音频守卫后收录。
+            """
+            if prev_seg is None or next_seg is None:
+                return None
+            if prev_idx is None or next_idx is None:
+                return None
+            if (index - int(prev_idx)) > 3 or (int(next_idx) - index) > 3:
+                return None
+            if prev_seg.get("source") in (None, self.target_video) or next_seg.get("source") in (None, self.target_video):
+                return None
+            if prev_seg.get("source") == next_seg.get("source"):
+                return None
+
+            prev_source = Path(str(prev_seg["source"]))
+            next_source = Path(str(next_seg["source"]))
+            if self._is_secondary_source(prev_source) or self._is_secondary_source(next_source):
+                return None
+
+            prev_source_duration = self.get_video_duration(prev_source)
+            next_source_duration = self.get_video_duration(next_source)
+            if prev_source_duration <= 0.0 or next_source_duration <= 0.0:
+                return None
+
+            task_start = float(task.target_start)
+            task_duration = float(task.duration)
+            task_end = float(task_start + task_duration)
+            prev_expected_start = float(prev_seg["start"]) + (task_start - float(prev_seg["target_start"]))
+            prev_expected_start = max(0.0, min(float(prev_expected_start), float(prev_source_duration)))
+            prev_tail_left = max(0.0, float(prev_source_duration - prev_expected_start))
+
+            # next_start_at_task_end 表示当前缺失段结束时，下一源时间轴应到达的位置。
+            # 若 next 是紧邻后一段，它通常等于 next["start"]；若中间还有缺段，则会相应前推。
+            next_start_at_task_end = float(next_seg["start"]) - (float(next_seg["target_start"]) - task_end)
+            if next_start_at_task_end <= 0.03:
+                return None
+
+            # 有些原片切换点只剩 0.2 秒左右的上一源尾巴；
+            # composite 提取本身允许极短 part，因此这里放宽最小分片，再交给探针验证。
+            min_part = min(0.35, max(0.05, task_duration * 0.02))
+            max_prev_part = min(task_duration - min_part, max(0.0, prev_tail_left))
+            if max_prev_part < min_part:
+                return None
+
+            raw_left_candidates = [
+                max_prev_part,
+                task_duration - min(task_duration - min_part, max(min_part, next_start_at_task_end)),
+                min(max_prev_part, task_duration * 0.35),
+                min(max_prev_part, task_duration * 0.50),
+                min(max_prev_part, task_duration * 0.65),
+            ]
+            left_candidates: List[float] = []
+            seen_left: Set[float] = set()
+            for raw_left in raw_left_candidates:
+                left_duration = max(min_part, min(float(raw_left), float(max_prev_part)))
+                right_duration = task_duration - left_duration
+                if right_duration < min_part:
+                    continue
+                key = round(float(left_duration), 3)
+                if key in seen_left:
+                    continue
+                seen_left.add(key)
+                left_candidates.append(float(left_duration))
+
+            best: Optional[Dict[str, object]] = None
+            for left_duration in left_candidates:
+                right_duration = float(task_duration - left_duration)
+                right_start = float(next_start_at_task_end - right_duration)
+                right_start = max(0.0, right_start)
+                right_end = float(right_start + right_duration)
+                if right_end > next_source_duration + 0.20:
+                    continue
+
+                prev_overrun = max(0.0, float(prev_expected_start + left_duration - prev_source_duration))
+                next_alignment_error = abs(float(right_end - next_start_at_task_end))
+                if prev_overrun > 0.20 or next_alignment_error > 0.35:
+                    continue
+
+                composite_parts = [
+                    {
+                        "source": str(prev_source),
+                        "start": float(prev_expected_start),
+                        "duration": float(left_duration),
+                    },
+                    {
+                        "source": str(next_source),
+                        "start": float(right_start),
+                        "duration": float(right_duration),
+                    },
+                ]
+                probe = self._probe_composite_parts_against_target(
+                    composite_parts,
+                    target_start=float(task_start),
+                    duration=float(task_duration),
+                )
+                if not isinstance(probe, dict):
+                    continue
+                score = (
+                    float(probe.get("score", 0.0))
+                    - float(prev_overrun) * 0.25
+                    - float(next_alignment_error) * 0.10
+                    - abs(float(left_duration - min(prev_tail_left, task_duration))) * 0.01
+                )
+                if best is None or score > float(best["score"]):
+                    best = {
+                        "parts": composite_parts,
+                        "left_duration": float(left_duration),
+                        "right_duration": float(right_duration),
+                        "right_start": float(right_start),
+                        "probe": probe,
+                        "score": float(score),
+                        "prev_overrun": float(prev_overrun),
+                        "next_alignment_error": float(next_alignment_error),
+                    }
+
+            if best is None:
+                return None
+
+            probe = dict(best["probe"])
+            audio_meta = probe.get("audio_meta", {})
+            return {
+                "index": int(task.index),
+                "source": next_source,
+                "start": float(best["right_start"]),
+                "duration": float(task_duration),
+                "target_start": float(task_start),
+                "composite_parts": list(best["parts"]),
+                "quality": {
+                    "combined": float(probe.get("verify_avg", 0.0)),
+                    "recovered_from_neighbors": True,
+                    "recover_mode": "cross_source_composite_missing",
+                    "recover_cross_source_composite": True,
+                    "recover_cross_source_left_duration": float(best["left_duration"]),
+                    "recover_cross_source_right_duration": float(best["right_duration"]),
+                    "recover_cross_source_prev_overrun": float(best["prev_overrun"]),
+                    "recover_cross_source_next_alignment_error": float(best["next_alignment_error"]),
+                    "cross_source_prev_tail_carryover_no_target": True,
+                    "cross_source_prev_tail_carryover_prev_source": str(prev_source),
+                    "cross_source_prev_tail_carryover_prev_tail_start": float(prev_expected_start),
+                    "cross_source_prev_tail_carryover_prev_tail_duration": float(best["left_duration"]),
+                    "cross_source_prev_tail_carryover_curr_source_start": float(best["right_start"]),
+                    "cross_source_prev_tail_carryover_curr_source_duration": float(best["right_duration"]),
+                    "cross_source_prev_tail_carryover_verify_avg": float(probe.get("verify_avg", 0.0)),
+                    "cross_source_prev_tail_carryover_audio_guard": audio_meta,
+                    "audio_guard": audio_meta,
+                },
+            }
+
+        composite_recovered = recover_cross_source_composite()
+        if composite_recovered is not None:
+            return composite_recovered
 
         if prev_seg is not None and next_seg is not None and prev_seg["source"] == next_seg["source"]:
             prev_t = float(prev_seg["target_start"])
@@ -3514,6 +4126,10 @@ class FastHighPrecisionReconstructor:
 
         start_wall = time.time()
         overall_perf = time.perf_counter()
+        self.last_reconstruct_status = "running"
+        self.last_failure_reason = ""
+        self.last_failure_details = {}
+        self.source_pool_gap_target_fallback_details = {}
 
         # 预建 pHash 帧索引（首次运行后缓存，后续秒速加载）
         self.build_frame_index(sample_interval=float(self.frame_index_sample_interval))
@@ -3523,6 +4139,25 @@ class FastHighPrecisionReconstructor:
         self.output_fps = self.get_video_fps(self.target_video)
         print(f"\n📹 目标视频: {target_duration:.1f}s")
         print(f"🎞️ 输出帧率: {self.output_fps:.3f} fps (自动读取目标视频)")
+        self._infer_target_sequence_and_shape()
+        print(
+            f"🧭 素材识别: shape={self.material_shape} "
+            f"(conf={self.material_shape_confidence:.2f}) "
+            f"strategy={self.selected_strategy}"
+        )
+        if self.target_sequence_segments:
+            print(f"   识别到 {len(self.target_sequence_segments)} 个素材源段序列")
+            if bool(getattr(self, "print_target_sequence", False)):
+                for seg in self.target_sequence_segments:
+                    print(
+                        "   "
+                        f"{Path(seg['source']).name}: "
+                        f"target {float(seg['target_start']):.2f}-{float(seg['target_end']):.2f}s -> "
+                        f"source {float(seg['source_start']):.2f}-{float(seg['source_end']):.2f}s "
+                        f"(conf={float(seg.get('confidence', 0.0)):.2f})"
+                    )
+        elif bool(getattr(self, "print_material_shape", False)):
+            print("   未识别出稳定的素材源段序列")
         
         # 创建任务列表
         tasks = []
@@ -3539,13 +4174,43 @@ class FastHighPrecisionReconstructor:
         print(f"\n🔄 并行处理 {len(tasks)} 个段 (线程数: {self.max_workers})...")
         match_perf = time.perf_counter()
 
+        prefilled_gap_fallback_segments: Dict[int, dict] = {}
+        tasks_to_process = list(tasks)
+        if bool(getattr(self, "source_pool_gap_target_fallback", False)):
+            tasks_to_process = []
+            for task in tasks:
+                prefill_meta = self._source_pool_gap_prefill_meta(task)
+                if prefill_meta is None:
+                    tasks_to_process.append(task)
+                    continue
+                prefilled_gap_fallback_segments[int(task.index)] = {
+                    "index": int(task.index),
+                    "source": self.target_video,
+                    "start": float(task.target_start),
+                    "duration": float(task.duration),
+                    "target_start": float(task.target_start),
+                    "quality": {
+                        "combined": 1.0,
+                        "fallback": True,
+                        "fallback_reason": "source_pool_gap_target_fallback",
+                        "source_pool_gap_target_fallback": True,
+                        "source_pool_gap_target_fallback_prefill": True,
+                        "source_pool_gap_target_fallback_prefill_meta": prefill_meta,
+                    },
+                }
+            if prefilled_gap_fallback_segments:
+                print(
+                    f"   🛟 源池缺口提前兜底: 跳过 {len(prefilled_gap_fallback_segments)} 段无效盲扫"
+                )
+        prefilled_gap_fallback_indices = sorted(int(x) for x in prefilled_gap_fallback_segments.keys())
+
         # 并行处理
         results = [None] * len(tasks)
         
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_task = {
                 executor.submit(self.process_segment, task): task 
-                for task in tasks
+                for task in tasks_to_process
             }
             
             for future in as_completed(future_to_task):
@@ -3561,6 +4226,8 @@ class FastHighPrecisionReconstructor:
         
         # 整理结果：默认保全所有段；若禁用目标兜底则缺失段直接记失败
         confirmed_by_index = {}
+        for idx, seg in prefilled_gap_fallback_segments.items():
+            confirmed_by_index[int(idx)] = dict(seg)
         for r in results:
             if r and r.success:
                 confirmed_by_index[r.index] = {
@@ -3645,7 +4312,177 @@ class FastHighPrecisionReconstructor:
                         missing_count = 0
                     else:
                         print(f"❌ 存在缺失段 {missing_count} 段，且已禁用目标素材兜底，终止输出")
-                        return False
+                        self.last_reconstruct_status = "failed"
+                        expected_total_segments = max(1, int(self.total_segments or len(tasks) or 1))
+                        missing_ratio = float(missing_count) / float(expected_total_segments)
+                        material_shape = str(getattr(self, "material_shape", "unknown") or "unknown")
+                        selected_strategy = str(getattr(self, "selected_strategy", "normal") or "normal")
+                        sequence_segments = list(getattr(self, "target_sequence_segments", []) or [])
+                        sequence_confidence = float(getattr(self, "material_shape_confidence", 0.0) or 0.0)
+                        missing_set = {int(x) for x in unresolved_missing_indices}
+                        tail_missing_count = 0
+                        cursor = int(expected_total_segments) - 1
+                        while cursor >= 0 and cursor in missing_set:
+                            tail_missing_count += 1
+                            cursor -= 1
+                        tail_missing_start_index = (
+                            int(expected_total_segments - tail_missing_count)
+                            if tail_missing_count > 0
+                            else -1
+                        )
+                        tail_missing_dominant = bool(
+                            (
+                                tail_missing_count >= max(3, int(expected_total_segments * 0.12))
+                                or (
+                                    tail_missing_count * float(self.segment_duration)
+                                    >= max(30.0, float(self.segment_duration) * 3.0)
+                                )
+                            )
+                            and tail_missing_count >= max(1, int(missing_count * 0.65))
+                        )
+                        if (
+                            selected_strategy == "sequence_model"
+                            and (not sequence_segments or sequence_confidence < 0.35)
+                        ):
+                            self.last_failure_reason = "target_sequence_low_confidence"
+                        elif selected_strategy == "sequence_model" and tail_missing_dominant:
+                            self.last_failure_reason = "insufficient_coverage_in_source_pool"
+                        elif missing_ratio >= 0.45:
+                            self.last_failure_reason = "insufficient_coverage_in_source_pool"
+                        elif selected_strategy == "sequence_model":
+                            self.last_failure_reason = "too_many_unresolved_multi_source_boundaries"
+                        else:
+                            self.last_failure_reason = "too_many_missing_segments_without_target_fallback"
+                        self.last_failure_details = {
+                            "missing_segments_count": int(missing_count),
+                            "missing_indices": [int(x) for x in unresolved_missing_indices],
+                            "neighbor_recovered_missing": int(recovered_missing),
+                            "available_segments": int(len(confirmed_segments)),
+                            "expected_total_segments": int(expected_total_segments),
+                            "missing_ratio": float(missing_ratio),
+                            "material_shape": str(material_shape),
+                            "selected_strategy": str(selected_strategy),
+                            "target_sequence_segments_count": int(len(sequence_segments)),
+                            "sequence_confidence": float(sequence_confidence),
+                            "tail_missing_count": int(tail_missing_count),
+                            "tail_missing_start_index": int(tail_missing_start_index),
+                            "tail_missing_dominant": bool(tail_missing_dominant),
+                        }
+                        all_segments_unmatched = bool(
+                            self.last_failure_reason == "target_sequence_low_confidence"
+                            and missing_count == expected_total_segments
+                            and len(confirmed_segments) == 0
+                            and missing_ratio >= 0.95
+                        )
+                        isolated_boundary_gap = bool(
+                            self.last_failure_reason == "too_many_unresolved_multi_source_boundaries"
+                            and selected_strategy == "sequence_model"
+                            and missing_count > 0
+                            and missing_count <= max(1, min(2, int(expected_total_segments * 0.03) + 1))
+                            and (len(confirmed_segments) + missing_count) >= expected_total_segments
+                        )
+                        if (
+                            bool(getattr(self, "source_pool_gap_target_fallback", False))
+                            and (
+                                self.last_failure_reason == "insufficient_coverage_in_source_pool"
+                                or all_segments_unmatched
+                                or isolated_boundary_gap
+                            )
+                        ):
+                            fallback_indices = [
+                                *[int(x) for x in unresolved_missing_indices],
+                                *[int(x) for x in prefilled_gap_fallback_indices],
+                            ]
+                            partial_tail_indices = []
+                            for idx, seg in list(confirmed_by_index.items()):
+                                seg_source = seg.get("source")
+                                if seg_source is None or seg_source == self.target_video:
+                                    continue
+                                quality = seg.get("quality") or {}
+                                try:
+                                    recover_shortfall_sec = float(quality.get("recover_shortfall_sec") or 0.0)
+                                except Exception:
+                                    recover_shortfall_sec = 0.0
+                                partial_source_tail = bool(
+                                    quality.get("recover_partial_tail")
+                                    or quality.get("recover_mode") == "partial_source_tail_no_target"
+                                    or recover_shortfall_sec > 0.05
+                                )
+                                if partial_source_tail:
+                                    partial_tail_indices.append(int(idx))
+                                    fallback_indices.append(int(idx))
+                                    continue
+                                try:
+                                    source_duration = float(self.get_video_duration(Path(seg_source)))
+                                except Exception:
+                                    source_duration = 0.0
+                                seg_end = float(seg.get("start", 0.0) or 0.0) + float(seg.get("duration", 0.0) or 0.0)
+                                if source_duration > 0.0 and seg_end <= source_duration + 0.05:
+                                    continue
+                                fallback_indices.append(int(idx))
+                            fallback_indices = sorted(set(int(x) for x in fallback_indices))
+                            print(
+                                f"   🛟 源池缺口目标兜底: 补齐 {len(fallback_indices)} 段，"
+                                "报告中会标记 source_pool_gap_target_fallback"
+                            )
+                            for missing_index in fallback_indices:
+                                task = tasks[int(missing_index)]
+                                confirmed_by_index[int(task.index)] = {
+                                    "index": int(task.index),
+                                    "source": self.target_video,
+                                    "start": float(task.target_start),
+                                    "duration": float(task.duration),
+                                    "target_start": float(task.target_start),
+                                    "quality": {
+                                        "combined": 1.0,
+                                        "fallback": True,
+                                        "fallback_reason": "source_pool_gap_target_fallback",
+                                        "source_pool_gap_target_fallback": True,
+                                        "source_pool_gap_target_fallback_all_unmatched": bool(all_segments_unmatched),
+                                        "source_pool_gap_target_fallback_isolated_boundary_gap": bool(isolated_boundary_gap),
+                                        "source_pool_gap_target_fallback_original_reason": str(self.last_failure_reason),
+                                    },
+                                }
+                            confirmed_segments = []
+                            for task in tasks:
+                                seg = confirmed_by_index.get(int(task.index))
+                                if seg is None:
+                                    # 仍有非源池缺口段未解决时，不能伪造成完整输出。
+                                    confirmed_segments = []
+                                    break
+                                confirmed_segments.append(seg)
+                            if confirmed_segments:
+                                self.source_pool_gap_target_fallback_details = {
+                                    **dict(self.last_failure_details),
+                                    "enabled": True,
+                                    "fallback_indices": fallback_indices,
+                                    "prefilled_indices": prefilled_gap_fallback_indices,
+                                    "partial_tail_indices": sorted(set(int(x) for x in partial_tail_indices)),
+                                    "fallback_segments_count": int(len(fallback_indices)),
+                                    "all_segments_unmatched": bool(all_segments_unmatched),
+                                    "isolated_boundary_gap": bool(isolated_boundary_gap),
+                                    "original_failure_reason": str(self.last_failure_reason),
+                                }
+                                self.last_failure_reason = ""
+                                self.last_failure_details = {}
+                                self.enable_target_video_fallback = True
+                                missing_count = 0
+                                unresolved_missing_indices = []
+                        if missing_count > 0:
+                            self.total_elapsed_sec = time.perf_counter() - overall_perf
+                            self.save_quality_report(confirmed_segments, output_path)
+                            return False
+
+        if prefilled_gap_fallback_indices and not getattr(self, "source_pool_gap_target_fallback_details", {}):
+            self.source_pool_gap_target_fallback_details = {
+                "enabled": True,
+                "fallback_indices": prefilled_gap_fallback_indices,
+                "prefilled_indices": prefilled_gap_fallback_indices,
+                "fallback_segments_count": int(len(prefilled_gap_fallback_indices)),
+                "prefilled_segments_count": int(len(prefilled_gap_fallback_indices)),
+                "original_failure_reason": "predicted_source_pool_gap",
+            }
+            self.enable_target_video_fallback = True
 
         if (not self.enable_target_video_fallback) and recovered_missing > 0:
             print(f"   🧩 邻段插值恢复: {recovered_missing} 段")
@@ -4029,6 +4866,9 @@ class FastHighPrecisionReconstructor:
             final_tail_shortfall_trimmed = self._trim_tail_overlaps_with_shortfall_tolerance_no_target(
                 confirmed_segments,
             )
+            final_repeat_risk_cleared = self._clear_resolved_repeat_risk_flags_no_target(
+                confirmed_segments,
+            )
             final_terminal_adjusted = int(
                 final_same_source_overlap_fixed
                 + final_head_snapped
@@ -4037,6 +4877,7 @@ class FastHighPrecisionReconstructor:
                 + final_small_overlap_suppressed
                 + final_terminal_hard
                 + final_tail_shortfall_trimmed
+                + final_repeat_risk_cleared
             )
             if final_terminal_adjusted > 0:
                 no_target_micro_gap_snapped += int(final_terminal_adjusted)
@@ -4070,6 +4911,18 @@ class FastHighPrecisionReconstructor:
             success = self._generate_output(confirmed_segments, output_path, target_duration)
 
         self.total_elapsed_sec = time.perf_counter() - overall_perf
+        if success:
+            self.last_reconstruct_status = "ok"
+            self.last_failure_reason = ""
+            self.last_failure_details = {}
+        else:
+            self.last_reconstruct_status = "failed"
+            self.last_failure_reason = str((self.last_render_metrics or {}).get("error", "") or "render_failed_after_reconstruction")
+            self.last_failure_details = {
+                "render_metrics": dict(self.last_render_metrics or {}),
+                "material_shape": str(self.material_shape),
+                "selected_strategy": str(self.selected_strategy),
+            }
         self.save_quality_report(confirmed_segments, output_path)
 
         elapsed = time.time() - start_wall
@@ -4230,15 +5083,20 @@ class FastHighPrecisionReconstructor:
         report = {
             "target_video": str(self.target_video),
             "output_video": str(output_path_obj),
+            "reconstruct_status": str(getattr(self, "last_reconstruct_status", "unknown")),
             "target_duration": float(self.target_duration),
             "output_duration": output_duration,
-            "total_segments": len(segments),
+            "available_segments": int(len(segments)),
+            "total_segments": int(max(0, int(getattr(self, "total_segments", len(segments)) or len(segments)))),
             "avg_combined_score": avg_score,
             "low_score_threshold": self.low_score_threshold,
             "low_score_segments": len(low_segments),
             "rematch_triggered": rematch_triggered,
             "rematch_improved": rematch_improved,
             "fallback_segments": fallback_count,
+            "source_pool_gap_target_fallback": to_jsonable(
+                getattr(self, "source_pool_gap_target_fallback_details", {}) or {}
+            ),
             "timing": {
                 "match_elapsed_sec": round(float(self.match_elapsed_sec), 3),
                 "timeline_guard_elapsed_sec": round(float(self.timeline_guard_elapsed_sec), 3),
@@ -4247,6 +5105,27 @@ class FastHighPrecisionReconstructor:
             },
             "guard_stats": to_jsonable(self.guard_stats),
             "render_metrics": to_jsonable(render_metrics),
+            "material_analysis": {
+                "material_shape": str(getattr(self, "material_shape", "unknown")),
+                "shape_confidence": float(getattr(self, "material_shape_confidence", 0.0)),
+                "selected_strategy": str(getattr(self, "selected_strategy", "normal")),
+                "target_sequence_retry_recommended": bool(getattr(self, "target_sequence_retry_recommended", False)),
+                "target_sequence_dominant_source": (
+                    Path(str(getattr(self, "target_sequence_dominant_source", "") or "")).name
+                    if str(getattr(self, "target_sequence_dominant_source", "") or "")
+                    else ""
+                ),
+                "target_sequence_dominant_ratio": float(getattr(self, "target_sequence_dominant_ratio", 0.0)),
+                "target_sequence_segments": to_jsonable(getattr(self, "target_sequence_segments", [])),
+                "target_sequence_samples": to_jsonable(getattr(self, "target_sequence_samples", [])),
+            },
+            "failure": {
+                "reason": str(getattr(self, "last_failure_reason", "") or ""),
+                "details": to_jsonable(getattr(self, "last_failure_details", {})),
+                "missing_segments_count": int(
+                    (getattr(self, "last_failure_details", {}) or {}).get("missing_segments_count", 0) or 0
+                ),
+            },
             "low_segments": low_segments,
             "boundary_summary": to_jsonable(boundary_summary),
             "boundary_details": to_jsonable(boundary_details),
@@ -8376,6 +9255,10 @@ class FastHighPrecisionReconstructor:
             curr_q["tail_shortfall_overlap_trim_prev_sec"] = float(trim)
             curr_q["tail_shortfall_overlap_trim_before_gap"] = float(gap)
             curr_q["tail_shortfall_overlap_trim_after_gap"] = float(new_gap)
+            if bool(curr_q.get("boundary_audio_repeat_risk_unresolved_after", False)) and new_gap >= -0.02:
+                # 尾段短缺场景下，前段尾巴已裁掉，当前边界不应继续计入未收敛风险。
+                curr_q["boundary_audio_repeat_risk_resolved_by_tail_trim"] = True
+                curr_q["boundary_audio_repeat_risk_unresolved_after"] = False
             curr["quality"] = curr_q
 
             budget -= float(trim)
@@ -8864,11 +9747,18 @@ class FastHighPrecisionReconstructor:
                 curr_start = float(curr["start"])
                 gap = float(curr_start - prev_end)
                 overlap = max(0.0, -float(gap))
-                if overlap < (min_overlap - 1e-6) or overlap > (max_overlap + 1e-6):
-                    continue
-
                 prev_q = prev.get("quality", {}) or {}
                 curr_q = curr.get("quality", {}) or {}
+                repeat_risk_boundary = bool(
+                    curr_q.get("boundary_audio_repeat_risk_unresolved_after", False)
+                    or curr_q.get("boundary_audio_issue_detected_no_target", False)
+                )
+                # 已被音频边界识别为重复风险的小重叠，也需要在最终阶段裁前段尾巴。
+                # 0.1 秒左右的重叠会被听成单字重读/回放，不能等到 0.25 秒才处理。
+                effective_min_overlap = 0.04 if repeat_risk_boundary else min_overlap
+                if overlap < (effective_min_overlap - 1e-6) or overlap > (max_overlap + 1e-6):
+                    continue
+
                 prev_combined = float(prev_q.get("combined", 0.0))
                 curr_combined = float(curr_q.get("combined", 0.0))
                 if min(prev_combined, curr_combined) < 0.90:
@@ -8901,10 +9791,17 @@ class FastHighPrecisionReconstructor:
                 q["trim_prev_same_source_overlap_new_duration"] = float(new_duration)
                 q["trim_prev_same_source_overlap_verify_avg"] = float(verify_avg)
                 q["trim_prev_same_source_overlap_relaxed_visual_keep"] = bool(relaxed_visual_keep)
+                q["trim_prev_same_source_small_repeat_overlap"] = bool(repeat_risk_boundary)
                 prev["quality"] = q
 
                 curr_quality = curr.get("quality", {}) or {}
                 curr_quality["trim_prev_same_source_overlap_boundary_index"] = int(i)
+                curr_quality["trim_prev_same_source_overlap_resolved_by_prev_trim"] = True
+                curr_quality["trim_prev_same_source_overlap_resolved_sec"] = float(overlap)
+                if repeat_risk_boundary:
+                    # 前段尾巴已经裁掉重复内容，后续未收敛统计不能继续把该边界算作风险。
+                    curr_quality["boundary_audio_repeat_risk_resolved_by_prev_trim"] = True
+                    curr_quality["boundary_audio_repeat_risk_unresolved_after"] = False
                 curr["quality"] = curr_quality
 
                 adjusted += 1
@@ -8914,6 +9811,63 @@ class FastHighPrecisionReconstructor:
                 break
 
         return int(adjusted)
+
+    def _clear_resolved_repeat_risk_flags_no_target(self, segments: List[dict]) -> int:
+        """
+        清理已被终态收口解决的 repeat-risk 标记：
+        - 只在最终同源边界 gap 已经贴齐时生效；
+        - 必须有硬收口、小重叠抑制、尾段裁剪或音频探针 after-gap 已归零等证据；
+        - 不改变分段，只避免质量报告继续把已收口边界统计为未收敛。
+        """
+        if self.enable_target_video_fallback:
+            return 0
+        cleared = 0
+        for i in range(1, len(segments)):
+            prev = segments[i - 1]
+            curr = segments[i]
+            if prev["source"] == self.target_video or curr["source"] == self.target_video:
+                continue
+            if prev["source"] != curr["source"]:
+                continue
+
+            q = curr.get("quality", {}) or {}
+            if not bool(q.get("boundary_audio_repeat_risk_unresolved_after", False)):
+                continue
+            if bool(q.get("boundary_audio_silence_mismatch_after", False)):
+                continue
+
+            prev_end = float(prev["start"]) + float(prev["duration"])
+            gap = float(curr["start"]) - prev_end
+            if abs(gap) > 0.025:
+                continue
+
+            def gap_meta_value(key: str) -> float:
+                value = q.get(key)
+                if value is None or value == "":
+                    return 999.0
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return 999.0
+
+            resolved_evidence = bool(
+                q.get("boundary_hard_clamped_no_target", False)
+                or q.get("small_overlap_suppressed_no_target", False)
+                or q.get("tail_shortfall_overlap_trimmed_prev_no_target", False)
+                or q.get("trim_prev_same_source_overlap_resolved_by_prev_trim", False)
+                or abs(gap_meta_value("boundary_audio_next_gap_after")) <= 0.025
+                or abs(gap_meta_value("boundary_audio_repair_after_gap")) <= 0.025
+            )
+            if not resolved_evidence:
+                continue
+
+            q["boundary_audio_repeat_risk_resolved_by_final_gap"] = True
+            q["boundary_audio_repeat_risk_final_gap_sec"] = float(gap)
+            q["boundary_audio_repeat_risk_unresolved_after"] = False
+            curr["quality"] = q
+            cleared += 1
+
+        return int(cleared)
 
     def snap_small_adjacent_gaps_without_target_fallback(self, segments: List[dict]) -> Tuple[int, int]:
         """
@@ -10574,6 +11528,70 @@ class FastHighPrecisionReconstructor:
             q["cross_source_prev_tail_carryover_curr_source_start"] = float(desired_curr_start)
             seg["quality"] = q
 
+        # 跨源拼桥段如果借用的“前源尾巴”早于上一段结束点，会把上一段尾巴重播一小截。
+        # 输出前把拼桥的前源尾巴收口到上一段结束点，并同步当前源片头，保持拼桥段总时长不变。
+        for idx in range(1, len(segments) - 1):
+            prev = segments[idx - 1]
+            seg = segments[idx]
+            nxt = segments[idx + 1]
+            q = seg.get("quality", {}) or {}
+            if not bool(q.get("cross_source_prev_tail_carryover_no_target", False)):
+                continue
+
+            prev_source = q.get("cross_source_prev_tail_carryover_prev_source")
+            if not prev_source or str(prev.get("source")) != str(prev_source):
+                continue
+            if seg.get("source") != nxt.get("source"):
+                continue
+
+            prev_tail_start = q.get("cross_source_prev_tail_carryover_prev_tail_start")
+            prev_tail_duration = q.get("cross_source_prev_tail_carryover_prev_tail_duration")
+            curr_part_start = q.get("cross_source_prev_tail_carryover_curr_source_start")
+            if prev_tail_start is None or prev_tail_duration is None or curr_part_start is None:
+                continue
+
+            prev_end = float(prev.get("start", 0.0) or 0.0) + float(prev.get("duration", 0.0) or 0.0)
+            prev_tail_start = float(prev_tail_start)
+            prev_tail_duration = float(prev_tail_duration)
+            overlap = float(prev_end - prev_tail_start)
+            if overlap <= 0.03 or overlap >= max(0.04, prev_tail_duration - 0.03):
+                continue
+
+            total_duration = max(0.0, float(seg.get("duration", 0.0) or 0.0))
+            new_prev_duration = max(0.0, float(prev_tail_duration - overlap))
+            new_curr_duration = max(0.0, float(total_duration - new_prev_duration))
+            if new_prev_duration <= 0.03 or new_curr_duration <= 0.03:
+                continue
+
+            next_start = float(nxt.get("start", 0.0) or 0.0)
+            desired_curr_start = max(0.0, float(next_start - new_curr_duration))
+            if desired_curr_start + new_curr_duration > next_start + 0.03:
+                continue
+
+            q["cross_source_prev_tail_carryover_overlap_trimmed_no_target"] = True
+            q["cross_source_prev_tail_carryover_overlap_trim_sec"] = float(overlap)
+            q["cross_source_prev_tail_carryover_prev_tail_start_before"] = float(prev_tail_start)
+            q["cross_source_prev_tail_carryover_prev_tail_duration_before"] = float(prev_tail_duration)
+            q["cross_source_prev_tail_carryover_curr_source_start_before"] = float(curr_part_start)
+            q["cross_source_prev_tail_carryover_prev_tail_start"] = float(prev_end)
+            q["cross_source_prev_tail_carryover_prev_tail_duration"] = float(new_prev_duration)
+            q["cross_source_prev_tail_carryover_curr_source_start"] = float(desired_curr_start)
+            q["cross_source_prev_tail_carryover_curr_source_duration"] = float(new_curr_duration)
+            q["cross_source_prev_tail_carryover_next_start_anchor"] = float(next_start)
+            seg["quality"] = q
+            seg["composite_parts"] = [
+                {
+                    "source": Path(str(prev_source)),
+                    "start": float(prev_end),
+                    "duration": float(new_prev_duration),
+                },
+                {
+                    "source": Path(str(seg.get("source"))),
+                    "start": float(desired_curr_start),
+                    "duration": float(new_curr_duration),
+                },
+            ]
+
         # 若前一段在输出阶段被恢复到更早的 carryover shift_to，而后一段仍保留着旧的硬约束起点，
         # 最终会在两个同源段之间留下一个正向空洞，表现为“字幕还在，但后面几个字没读出来”。
         # 这里在正式抽段前，再把后一段同步回拉到与前段收口一致的位置。
@@ -10840,6 +11858,9 @@ class FastHighPrecisionReconstructor:
             if bool((seg.get("quality", {}) or {}).get("fallback", False))
         )
         fallback_ratio = (float(fallback_count) / float(len(segments))) if segments else 0.0
+        source_pool_gap_fallback_active = bool(
+            (getattr(self, "source_pool_gap_target_fallback_details", {}) or {}).get("enabled", False)
+        )
 
         def _run_concat_reencode(out_path: Path) -> Tuple[bool, str]:
             reencode_cmd = [
@@ -10877,7 +11898,15 @@ class FastHighPrecisionReconstructor:
             return False, (reencode_proc.stderr or "").strip()
 
         concat_error = ""
-        if not self.enable_target_video_fallback:
+        if source_pool_gap_fallback_active:
+            # 源池缺口兜底会混合“源片段 + 目标片段”，copy 拼接容易保留异常时间戳并截短尾部。
+            # 这里强制重编码，优先保证输出时长和播放连续性。
+            ok, concat_error = _run_concat_reencode(temp_output)
+            if ok:
+                concat_mode = "reencode_source_pool_gap_fallback"
+            else:
+                concat_mode = ""
+        elif not self.enable_target_video_fallback:
             # 严格禁兜底模式下优先稳定性：始终重编码拼接，避免 copy 拼接时间戳抖动导致掉音/循环。
             ok, concat_error = _run_concat_reencode(temp_output)
             if ok:
@@ -11434,6 +12463,15 @@ def main():
         audio_fp_cache_max_items_default = cfg_req_int(cfg, "audio_fp_cache_max_items")
         frame_cache_max_items_default = cfg_req_int(cfg, "frame_cache_max_items")
         frame_feature_cache_max_items_default = cfg_req_int(cfg, "frame_feature_cache_max_items")
+        material_shape_detection_enabled_default = cfg_req_bool(cfg, "material_shape_detection_enabled")
+        target_sequence_inference_enabled_default = cfg_req_bool(cfg, "target_sequence_inference_enabled")
+        stitched_material_retry_enabled_default = cfg_req_bool(cfg, "stitched_material_retry_enabled")
+        stitched_material_retry_on_fail_default = cfg_req_bool(cfg, "stitched_material_retry_on_fail")
+        source_pool_gap_target_fallback_default = cfg_req_bool(cfg, "source_pool_gap_target_fallback")
+        sequence_inference_sample_count_default = cfg_req_int(cfg, "sequence_inference_sample_count")
+        sequence_inference_window_sec_default = cfg_req_float(cfg, "sequence_inference_window_sec")
+        sequence_prediction_search_radius_sec_default = cfg_req_float(cfg, "sequence_prediction_search_radius_sec")
+        retry_on_missing_segments_threshold_default = cfg_req_int(cfg, "retry_on_missing_segments_threshold")
         allow_numeric_fallback_default = cfg_req_bool(cfg, "allow_numeric_fallback")
     except RuntimeError as exc:
         print(f"❌ {exc}")
@@ -11521,6 +12559,18 @@ def main():
     add_bool_arg(parser, "--boundary-rematch-no-target", no_target_boundary_rematch_enabled_default, "禁兜底模式下对未收敛边界启用定点重匹配")
     parser.add_argument("--no-target-boundary-rematch-max-attempts", type=int, default=no_target_boundary_rematch_max_attempts_default, help="禁兜底未收敛边界定点重匹配最大尝试次数")
     parser.add_argument("--boundary-hard-max-shift-sec", type=float, default=boundary_hard_max_shift_sec_default, help="边界硬约束单次最大位移（秒，超过则跳过硬夹紧）")
+    add_bool_arg(parser, "--material-shape-detection-enabled", material_shape_detection_enabled_default, "启用素材形态自动识别")
+    add_bool_arg(parser, "--target-sequence-inference-enabled", target_sequence_inference_enabled_default, "启用素材时间轴源段序列推断")
+    add_bool_arg(parser, "--stitched-material-retry-enabled", stitched_material_retry_enabled_default, "启用长拼接素材重试能力")
+    add_bool_arg(parser, "--stitched-material-retry-on-fail", stitched_material_retry_on_fail_default, "失败后允许切换到 sequence_model 重试")
+    add_bool_arg(parser, "--source-pool-gap-target-fallback", source_pool_gap_target_fallback_default, "源池覆盖不足时允许用目标素材补齐缺口，并在报告中标记 fallback")
+    parser.add_argument("--sequence-inference-sample-count", type=int, default=sequence_inference_sample_count_default, help="素材序列推断抽样窗口数量")
+    parser.add_argument("--sequence-inference-window-sec", type=float, default=sequence_inference_window_sec_default, help="素材序列推断窗口时长（秒）")
+    parser.add_argument("--sequence-prediction-search-radius-sec", type=float, default=sequence_prediction_search_radius_sec_default, help="sequence_model 下预测时间带搜索半径（秒）")
+    parser.add_argument("--retry-on-missing-segments-threshold", type=int, default=retry_on_missing_segments_threshold_default, help="批量重试触发的缺段阈值")
+    parser.add_argument("--force-strategy", choices=["", "normal", "sequence_model"], default="", help="强制指定本次重构策略")
+    add_bool_arg(parser, "--print-material-shape", False, "打印素材形态识别结果")
+    add_bool_arg(parser, "--print-target-sequence", False, "打印素材时间轴源段序列")
     parser.add_argument(
         "--verify-whisper-candidates",
         default=",".join(verify_whisper_candidates_default),
@@ -11544,7 +12594,11 @@ def main():
         print(f"❌ 源视频目录不存在: {source_dir}")
         return
 
-    source_videos = [str(f) for f in sorted(source_dir.iterdir()) if f.suffix.lower() == '.mp4']
+    source_videos = [
+        str(f)
+        for f in sorted(source_dir.iterdir())
+        if f.suffix.lower() == '.mp4' and not f.name.startswith('.') and not f.name.startswith('._')
+    ]
     if not source_videos:
         print(f"❌ 源视频目录中未找到 mp4: {source_dir}")
         return
@@ -11641,6 +12695,18 @@ def main():
     reconstructor.audio_fp_cache_max_items = max(128, int(audio_fp_cache_max_items_default))
     reconstructor.frame_cache_max_items = max(128, int(frame_cache_max_items_default))
     reconstructor.frame_feature_cache_max_items = max(128, int(frame_feature_cache_max_items_default))
+    reconstructor.material_shape_detection_enabled = bool(args.material_shape_detection_enabled)
+    reconstructor.target_sequence_inference_enabled = bool(args.target_sequence_inference_enabled)
+    reconstructor.stitched_material_retry_enabled = bool(args.stitched_material_retry_enabled)
+    reconstructor.stitched_material_retry_on_fail = bool(args.stitched_material_retry_on_fail)
+    reconstructor.source_pool_gap_target_fallback = bool(args.source_pool_gap_target_fallback)
+    reconstructor.sequence_inference_sample_count = max(4, int(args.sequence_inference_sample_count))
+    reconstructor.sequence_inference_window_sec = max(2.0, float(args.sequence_inference_window_sec))
+    reconstructor.sequence_prediction_search_radius_sec = max(1.0, float(args.sequence_prediction_search_radius_sec))
+    reconstructor.retry_on_missing_segments_threshold = max(1, int(args.retry_on_missing_segments_threshold))
+    reconstructor.force_strategy = str(args.force_strategy or "")
+    reconstructor.print_material_shape = bool(args.print_material_shape)
+    reconstructor.print_target_sequence = bool(args.print_target_sequence)
     reconstructor.use_audio_matching = bool(args.use_audio_matching)
     reconstructor.force_target_audio = bool(args.force_target_audio)
     reconstructor.run_ai_verify_snapshots = bool(args.run_ai_verify_snapshots)

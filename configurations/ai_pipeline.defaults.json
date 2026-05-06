@@ -4,6 +4,15 @@
     "match_threshold": 0.95,
     "segment_duration": 5.0,
     "frame_index_sample_interval": 0.2,
+    "material_shape_detection_enabled": true,
+    "target_sequence_inference_enabled": true,
+    "stitched_material_retry_enabled": true,
+    "stitched_material_retry_on_fail": true,
+    "source_pool_gap_target_fallback": false,
+    "sequence_inference_sample_count": 48,
+    "sequence_inference_window_sec": 5.0,
+    "sequence_prediction_search_radius_sec": 12.0,
+    "retry_on_missing_segments_threshold": 2,
     "workers": 0,
     "render_workers": 0,
     "low_score_threshold": 0.82,
@@ -87,6 +96,15 @@
       "/usr/local/bin/python3"
     ],
     "allow_numeric_fallback": false
+  },
+  "batch_project_clip": {
+    "project_videos_root": "/Volumes/学习资料/cutvideo_project_videos",
+    "auto_pause_on_failures": true,
+    "final_fail_threshold_count": 3,
+    "regression_guard_enabled": true,
+    "regression_guard_config": "configurations/regression_guard.samples.json",
+    "paused_repair_heartbeat_minutes": 30,
+    "archive_existing_output_on_fresh_start": true
   },
   "build_ai_video_audit_bundle": {
     "interval": 8.0,
