@@ -53,6 +53,17 @@
 - mismatch 数量变化
 - 是否触发自动修复及修复轮次
 
+## 已确认执行约定
+
+- 项目素材根目录统一使用 `/Volumes/学习资料/cutvideo_project_videos`。
+- 批量二次裁剪、暂停修复、回归护栏、批量恢复、状态检查需要读写该目录及其项目级缓存时，视为本项目已确认操作。
+- 后续同类操作不再作为需要人工决策的问题中断流程；若运行环境弹出系统级授权限制，应继续按既定流程请求/使用相同权限并恢复执行。
+- 修复后必须先跑外置回归护栏，再按 `failed_materials -> source_pool_gap_failed_materials -> inflight_materials_at_pause -> remaining_materials` 恢复批量；回归不通过不得恢复批量。
+- 回归护栏允许“重新生成结果”或“重新验证已有合格报告”两种模式；对耗时很长的稳定样本，优先重新验证最近合格报告，缺少合格报告才重构，重构必须有超时和日志，避免恢复流程被单条护栏样本长时间卡住。
+- “最终失败累计 3 条即暂停修复”的阈值统计本轮恢复后新增的所有最终失败，包括 `insufficient_coverage_in_source_pool`；这类失败统一归类为 `source_pool_gap`，不再叫不可修复，暂停后自动走带标记的目标素材兜底修复路径。
+- `target_sequence_low_confidence` 若表现为整条无命中（`available_segments=0` 且缺段数覆盖全部分段），归入 `all_unmatched`，直接进入目标素材兜底输出，并在质量报告中显式标记，不能伪装成源片匹配成功。
+- 真正不可修复失败仍要保留在批量汇总和状态文件中，明确给出素材、失败阶段、缺段数量和原因，但不进入恢复重跑队列。
+
 ## 说明
 
 - 旧链路中提到的 `v6_precision.py`、`av_consistency_checker.py`、`auto_fix_loop.sh` 不再作为自动化入口。
